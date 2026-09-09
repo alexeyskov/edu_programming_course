@@ -1,0 +1,118 @@
+"""Complete SQLAlchemy registry for the current domain schema.
+
+Importing this module is intentionally sufficient for Alembic to discover every table.
+"""
+
+from app.models.analysis import (
+    AuthorshipAnalysisJob,
+    AuthorshipAnalysisResult,
+    PlagiarismCase,
+    SimilarityAnalysis,
+    SimilarityMatch,
+)
+from app.models.attempts import (
+    Attempt,
+    ClipboardReceipt,
+    EditEvent,
+    RunRequest,
+    RunResult,
+    Snapshot,
+    Submission,
+    Workspace,
+    WorkspaceFile,
+)
+from app.models.courses import (
+    Course,
+    CourseGroup,
+    CourseImportJob,
+    CourseMembership,
+    CourseMembershipGroup,
+    CourseSection,
+)
+from app.models.evidence import EvidenceReport
+from app.models.identity import (
+    AdminElevation,
+    ExternalPrincipal,
+    LMSConnection,
+    LoginTransaction,
+    MoodleCredential,
+    MoodleLoginAttempt,
+    PrincipalSession,
+    TeacherAccessToken,
+    TeacherTokenGrant,
+    UsedLaunchNonce,
+)
+from app.models.integration import (
+    AuditEntry,
+    ExternalMapping,
+    LMSSubmissionFingerprint,
+    SyncOutbox,
+    SystemSetting,
+)
+from app.models.review import (
+    ChatMessage,
+    ChatThread,
+    ReviewClaim,
+    ReviewDecision,
+    ReviewDraft,
+    TeacherExperiment,
+    TeacherExperimentFile,
+)
+from app.models.tasks import (
+    Assessment,
+    AssessmentItem,
+    AvailabilityRule,
+    TaskBankItem,
+    TaskVersion,
+)
+
+__all__ = [
+    "AdminElevation",
+    "Assessment",
+    "AssessmentItem",
+    "Attempt",
+    "AuditEntry",
+    "AuthorshipAnalysisJob",
+    "AuthorshipAnalysisResult",
+    "AvailabilityRule",
+    "ChatMessage",
+    "ChatThread",
+    "ClipboardReceipt",
+    "Course",
+    "CourseGroup",
+    "CourseImportJob",
+    "CourseMembership",
+    "CourseMembershipGroup",
+    "CourseSection",
+    "EditEvent",
+    "EvidenceReport",
+    "ExternalMapping",
+    "ExternalPrincipal",
+    "LMSConnection",
+    "LMSSubmissionFingerprint",
+    "LoginTransaction",
+    "MoodleCredential",
+    "MoodleLoginAttempt",
+    "PlagiarismCase",
+    "PrincipalSession",
+    "ReviewClaim",
+    "ReviewDecision",
+    "ReviewDraft",
+    "RunRequest",
+    "RunResult",
+    "SimilarityAnalysis",
+    "SimilarityMatch",
+    "Snapshot",
+    "Submission",
+    "SyncOutbox",
+    "SystemSetting",
+    "TaskBankItem",
+    "TaskVersion",
+    "TeacherAccessToken",
+    "TeacherExperiment",
+    "TeacherExperimentFile",
+    "TeacherTokenGrant",
+    "UsedLaunchNonce",
+    "Workspace",
+    "WorkspaceFile",
+]

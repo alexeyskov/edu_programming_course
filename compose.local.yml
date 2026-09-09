@@ -1,0 +1,45 @@
+# Safe local UI/API smoke profile. It deliberately does not start a compiler
+# service and never executes submitted C/C++: backend runner responses are mocked.
+services:
+  runner:
+    profiles:
+      - linux-runner
+
+  backend:
+    environment:
+      AUTO_MIGRATE: "true"
+      APP_DEBUG: "true"
+      DEV_AUTH_ENABLED: "true"
+      MOODLE_MOCK_ENABLED: "true"
+      RUNNER_URL: ""
+      RUNNER_MOCK_ENABLED: "true"
+      AI_MOCK_ENABLED: "true"
+      SESSION_COOKIE_SECURE: "false"
+      SECURE_SSL_REDIRECT: "false"
+      SECURE_HSTS_SECONDS: "0"
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-local-admin-token}
+    depends_on:
+      runner:
+        condition: service_healthy
+        required: false
+
+  deadline-worker:
+    environment:
+      APP_DEBUG: "true"
+
+  sync-worker:
+    environment:
+      APP_DEBUG: "true"
+      MOODLE_MOCK_ENABLED: "true"
+
+  frontend:
+    build:
+      args:
+        VITE_DEMO_MODE: never
+        VITE_DEV_LOGIN: "true"
+
+volumes:
+  postgres-data:
+    # Disposable local smoke environments may let Compose create the volume;
+    # production uses an external volume managed by run_eduprog.sh.
+    external: false

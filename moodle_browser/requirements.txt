@@ -1,0 +1,6 @@
+beautifulsoup4==4.15.0
+fastapi==0.139.0
+playwright==1.62.0
+pydantic==2.13.4
+uvicorn[standard]==0.35.0
+

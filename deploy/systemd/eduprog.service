@@ -1,0 +1,34 @@
+[Unit]
+Description=Мехмат.Практикум (eduprog) course platform
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=alexey
+Group=alexey
+WorkingDirectory=/home/alexey/programming/edu_programming_course
+# NUC host binding is supplied here: PUBLIC_BIND_ADDRESS=127.0.0.1 and
+# PUBLIC_PORT=5173. The external VPS listener on :8080 is configured on the VPS.
+EnvironmentFile=/home/alexey/cpp_markup.env
+Environment=EDUPROG_ENV_FILE=/home/alexey/.config/eduprog/runtime.env
+Environment=EDUPROG_LEGACY_ENV_FILE=/home/alexey/.config/contour/runtime.env
+# Invoke Bash explicitly so deployments copied without the executable file bit
+# do not fail at systemd's EXEC stage (status=203/EXEC).
+ExecStart=/bin/bash /home/alexey/programming/edu_programming_course/run_eduprog.sh serve
+ExecStop=/bin/bash /home/alexey/programming/edu_programming_course/run_eduprog.sh stop
+Restart=always
+RestartSec=10
+KillMode=control-group
+TimeoutStartSec=infinity
+TimeoutStopSec=60
+SuccessExitStatus=143
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

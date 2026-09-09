@@ -1,0 +1,343 @@
+name: eduprog
+
+x-backend-environment: &backend-environment
+  APP_SECRET_KEY: ${APP_SECRET_KEY:?Set APP_SECRET_KEY in .env}
+  APP_DEBUG: ${APP_DEBUG:-false}
+  ALLOWED_HOSTS: ${ALLOWED_HOSTS:-localhost,127.0.0.1,backend}
+  CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:8080}
+  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+  FRONTEND_URL: ${FRONTEND_URL:-http://localhost:8080}
+  DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
+  DB_SSLMODE: ${DB_SSLMODE:-prefer}
+  SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+  SESSION_COOKIE_SAMESITE: ${SESSION_COOKIE_SAMESITE:-lax}
+  SECURE_SSL_REDIRECT: ${SECURE_SSL_REDIRECT:-false}
+  SECURE_HSTS_SECONDS: ${SECURE_HSTS_SECONDS:-0}
+  SECURE_HSTS_INCLUDE_SUBDOMAINS: ${SECURE_HSTS_INCLUDE_SUBDOMAINS:-false}
+  SECURE_HSTS_PRELOAD: ${SECURE_HSTS_PRELOAD:-false}
+  APP_BUILD: ${APP_BUILD:-compose}
+  DEV_AUTH_ENABLED: ${DEV_AUTH_ENABLED:-false}
+  MOODLE_MOCK_ENABLED: ${MOODLE_MOCK_ENABLED:-false}
+  ADMIN_TOKEN_HASH: ${ADMIN_TOKEN_HASH:-}
+  ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+  RUNNER_URL: http://runner:8081
+  RUNNER_SHARED_SECRET: ${RUNNER_SHARED_SECRET:?Set RUNNER_SHARED_SECRET in .env}
+  RUNNER_HTTP_TIMEOUT_SECONDS: ${RUNNER_HTTP_TIMEOUT_SECONDS:-65}
+  RUNNER_REQUEST_BODY_MAX_BYTES: ${RUNNER_REQUEST_BODY_MAX_BYTES:-4194304}
+  RUNNER_RESPONSE_BODY_MAX_BYTES: ${RUNNER_RESPONSE_BODY_MAX_BYTES:-8388608}
+  RUNNER_MAX_OUTPUT_BYTES: ${RUNNER_MAX_OUTPUT_BYTES:-1000000}
+  RUNNER_MAX_CONCURRENT_RUNS_PER_USER: ${RUNNER_MAX_CONCURRENT_RUNS_PER_USER:-2}
+  RUNNER_RATE_LIMIT_RUNS: ${RUNNER_RATE_LIMIT_RUNS:-30}
+  RUNNER_RATE_LIMIT_WINDOW_SECONDS: ${RUNNER_RATE_LIMIT_WINDOW_SECONDS:-60}
+  RUNNER_RUNNING_STALE_SECONDS: ${RUNNER_RUNNING_STALE_SECONDS:-120}
+  RUNNER_MOCK_ENABLED: ${RUNNER_MOCK_ENABLED:-false}
+  EVIDENCE_CASE_TIMEOUT_SECONDS: ${EVIDENCE_CASE_TIMEOUT_SECONDS:-8}
+  EVIDENCE_TOTAL_TIMEOUT_SECONDS: ${EVIDENCE_TOTAL_TIMEOUT_SECONDS:-50}
+  EVIDENCE_CPU_SECONDS_PER_CASE: ${EVIDENCE_CPU_SECONDS_PER_CASE:-2}
+  EVIDENCE_MAX_CONCURRENT_REPORTS_PER_TEACHER: ${EVIDENCE_MAX_CONCURRENT_REPORTS_PER_TEACHER:-1}
+  EVIDENCE_RATE_LIMIT_REPORTS: ${EVIDENCE_RATE_LIMIT_REPORTS:-5}
+  EVIDENCE_RATE_LIMIT_WINDOW_SECONDS: ${EVIDENCE_RATE_LIMIT_WINDOW_SECONDS:-300}
+  EVIDENCE_RUNNING_STALE_SECONDS: ${EVIDENCE_RUNNING_STALE_SECONDS:-120}
+  AI_ENABLED: ${AI_ENABLED:-false}
+  AI_MOCK_ENABLED: ${AI_MOCK_ENABLED:-false}
+  AI_BASE_URL: ${AI_BASE_URL:-https://api.openai.com/v1}
+  AI_API_KEY: ${AI_API_KEY:-}
+  AI_MODEL: ${AI_MODEL:-gpt-5-mini}
+  AI_API_STYLE: ${AI_API_STYLE:-responses}
+  AI_TIMEOUT_SECONDS: ${AI_TIMEOUT_SECONDS:-45}
+  AI_MAX_RESPONSE_BYTES: ${AI_MAX_RESPONSE_BYTES:-1048576}
+  AI_MAX_CONTEXT_BYTES: ${AI_MAX_CONTEXT_BYTES:-262144}
+  AI_MAX_OUTPUT_CHARS: ${AI_MAX_OUTPUT_CHARS:-12000}
+  AI_HISTORY_MESSAGES: ${AI_HISTORY_MESSAGES:-20}
+  AI_STUDENT_RATE_LIMIT_MESSAGES: ${AI_STUDENT_RATE_LIMIT_MESSAGES:-10}
+  AI_TEACHER_RATE_LIMIT_MESSAGES: ${AI_TEACHER_RATE_LIMIT_MESSAGES:-30}
+  AI_RATE_LIMIT_WINDOW_SECONDS: ${AI_RATE_LIMIT_WINDOW_SECONDS:-60}
+  AUTHORSHIP_ANALYZER_URL: ${AUTHORSHIP_ANALYZER_URL:-}
+  AUTHORSHIP_ANALYZER_TOKEN: ${AUTHORSHIP_ANALYZER_TOKEN:-}
+  AUTHORSHIP_ANALYZER_SHARED_SECRET: ${AUTHORSHIP_ANALYZER_SHARED_SECRET:-}
+  AUTHORSHIP_ANALYZER_TIMEOUT_SECONDS: ${AUTHORSHIP_ANALYZER_TIMEOUT_SECONDS:-30}
+  AUTHORSHIP_ALLOW_INSECURE_HTTP: ${AUTHORSHIP_ALLOW_INSECURE_HTTP:-false}
+  AUTHORSHIP_PSEUDONYM_SECRET: ${AUTHORSHIP_PSEUDONYM_SECRET:-}
+  AUTHORSHIP_MAX_EXPORT_BYTES: ${AUTHORSHIP_MAX_EXPORT_BYTES:-16777216}
+  AUTHORSHIP_MAX_RESPONSE_BYTES: ${AUTHORSHIP_MAX_RESPONSE_BYTES:-1048576}
+  PLAGIARISM_SHINGLE_SIZE: ${PLAGIARISM_SHINGLE_SIZE:-7}
+  PLAGIARISM_WINNOW_WINDOW: ${PLAGIARISM_WINNOW_WINDOW:-5}
+  PLAGIARISM_MIN_SCORE: ${PLAGIARISM_MIN_SCORE:-0.30}
+  PLAGIARISM_MAX_EVIDENCE: ${PLAGIARISM_MAX_EVIDENCE:-20}
+  PLAGIARISM_MAX_SUBMISSIONS: ${PLAGIARISM_MAX_SUBMISSIONS:-300}
+  PLAGIARISM_MAX_SUBMISSION_BYTES: ${PLAGIARISM_MAX_SUBMISSION_BYTES:-2097152}
+  PLAGIARISM_MAX_SCAN_BYTES: ${PLAGIARISM_MAX_SCAN_BYTES:-67108864}
+  MOODLE_BASE_URL: ${MOODLE_BASE_URL:-}
+  MOODLE_CONNECTION_NAME: ${MOODLE_CONNECTION_NAME:-University Moodle}
+  MOODLE_SERVICE_TOKEN: ${MOODLE_SERVICE_TOKEN:-}
+  MOODLE_LAUNCH_SHARED_SECRET: ${MOODLE_LAUNCH_SHARED_SECRET:-}
+  MOODLE_CREDENTIAL_ENCRYPTION_KEY: ${MOODLE_CREDENTIAL_ENCRYPTION_KEY:-}
+  MOODLE_HTTP_TIMEOUT_SECONDS: ${MOODLE_HTTP_TIMEOUT_SECONDS:-15}
+  MOODLE_MAX_RESPONSE_BYTES: ${MOODLE_MAX_RESPONSE_BYTES:-4194304}
+  MOODLE_LOGIN_RATE_LIMIT_ATTEMPTS: ${MOODLE_LOGIN_RATE_LIMIT_ATTEMPTS:-8}
+  MOODLE_LOGIN_NETWORK_RATE_LIMIT_ATTEMPTS: ${MOODLE_LOGIN_NETWORK_RATE_LIMIT_ATTEMPTS:-256}
+  MOODLE_LOGIN_RATE_LIMIT_WINDOW_SECONDS: ${MOODLE_LOGIN_RATE_LIMIT_WINDOW_SECONDS:-300}
+  MOODLE_MAX_CONCURRENT_LOGINS_PER_WORKER: ${MOODLE_MAX_CONCURRENT_LOGINS_PER_WORKER:-2}
+  MOODLE_CREDENTIAL_LOGIN_ALLOW_INSECURE_HTTP: ${MOODLE_CREDENTIAL_LOGIN_ALLOW_INSECURE_HTTP:-false}
+  MOODLE_BROWSER_SERVICE_URL: http://moodle-browser:8083
+  MOODLE_BROWSER_SHARED_SECRET: ${MOODLE_BROWSER_SHARED_SECRET:?Set MOODLE_BROWSER_SHARED_SECRET in .env}
+  MOODLE_BROWSER_HTTP_TIMEOUT_SECONDS: ${MOODLE_BROWSER_HTTP_TIMEOUT_SECONDS:-300}
+  MOODLE_BROWSER_REQUEST_BODY_MAX_BYTES: ${MOODLE_BROWSER_REQUEST_BODY_MAX_BYTES:-6291456}
+  MOODLE_BROWSER_MAX_RESPONSE_BYTES: ${MOODLE_BROWSER_MAX_RESPONSE_BYTES:-4194304}
+  MOODLE_BROWSER_STORAGE_STATE_MAX_BYTES: ${MOODLE_BROWSER_STORAGE_STATE_MAX_BYTES:-262144}
+  LMS_CHECKPOINT_MAX_BYTES: ${LMS_CHECKPOINT_MAX_BYTES:-4194304}
+  LMS_CHECKPOINT_MAX_FILES: ${LMS_CHECKPOINT_MAX_FILES:-128}
+  LMS_SYNC_RECEIPT_MAX_BYTES: ${LMS_SYNC_RECEIPT_MAX_BYTES:-65536}
+  LMS_SYNC_COURSE_INTERVAL_SECONDS: ${LMS_SYNC_COURSE_INTERVAL_SECONDS:-900}
+  LMS_SYNC_MAX_ATTEMPTS: ${LMS_SYNC_MAX_ATTEMPTS:-8}
+  LMS_SYNC_RETRY_BASE_SECONDS: ${LMS_SYNC_RETRY_BASE_SECONDS:-15}
+  LMS_SYNC_RETRY_MAX_SECONDS: ${LMS_SYNC_RETRY_MAX_SECONDS:-3600}
+  LMS_SYNC_LOCK_TIMEOUT_SECONDS: ${LMS_SYNC_LOCK_TIMEOUT_SECONDS:-300}
+  LMS_SYNC_WORKER_POLL_SECONDS: ${LMS_SYNC_WORKER_POLL_SECONDS:-2}
+  LMS_SYNC_WORKER_CONCURRENCY: ${LMS_SYNC_WORKER_CONCURRENCY:-2}
+  LMS_EMBEDDED_TERMINAL_WORKER_ENABLED: ${LMS_EMBEDDED_TERMINAL_WORKER_ENABLED:-true}
+  DEADLINE_POLL_SECONDS: ${DEADLINE_POLL_SECONDS:-5}
+  WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+  WEB_TIMEOUT_SECONDS: ${WEB_TIMEOUT_SECONDS:-90}
+  # Backend is reachable only from the internal edge network; trust the
+  # Nginx container's normalized forwarding headers, not public clients.
+  FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-*}
+
+x-backend-image: &backend-image
+  image: eduprog-backend:${APP_IMAGE_TAG:-local}
+  environment: *backend-environment
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,noexec,size=128m,mode=1777
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  runner:
+    image: eduprog-runner:${APP_IMAGE_TAG:-local}
+    build:
+      context: ./runner
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: ${RUNNER_CONTAINER_MEMORY:-3g}
+    cpus: ${RUNNER_CONTAINER_CPUS:-2.0}
+    environment:
+      RUNNER_SHARED_SECRET: ${RUNNER_SHARED_SECRET:?Set RUNNER_SHARED_SECRET in .env}
+      # Deliberately mirrors the legacy implementation: compile and execute as
+      # ordinary subprocesses inside this dedicated runner container.
+      RUNNER_EXECUTOR: local
+      RUNNER_WORK_ROOT: /var/lib/edu-runner/jobs
+      RUNNER_MAX_CONCURRENT_JOBS: ${RUNNER_MAX_CONCURRENT_JOBS:-2}
+      RUNNER_QUEUE_WAIT_SECONDS: ${RUNNER_QUEUE_WAIT_SECONDS:-0.25}
+      RUNNER_INTERACTIVE_WALL_SECONDS: ${RUNNER_INTERACTIVE_WALL_SECONDS:-60}
+      RUNNER_INTERACTIVE_TERMINAL_TTL_SECONDS: ${RUNNER_INTERACTIVE_TERMINAL_TTL_SECONDS:-300}
+      RUNNER_REQUEST_BODY_LIMIT_BYTES: ${RUNNER_REQUEST_BODY_LIMIT_BYTES:-4194304}
+      RUNNER_SIGNATURE_CLOCK_SKEW_SECONDS: ${RUNNER_SIGNATURE_CLOCK_SKEW_SECONDS:-60}
+      RUNNER_NONCE_TTL_SECONDS: ${RUNNER_NONCE_TTL_SECONDS:-300}
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
+      - /var/lib/edu-runner/jobs:rw,nosuid,nodev,exec,size=${RUNNER_WORKSPACE_TMPFS_SIZE:-1g},uid=65532,gid=65532,mode=0700
+    networks:
+      - execution
+
+  moodle-browser:
+    image: eduprog-moodle-browser:${APP_IMAGE_TAG:-local}
+    build:
+      context: ./moodle_browser
+    init: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    mem_limit: ${MOODLE_BROWSER_CONTAINER_MEMORY:-1g}
+    cpus: ${MOODLE_BROWSER_CONTAINER_CPUS:-1.5}
+    shm_size: ${MOODLE_BROWSER_SHM_SIZE:-512m}
+    environment:
+      MOODLE_BROWSER_SHARED_SECRET: ${MOODLE_BROWSER_SHARED_SECRET:?Set MOODLE_BROWSER_SHARED_SECRET in .env}
+      MOODLE_BROWSER_BASE_URL: ${MOODLE_BASE_URL:-https://edu.mmcs.sfedu.ru}
+      MOODLE_BROWSER_HEADLESS: ${MOODLE_BROWSER_HEADLESS:-true}
+      # Keep one bounded Chromium context available for login while a
+      # background course/history crawl occupies the other context.
+      MOODLE_BROWSER_MAX_CONCURRENT_OPERATIONS: ${MOODLE_BROWSER_MAX_CONCURRENT_OPERATIONS:-3}
+      MOODLE_BROWSER_QUEUE_WAIT_SECONDS: ${MOODLE_BROWSER_QUEUE_WAIT_SECONDS:-8}
+      MOODLE_BROWSER_NAVIGATION_TIMEOUT_MS: ${MOODLE_BROWSER_NAVIGATION_TIMEOUT_MS:-30000}
+      MOODLE_BROWSER_MAX_LOGIN_COURSE_ROLE_PAGES: ${MOODLE_BROWSER_MAX_LOGIN_COURSE_ROLE_PAGES:-64}
+      MOODLE_BROWSER_LOGIN_COURSE_ROLE_BUDGET_SECONDS: ${MOODLE_BROWSER_LOGIN_COURSE_ROLE_BUDGET_SECONDS:-15}
+      MOODLE_BROWSER_LOGIN_OPERATION_TIMEOUT_SECONDS: ${MOODLE_BROWSER_LOGIN_OPERATION_TIMEOUT_SECONDS:-45}
+      MOODLE_BROWSER_ACTIVITY_DETAIL_BUDGET_SECONDS: ${MOODLE_BROWSER_ACTIVITY_DETAIL_BUDGET_SECONDS:-240}
+      MOODLE_BROWSER_MAX_PARTICIPANT_PAGES: ${MOODLE_BROWSER_MAX_PARTICIPANT_PAGES:-50}
+      MOODLE_BROWSER_PARTICIPANTS_PER_PAGE: ${MOODLE_BROWSER_PARTICIPANTS_PER_PAGE:-100}
+      MOODLE_BROWSER_MAX_PARTICIPANTS: ${MOODLE_BROWSER_MAX_PARTICIPANTS:-5000}
+      MOODLE_BROWSER_STORAGE_STATE_MAX_BYTES: ${MOODLE_BROWSER_STORAGE_STATE_MAX_BYTES:-262144}
+      MOODLE_BROWSER_REQUEST_BODY_MAX_BYTES: ${MOODLE_BROWSER_REQUEST_BODY_MAX_BYTES:-6291456}
+      MOODLE_BROWSER_SIGNATURE_CLOCK_SKEW_SECONDS: ${MOODLE_BROWSER_SIGNATURE_CLOCK_SKEW_SECONDS:-60}
+      MOODLE_BROWSER_NONCE_TTL_SECONDS: ${MOODLE_BROWSER_NONCE_TTL_SECONDS:-300}
+    tmpfs:
+      # Ubuntu Noble reserves uid 1000; the official Playwright image creates
+      # pwuser as uid/gid 1001. Keep these mounts aligned or Chromium cannot
+      # create /tmp/playwright-artifacts-* and the service exits during startup.
+      - /tmp:rw,nosuid,nodev,noexec,size=384m,uid=1001,gid=1001,mode=1777
+      - /home/pwuser/.cache:rw,nosuid,nodev,noexec,size=32m,uid=1001,gid=1001,mode=0700
+      - /home/pwuser/.config:rw,nosuid,nodev,noexec,size=32m,uid=1001,gid=1001,mode=0700
+    networks:
+      - browser-rpc
+      - integration
+
+  backend:
+    <<: *backend-image
+    build:
+      context: ./backend
+    environment:
+      <<: *backend-environment
+      # Production migrations are an explicit deployment step. The local
+      # override enables this only for its disposable smoke environment.
+      AUTO_MIGRATE: ${BACKEND_AUTO_MIGRATE:-false}
+    networks:
+      - edge
+      - data
+      - execution
+      - browser-rpc
+    depends_on:
+      postgres:
+        condition: service_healthy
+      moodle-browser:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; request=urllib.request.Request('http://127.0.0.1:8000/api/v1/system/health', headers={'X-Forwarded-Proto':'https'}); urllib.request.urlopen(request, timeout=3).read()
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  deadline-worker:
+    <<: *backend-image
+    init: true
+    entrypoint: ["python", "-m", "app.workers.scheduler"]
+    environment:
+      APP_SECRET_KEY: ${APP_SECRET_KEY:?Set APP_SECRET_KEY in .env}
+      APP_DEBUG: ${APP_DEBUG:-false}
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
+      DB_SSLMODE: ${DB_SSLMODE:-prefer}
+      APP_BUILD: ${APP_BUILD:-compose}
+      DEADLINE_POLL_SECONDS: ${DEADLINE_POLL_SECONDS:-5}
+      LMS_CHECKPOINT_MAX_BYTES: ${LMS_CHECKPOINT_MAX_BYTES:-4194304}
+      LMS_CHECKPOINT_MAX_FILES: ${LMS_CHECKPOINT_MAX_FILES:-128}
+      LMS_SYNC_COURSE_INTERVAL_SECONDS: ${LMS_SYNC_COURSE_INTERVAL_SECONDS:-900}
+    networks:
+      - data
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  sync-worker:
+    <<: *backend-image
+    init: true
+    entrypoint: ["python", "-m", "app.workers.sync"]
+    environment:
+      APP_SECRET_KEY: ${APP_SECRET_KEY:?Set APP_SECRET_KEY in .env}
+      APP_DEBUG: ${APP_DEBUG:-false}
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
+      DB_SSLMODE: ${DB_SSLMODE:-prefer}
+      APP_BUILD: ${APP_BUILD:-compose}
+      MOODLE_MOCK_ENABLED: ${MOODLE_MOCK_ENABLED:-false}
+      MOODLE_CONNECTION_NAME: ${MOODLE_CONNECTION_NAME:-University Moodle}
+      MOODLE_BASE_URL: ${MOODLE_BASE_URL:-}
+      MOODLE_SERVICE_TOKEN: ${MOODLE_SERVICE_TOKEN:-}
+      MOODLE_CREDENTIAL_ENCRYPTION_KEY: ${MOODLE_CREDENTIAL_ENCRYPTION_KEY:-}
+      MOODLE_HTTP_TIMEOUT_SECONDS: ${MOODLE_HTTP_TIMEOUT_SECONDS:-15}
+      MOODLE_MAX_RESPONSE_BYTES: ${MOODLE_MAX_RESPONSE_BYTES:-4194304}
+      MOODLE_BROWSER_SERVICE_URL: http://moodle-browser:8083
+      MOODLE_BROWSER_SHARED_SECRET: ${MOODLE_BROWSER_SHARED_SECRET:?Set MOODLE_BROWSER_SHARED_SECRET in .env}
+      MOODLE_BROWSER_HTTP_TIMEOUT_SECONDS: ${MOODLE_BROWSER_HTTP_TIMEOUT_SECONDS:-300}
+      MOODLE_BROWSER_REQUEST_BODY_MAX_BYTES: ${MOODLE_BROWSER_REQUEST_BODY_MAX_BYTES:-6291456}
+      MOODLE_BROWSER_MAX_RESPONSE_BYTES: ${MOODLE_BROWSER_MAX_RESPONSE_BYTES:-4194304}
+      MOODLE_BROWSER_STORAGE_STATE_MAX_BYTES: ${MOODLE_BROWSER_STORAGE_STATE_MAX_BYTES:-262144}
+      LMS_CHECKPOINT_MAX_BYTES: ${LMS_CHECKPOINT_MAX_BYTES:-4194304}
+      LMS_CHECKPOINT_MAX_FILES: ${LMS_CHECKPOINT_MAX_FILES:-128}
+      LMS_SYNC_RECEIPT_MAX_BYTES: ${LMS_SYNC_RECEIPT_MAX_BYTES:-65536}
+      LMS_SYNC_COURSE_INTERVAL_SECONDS: ${LMS_SYNC_COURSE_INTERVAL_SECONDS:-900}
+      LMS_SYNC_MAX_ATTEMPTS: ${LMS_SYNC_MAX_ATTEMPTS:-8}
+      LMS_SYNC_RETRY_BASE_SECONDS: ${LMS_SYNC_RETRY_BASE_SECONDS:-15}
+      LMS_SYNC_RETRY_MAX_SECONDS: ${LMS_SYNC_RETRY_MAX_SECONDS:-3600}
+      LMS_SYNC_LOCK_TIMEOUT_SECONDS: ${LMS_SYNC_LOCK_TIMEOUT_SECONDS:-300}
+      LMS_SYNC_WORKER_POLL_SECONDS: ${LMS_SYNC_WORKER_POLL_SECONDS:-2}
+      LMS_SYNC_WORKER_CONCURRENCY: ${LMS_SYNC_WORKER_CONCURRENCY:-2}
+    networks:
+      - data
+      - integration
+      - browser-rpc
+    depends_on:
+      backend:
+        condition: service_healthy
+      moodle-browser:
+        condition: service_healthy
+
+  frontend:
+    image: eduprog-frontend:${APP_IMAGE_TAG:-local}
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE: /api/v1
+        VITE_DEMO_MODE: ${VITE_DEMO_MODE:-never}
+        VITE_DEV_LOGIN: ${VITE_DEV_LOGIN:-false}
+        VITE_APP_NAME: ${VITE_APP_NAME:-Мехмат.Практикум}
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=32m,mode=1777
+      - /var/cache/nginx:rw,nosuid,nodev,noexec,size=32m,uid=101,gid=101,mode=0755
+      - /var/run:rw,nosuid,nodev,noexec,size=8m,mode=0755
+    ports:
+      - "${PUBLIC_BIND_ADDRESS:-127.0.0.1}:${PUBLIC_PORT:-8080}:8080"
+    networks:
+      - edge
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+    # The launcher chooses the existing legacy volume during a NUC migration,
+    # otherwise a fresh eduprog volume is created. Never attach two running
+    # PostgreSQL containers to this physical volume.
+    name: ${POSTGRES_VOLUME_NAME:-eduprog_postgres-data}
+    external: true
+
+networks:
+  edge:
+  data:
+    internal: true
+  execution:
+    internal: true
+  browser-rpc:
+    internal: true
+  integration:

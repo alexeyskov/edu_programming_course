@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="ru">
+  <body>
+    <a href="/login/logout.php?sesskey=opaque">Выход</a>
+    <table id="participants">
+      <thead><tr><th>Выбрать</th><th>ФИО</th><th>Роли</th><th>Группы</th><th>Email</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><input type="checkbox"></td>
+          <th><a href="/user/view.php?id=42&amp;course=549">Алексей Преподаватель</a></th>
+          <td class="c2"><a class="quickeditlink">Преподаватель</a></td>
+          <td class="c3"><a href="/group/index.php?id=549&amp;group=9">2.4 подгруппа А</a></td>
+          <td><a href="mailto:teacher@example.test">teacher@example.test</a></td>
+        </tr>
+        <tr>
+          <td><input type="checkbox"></td>
+          <th><a href="/user/view.php?id=77&amp;course=549">Иван Студент</a></th>
+          <td class="c2"><a class="quickeditlink">Студент</a></td>
+          <td class="c3"><a class="quickeditlink">2.4 подгруппа А</a></td>
+          <td>student@example.test</td>
+        </tr>
+      </tbody>
+    </table>
+    <nav aria-label="Страница">
+      <ul class="pagination"><li class="page-item"><a href="/user/index.php?id=549&amp;page=1" aria-label="Следующая">»</a></li></ul>
+    </nav>
+  </body>
+</html>
+
