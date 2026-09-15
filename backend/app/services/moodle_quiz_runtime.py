@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from sqlalchemy import select
@@ -10,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.base import utcnow
 from app.integrations.moodle_modes import moodle_auth_mode, moodle_pluginless_transport
 from app.integrations.moodle_transport import normalize_moodle_essay_answer_transport
+from app.models.attempts import Attempt
 from app.models.courses import Course
 from app.models.enums import LMSProvider, TaskVersionStatus
 from app.models.identity import LMSConnection
@@ -59,6 +62,38 @@ class PreparedMoodleQuizAttempt:
     answer_transport: str
     available_answer_transports: tuple[str, ...]
     remaining_seconds: int | None = None
+    question_max_mark: Decimal | None = None
+    questions: tuple[PreparedMoodleQuizAttempt, ...] = ()
+
+
+def apply_prepared_quiz_timer(
+    attempt: Attempt,
+    *,
+    remaining_seconds: int | None,
+    reserve_seconds: int,
+    now: datetime,
+) -> None:
+    """Reserve upload time against the live, per-user timer, never course dates.
+
+    The configured reserve is pinned once per attempt. A subsequent successful
+    preparation can refresh Moodle's remaining time (including an extension),
+    but never subtracts the reserve from an already reduced local deadline.
+    A missing timer cannot erase a previously confirmed deadline.
+    """
+    policy = dict(attempt.integrity_policy or {})
+    pinned = policy.get("moodle_sync_timeout_seconds")
+    has_pinned_reserve = type(pinned) is int and 0 <= pinned <= 86_400
+    if remaining_seconds is None:
+        if not has_pinned_reserve:
+            # Repair legacy deadlines derived from global dates, which do not
+            # reflect student/group overrides. Unlimited work stays untimed.
+            attempt.expected_end_at = None
+            attempt.deadline_at = None
+        return
+    reserve = pinned if has_pinned_reserve else reserve_seconds
+    attempt.expected_end_at = now + timedelta(seconds=remaining_seconds)
+    attempt.deadline_at = now + timedelta(seconds=max(0, remaining_seconds - reserve))
+    attempt.integrity_policy = {**policy, "moodle_sync_timeout_seconds": reserve}
 
 
 def prepared_moodle_assignment(
@@ -109,6 +144,17 @@ def _positive_decimal_id(value: object, label: str, *, maximum: int = 2_147_483_
     return str(int(normalized))
 
 
+def moodle_question_local_max_score(mark: Decimal) -> Decimal:
+    """Use the app's two-decimal score scale without losing Moodle's raw mark.
+
+    The exact mark remains in the immutable question binding. Grade delivery
+    converts the relative local grade back to that Moodle scale.
+    """
+
+    rounded = mark.quantize(Decimal("0.01"))
+    return rounded if rounded > 0 else Decimal("1.00")
+
+
 def prepared_moodle_quiz_attempt(
     *,
     course_external_id: object,
@@ -119,6 +165,8 @@ def prepared_moodle_quiz_attempt(
     answer_transport: object,
     available_answer_transports: object,
     remaining_seconds: object = None,
+    question_max_mark: object = None,
+    questions: object = None,
 ) -> PreparedMoodleQuizAttempt:
     course_id = _positive_decimal_id(course_external_id, "Moodle course id")
     normalized_cmid = int(_positive_decimal_id(cmid, "Moodle activity id"))
@@ -180,6 +228,63 @@ def prepared_moodle_quiz_attempt(
             "INVALID_MOODLE_PREPARATION",
             "Moodle remaining attempt time is invalid",
         )
+    mark = None
+    if question_max_mark is not None:
+        try:
+            mark = Decimal(str(question_max_mark))
+        except (InvalidOperation, ValueError) as exc:
+            raise DomainError(
+                502, "INVALID_MOODLE_PREPARATION", "Moodle question mark is invalid"
+            ) from exc
+        if (
+            not mark.is_finite()
+            or not 0 < mark <= Decimal("999999.99")
+            or mark != mark.quantize(Decimal("0.0000001"))
+        ):
+            raise DomainError(
+                502, "INVALID_MOODLE_PREPARATION", "Moodle question mark is invalid"
+            )
+    prepared_questions: tuple[PreparedMoodleQuizAttempt, ...] = ()
+    if questions is not None:
+        if not isinstance(questions, list | tuple) or not 1 <= len(questions) <= 32:
+            raise DomainError(
+                502, "INVALID_MOODLE_PREPARATION", "Moodle question list is invalid"
+            )
+        parsed_questions = []
+        for raw_question in questions:
+            if not isinstance(raw_question, dict):
+                raise DomainError(
+                    502, "INVALID_MOODLE_PREPARATION", "Moodle question list is invalid"
+                )
+            question = prepared_moodle_quiz_attempt(
+                course_external_id=course_id,
+                cmid=normalized_cmid,
+                external_attempt_id=attempt_id,
+                question_slot=raw_question.get("question_slot"),
+                question_text=raw_question.get("question_text"),
+                answer_transport=raw_question.get("answer_transport"),
+                available_answer_transports=raw_question.get("available_answer_transports"),
+                remaining_seconds=remaining_seconds,
+                question_max_mark=raw_question.get("question_max_mark"),
+            )
+            if len(questions) > 1 and question.question_max_mark is None:
+                raise DomainError(
+                    502, "INVALID_MOODLE_PREPARATION", "Moodle question mark is unconfirmed"
+                )
+            parsed_questions.append(question)
+        first = parsed_questions[0]
+        if (
+            len({question.question_slot for question in parsed_questions}) != len(parsed_questions)
+            or first.question_slot != slot
+            or first.question_text != statement
+            or first.answer_transport != transport
+            or first.available_answer_transports != available
+        ):
+            raise DomainError(
+                502, "INVALID_MOODLE_PREPARATION", "Moodle question list is inconsistent"
+            )
+        prepared_questions = tuple(parsed_questions)
+        mark = first.question_max_mark
     return PreparedMoodleQuizAttempt(
         course_external_id=course_id,
         cmid=normalized_cmid,
@@ -189,6 +294,8 @@ def prepared_moodle_quiz_attempt(
         answer_transport=transport,
         available_answer_transports=available,
         remaining_seconds=remaining_seconds,
+        question_max_mark=mark,
+        questions=prepared_questions,
     )
 
 
@@ -431,6 +538,11 @@ async def materialize_prepared_task_version(
             if (
                 candidate.statement != prepared.question_text
                 or policy.get("answer_transport") != prepared.answer_transport
+                or (
+                    policy.get("moodle_question_max_mark") is not None
+                    and str(policy["moodle_question_max_mark"])
+                    != str(prepared.question_max_mark)
+                )
             ):
                 raise DomainError(
                     409,
@@ -453,6 +565,12 @@ async def materialize_prepared_task_version(
         "question_sha256": sha256_text(prepared.question_text),
         "base_task_version_id": str(base_version.id),
     }
+    question_scale = len(prepared.questions) > 1 or (
+        prepared.question_max_mark is not None
+        and dict(base_version.ai_policy or {}).get("historical_import_only") is True
+    )
+    if question_scale:
+        ai_policy["moodle_question_max_mark"] = str(prepared.question_max_mark)
     version = TaskVersion(
         item_id=base_version.item_id,
         number=(versions[0].number if versions else base_version.number) + 1,
@@ -472,7 +590,11 @@ async def materialize_prepared_task_version(
         ),
         public_examples=list(base_version.public_examples or []),
         hidden_test_manifest=dict(base_version.hidden_test_manifest or {}),
-        max_score=base_version.max_score,
+        max_score=(
+            moodle_question_local_max_score(prepared.question_max_mark)
+            if question_scale and prepared.question_max_mark is not None
+            else base_version.max_score
+        ),
         difficulty=base_version.difficulty,
         ai_policy=ai_policy,
         content_hash="",
@@ -490,6 +612,7 @@ __all__ = [
     "DeferredMoodleQuizContext",
     "PreparedMoodleQuizAttempt",
     "materialize_prepared_task_version",
+    "moodle_question_local_max_score",
     "pinned_moodle_quiz_binding",
     "prepared_binding_matches_attempt",
     "prepared_moodle_quiz_attempt",

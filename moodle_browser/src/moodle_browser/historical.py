@@ -15,6 +15,11 @@ from .parsers import MoodleMarkupError, canonical_hash
 
 _POSITIVE_ID = re.compile(r"^[1-9][0-9]{0,19}$")
 _WHITESPACE = re.compile(r"\s+")
+# Moodle sets the rendered Assignment table id to "submissions". The
+# mod_assign_grading name is a preference key, not its standard DOM id.
+_ASSIGNMENT_TABLE_SELECTOR = (
+    "table#submissions, table#mod_assign_grading, table#gradingtable, table.gradingtable"
+)
 _NUMBER = r"([0-9]+(?:[.,][0-9]+)?)"
 _GRADE_PAIR = re.compile(
     rf"{_NUMBER}\s*(?:/|из|out\s+of)\s*{_NUMBER}",
@@ -93,6 +98,17 @@ def _text(node: Tag | None, *, maximum: int = 255) -> str:
     if node is None:
         return ""
     return _WHITESPACE.sub(" ", node.get_text(" ", strip=True)).strip()[:maximum]
+
+
+def _empty_table_spacer(row: Tag) -> bool:
+    # Moodle's standard emptyrow is decoration, not a lost submission. Keep
+    # reporting malformed rows that carry content or student/attempt evidence.
+    return (
+        "emptyrow" in (row.get("class") or [])
+        and not _text(row)
+        and not any(key.startswith("data-") for key in row.attrs)
+        and not row.select("a, input, time, [data-userid], [data-attemptid]")
+    )
 
 
 def _trim_empty_boundary_lines(value: str, *, maximum: int) -> str:
@@ -437,7 +453,7 @@ def _report_explicitly_empty(
     if region.select_one(
         "a[href*='attempt='], input[name='attemptid[]'], input[name='attemptid'], "
         "a[href*='/mod/assign/view.php'][href*='userid='], "
-        "table#attempts, table#mod_assign_grading, table#gradingtable, table.gradingtable"
+        f"table#attempts, {_ASSIGNMENT_TABLE_SELECTOR}"
     ) or _has_next_page(soup, base_url, report_path, page_number):
         return False
     empty_messages = {
@@ -481,6 +497,8 @@ def parse_quiz_report_page(
     seen: set[str] = set()
     skipped = 0
     for row in table.select("tbody tr"):
+        if _empty_table_spacer(row):
+            continue
         user_id, display_name = _user_evidence(row, base_url)
         grade_node = row.select_one("td.grade, .grade, [data-column='grade']")
         grade, grade_max = _grade(_text(grade_node, maximum=2_000))
@@ -812,7 +830,7 @@ def parse_assignment_grading_page(
     soup = BeautifulSoup(html, "html.parser")
     if not _course_context(soup, base_url, course_id):
         raise MoodleMarkupError("Moodle assignment grading page has another course context")
-    table = soup.select_one("table#mod_assign_grading, table#gradingtable, table.gradingtable")
+    table = soup.select_one(_ASSIGNMENT_TABLE_SELECTOR)
     if table is None:
         if _report_explicitly_empty(soup, base_url, "/mod/assign/view.php", page_number):
             return HistoricalIndexPage(items=[], has_next=False)
@@ -822,6 +840,8 @@ def parse_assignment_grading_page(
     seen: set[str] = set()
     skipped = 0
     for row in table.select("tbody tr"):
+        if _empty_table_spacer(row):
+            continue
         user_id, display_name = _user_evidence(row, base_url)
         if not user_id:
             skipped += 1

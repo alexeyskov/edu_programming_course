@@ -28,6 +28,19 @@ class AttemptStartRequest(EmptyMutation):
     pass
 
 
+class QuizSessionQuestionRead(ReadModel):
+    attempt_id: UUID
+    slot: Annotated[str, StringConstraints(min_length=1, max_length=64)]
+    title: Annotated[str, StringConstraints(min_length=1, max_length=255)]
+    position: int = Field(ge=1, le=32)
+
+
+class QuizSessionRead(ReadModel):
+    id: UUID
+    root_attempt_id: UUID
+    questions: list[QuizSessionQuestionRead] = Field(min_length=2, max_length=32)
+
+
 class AttemptStudentRead(ReadModel):
     """Attempt state without assigned variant IDs or captured integrity policy."""
 
@@ -40,6 +53,9 @@ class AttemptStudentRead(ReadModel):
     started_at: datetime
     expected_end_at: datetime | None = None
     deadline_at: datetime | None = None
+    # None means Moodle has not supplied an authoritative timer, not unlimited.
+    has_time_limit: bool | None = None
+    moodle_sync_timeout_seconds: int | None = Field(default=None, ge=0, le=86_400)
     current_revision: Revision
     submitted_at: datetime | None = None
     paste_policy: PastePolicy = "INTERNAL_ONLY"
@@ -52,6 +68,7 @@ class AttemptStudentRead(ReadModel):
     # Moodle preparation contract.  It reveals no connector policy; clients
     # use it to call the idempotent start endpoint before showing the editor.
     requires_live_lms_preparation: bool = False
+    quiz_session: QuizSessionRead | None = None
 
 
 class AttemptTeacherRead(AttemptStudentRead):
@@ -93,10 +110,17 @@ class WorkspaceTeacherRead(WorkspaceStudentRead):
     updated_at: datetime
 
 
+class ClipboardPasteRange(MutationModel):
+    # Unicode code points, matching edit history (not JavaScript UTF-16 offsets).
+    offset: int = Field(ge=0, le=2_097_152)
+    delete_count: int = Field(ge=0, le=2_097_152)
+
+
 class WorkspaceFilePatchRequest(MutationModel):
     content: SourceContent
     source: EditSource = "TYPING"
     receipt_id: UUID | None = None
+    paste_range: ClipboardPasteRange | None = None
     client_id: Annotated[str, StringConstraints(max_length=100)] = ""
     client_request_id: Annotated[str, StringConstraints(max_length=100)] | None = None
 
@@ -106,6 +130,8 @@ class WorkspaceFilePatchRequest(MutationModel):
             raise ValueError("receipt_id is required for INTERNAL_PASTE")
         if self.source == "TYPING" and self.receipt_id is not None:
             raise ValueError("receipt_id is only valid for INTERNAL_PASTE")
+        if self.source != "INTERNAL_PASTE" and self.paste_range is not None:
+            raise ValueError("paste_range is only valid for INTERNAL_PASTE")
         return self
 
 
@@ -206,7 +232,7 @@ class AttemptHistoryEventRead(ReadModel):
 
 
 class ClipboardReceiptCreateRequest(MutationModel):
-    """file_id identifies the copied source; the receipt remains attempt-scoped."""
+    """Source proof is also usable by pinned sibling questions of the same quiz attempt."""
 
     file_id: UUID
     text: Annotated[str, StringConstraints(min_length=1, max_length=1_048_576)]
@@ -257,6 +283,8 @@ __all__ = [
     "EditSource",
     "FileCreateChange",
     "FileDeleteChange",
+    "QuizSessionQuestionRead",
+    "QuizSessionRead",
     "SnapshotTeacherRead",
     "WorkspaceFileCreateRead",
     "WorkspaceFileCreateRequest",

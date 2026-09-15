@@ -240,4 +240,6 @@ async def test_deferred_quiz_preparation_uses_student_session_and_persists_bindi
     assert attempt.integrity_policy["moodle_answer_transport"] == "ESSAY_ATTACHMENT"
     assert attempt.expected_end_at is not None
     assert 6_330 <= (attempt.expected_end_at - attempt.started_at).total_seconds() <= 6_333
-    assert attempt.deadline_at is None
+    assert attempt.deadline_at is not None
+    assert (attempt.expected_end_at - attempt.deadline_at).total_seconds() == 300
+    assert attempt.integrity_policy["moodle_sync_timeout_seconds"] == 300

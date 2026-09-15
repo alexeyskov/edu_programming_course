@@ -25,7 +25,13 @@ export function findWorkspacePasteSource(
   text: string,
 ): WorkspaceFile | undefined {
   if (!text) return undefined;
-  return files.find((file) => file.content.includes(text));
+  const normalized = normalizeClipboardText(text);
+  return files.find((file) => normalizeClipboardText(file.content).includes(normalized));
+}
+
+// Clipboard/Monaco may translate Windows line endings, but no other characters.
+export function normalizeClipboardText(text: string): string {
+  return text.replace(/\r\n/g, '\n');
 }
 
 export function cn(...parts: Array<string | false | null | undefined>): string {
@@ -139,22 +145,4 @@ export function validateWorkspacePath(path: string): string | null {
   if (!/^[\p{L}\p{N}_./-]+$/u.test(normalized)) return 'В имени есть недопустимые символы';
   if (!/\.(c|cc|cpp|cxx|h|hh|hpp|hxx|inc|txt)$/i.test(normalized)) return 'Допустимы только C/C++ и текстовые файлы';
   return null;
-}
-
-export interface InternalClipboardReceipt {
-  attemptId: string;
-  text: string;
-  sourceFileId: string;
-  createdAt: number;
-  serverReceiptId?: string;
-}
-
-export function isReceiptUsable(
-  receipt: InternalClipboardReceipt | null,
-  attemptId: string,
-  text: string,
-  now = Date.now(),
-  ttlMs = 5 * 60_000,
-): boolean {
-  return Boolean(receipt && receipt.attemptId === attemptId && receipt.text === text && now - receipt.createdAt <= ttlMs);
 }

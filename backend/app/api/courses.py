@@ -307,7 +307,7 @@ async def _course_payload(
                     for assessment in active_assessments
                     if not (
                         isinstance(assessment.policy, dict)
-                        and assessment.policy.get("historical_quiz_split_container") is True
+                        and assessment.policy.get("historical_import_only") is True
                     )
                 ),
             }
@@ -1467,6 +1467,7 @@ def _project_activity(raw: object, section_external_id: str) -> dict[str, Any] |
             result[field] = value
     result["import_supported"] = bool(raw.get("import_supported", False))
     result["random_essay_confirmed"] = raw.get("random_essay_confirmed") is True
+    result["quiz_questions_confirmed"] = raw.get("quiz_questions_confirmed") is True
     result["statement_deferred"] = raw.get("statement_deferred") is True
     result["attempt_limit_unlimited"] = raw.get("attempt_limit_unlimited") is True
     grading_method = str(raw.get("quiz_grading_method", "")).upper()
@@ -1654,6 +1655,10 @@ async def _apply_activity_deadlines(
             ).all()
         )
         for attempt in attempts:
+            if "moodle_sync_timeout_seconds" in (attempt.integrity_policy or {}):
+                # Course-wide metadata cannot overwrite a live per-user timer
+                # or release the time already reserved for final submission.
+                continue
             assessment_policy = assessment.policy if isinstance(assessment.policy, dict) else {}
             if assessment_policy.get("moodle_metadata_read_only") is True:
                 attempt.deadline_at = None

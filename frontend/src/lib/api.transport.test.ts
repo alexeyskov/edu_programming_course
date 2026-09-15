@@ -13,11 +13,74 @@ async function freshApi() {
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
 describe('API transport security contract', () => {
+  it('waits for a busy student session with the same start idempotency key', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ csrf_token: 'a'.repeat(32) }))
+      .mockResolvedValueOnce(jsonResponse({ code: 'MOODLE_SESSION_BUSY' }, 409))
+      .mockResolvedValueOnce(jsonResponse({ code: 'MOODLE_SESSION_BUSY' }, 409))
+      .mockResolvedValueOnce(jsonResponse({ id: 'new-attempt', state: 'ACTIVE', workspace: { files: [] } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    const result = api.startAttempt('assessment-1');
+    await vi.advanceTimersByTimeAsync(4_100);
+    await expect(result).resolves.toMatchObject({ id: 'new-attempt' });
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    const keys = fetchMock.mock.calls.slice(1).map(([, init]) => new Headers(init.headers).get('Idempotency-Key'));
+    expect(keys[0]).toBeTruthy();
+    expect(new Set(keys).size).toBe(1);
+  });
+
+  it('cancels waiting for a student session when leaving the page', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ csrf_token: 'a'.repeat(32) }))
+      .mockResolvedValueOnce(jsonResponse({ code: 'MOODLE_SESSION_BUSY' }, 409));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    const controller = new AbortController();
+    const result = api.startAttempt('assessment-1', controller.signal);
+    const rejected = expect(result).rejects.toMatchObject({ name: 'AbortError' });
+    await vi.advanceTimersByTimeAsync(1_000);
+    controller.abort();
+    await rejected;
+    await vi.advanceTimersByTimeAsync(100_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['MOODLE_ATTEMPT_BINDING_CONFLICT', 'MOODLE_UNAVAILABLE', 'FORBIDDEN'])(
+    'does not replay a start after %s', async (code) => {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(jsonResponse({ csrf_token: 'a'.repeat(32) }))
+        .mockResolvedValueOnce(jsonResponse({ code }, 409));
+      vi.stubGlobal('fetch', fetchMock);
+      const { api } = await freshApi();
+      await expect(api.startAttempt('assessment-1')).rejects.toMatchObject({ code });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it('sends the verified paste range and receipt with the workspace revision', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ csrf_token: 'a'.repeat(32) }))
+      .mockResolvedValueOnce(jsonResponse({ revision: 8 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    await api.saveFile('attempt-1', { id: 'file-1', path: 'main.cpp', content: 'int int' }, 7, 'internal_paste', 'receipt-1', { offset: 4, deleteCount: 0 });
+    const request = fetchMock.mock.calls[1][1];
+    expect(new Headers(request.headers).get('If-Match')).toBe('7');
+    expect(JSON.parse(request.body)).toEqual({
+      content: 'int int', source: 'INTERNAL_PASTE', receipt_id: 'receipt-1',
+      paste_range: { offset: 4, delete_count: 0 },
+    });
+  });
+
   it('reads the persisted course synchronization state without starting another job', async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({
       course_id: 'course-1', status: 'SYNCING', updated_at: '2026-09-02T10:00:00Z',

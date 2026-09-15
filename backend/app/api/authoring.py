@@ -77,8 +77,8 @@ from app.services.common import (
     sha256_text,
 )
 from app.services.moodle_source import (
+    confirmed_moodle_quiz_grading_method,
     missing_moodle_source_confirmations,
-    moodle_quiz_uses_latest_attempt_grade,
 )
 from app.services.policy import (
     MembershipContext,
@@ -1279,15 +1279,15 @@ async def list_course_assessments(
             )
         ).all()
     )
-    # A multi-Essay Moodle Quiz is an activity container, not one programming
-    # assignment.  Once history discovery has materialized its Essay questions,
-    # expose only those question assessments in course views.
+    # The visible work remains the Moodle activity, including multi-question
+    # Quiz. Internal history/question assessments are review contexts, not
+    # independently launchable works. Legacy container flags must not hide it.
     rows = [
         row
         for row in rows
         if not (
             isinstance(row.policy, dict)
-            and row.policy.get("historical_quiz_split_container") is True
+            and row.policy.get("historical_import_only") is True
         )
     ]
     if membership.membership.role == CourseRole.TEACHER.value:
@@ -1386,7 +1386,7 @@ async def update_assessment(
             "Moodle is the source of the work title, condition, schedule, grade and attempts",
             fields=sorted(changes.keys() & moodle_owned_fields),
         )
-    runtime_policy_fields = {"decision_support_enabled"}
+    runtime_policy_fields = {"decision_support_enabled", "student_ai_enabled"}
     if (
         assessment.status != AssessmentStatus.DRAFT.value
         and not changes.keys() <= runtime_policy_fields
@@ -1767,7 +1767,7 @@ async def _validate_assessment(
     return errors, warnings
 
 
-def _require_latest_attempt_quiz_grading_for_publication(
+def _require_confirmed_quiz_grading_for_publication(
     mapping: ExternalMapping,
 ) -> None:
     metadata = mapping.metadata_json if isinstance(mapping.metadata_json, dict) else {}
@@ -1775,15 +1775,18 @@ def _require_latest_attempt_quiz_grading_for_publication(
     module = str(metadata.get("module", activity.get("module", ""))).lower().removeprefix("mod_")
     if module != "quiz":
         return
-    if moodle_quiz_uses_latest_attempt_grade(metadata.get("activity")):
+    # Publishing controls visibility, not Moodle's gradebook aggregation.
+    # Review targets are selected independently by the latest Moodle attempt;
+    # Moodle still computes the course grade with its confirmed configured
+    # method (highest, average, first or last), which we must not change.
+    if confirmed_moodle_quiz_grading_method(activity) is not None:
         return
     raise _error(
         409,
-        "MOODLE_LAST_ATTEMPT_GRADING_REQUIRED",
+        "MOODLE_QUIZ_GRADING_METHOD_UNCONFIRMED",
         (
-            "Moodle Quiz must use the 'Last attempt' grading method. Moodle may "
-            "grant an additional attempt to an individual student later, and the "
-            "reviewed work must always remain the latest attempt"
+            "The Moodle Quiz grading method has not been confirmed. "
+            "Synchronize the course before enabling the work"
         ),
     )
 
@@ -1949,7 +1952,7 @@ async def publish_assessment(
                     "GROUP_SCOPE_REQUIRED",
                     "A teacher may enable work only for Moodle groups assigned to them",
                 )
-        _require_latest_attempt_quiz_grading_for_publication(managed_mapping)
+        _require_confirmed_quiz_grading_for_publication(managed_mapping)
     if assessment.status == AssessmentStatus.PUBLISHED.value:
         if managed_mapping is not None:
             await _replace_managed_publication_rules(
@@ -1958,7 +1961,9 @@ async def publish_assessment(
                 groups=groups,
                 authored_by_id=context.principal_id,
             )
-            await db.commit()
+        if payload.student_ai_enabled is not None:
+            assessment.student_ai_enabled = payload.student_ai_enabled
+        await db.commit()
         return await _assessment_teacher_read(db, assessment)
     if assessment.status != AssessmentStatus.DRAFT.value:
         raise _error(409, "ASSESSMENT_NOT_DRAFT", "Only a draft assessment can be published")
@@ -2004,6 +2009,8 @@ async def publish_assessment(
             version.published_at = utcnow()
     assessment.status = AssessmentStatus.PUBLISHED.value
     assessment.published_at = utcnow()
+    if payload.student_ai_enabled is not None:
+        assessment.student_ai_enabled = payload.student_ai_enabled
     await _sync_assessment_mapping(db, assessment)
     mirror_rows = list(
         (

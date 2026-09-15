@@ -38,6 +38,7 @@ from app.models.review import (
 from app.models.tasks import Assessment, TaskVersion
 from app.services.common import DomainError, sha256_text
 from app.services.moodle_attempt_selection import is_latest_completed_moodle_attempt
+from app.services.moodle_quiz_session import quiz_question_for_attempt
 from app.services.policy import require_review_required, require_submission_review_access
 
 
@@ -45,6 +46,17 @@ def _as_utc(value: datetime) -> datetime:
     """SQLite drops timezone metadata even for timezone-aware columns."""
 
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+async def response_max_score(db: AsyncSession, attempt: Attempt, assessment: Assessment) -> Decimal:
+    """A native Quiz solution is graded in its question scale, not the quiz total."""
+    question = await quiz_question_for_attempt(db, attempt.id)
+    if question is None:
+        return assessment.max_score
+    version = await db.get(TaskVersion, attempt.assigned_task_version_id)
+    if version is None:
+        raise DomainError(500, "TASK_VERSION_MISSING", "Quiz response scale is unavailable")
+    return version.max_score
 
 
 async def _submission_context(
@@ -287,7 +299,9 @@ async def save_review_draft(
         submission_id=submission_id,
         teacher_id=teacher_id,
     )
-    if grade is not None and (grade < 0 or grade > assessment.max_score):
+    if grade is not None and (
+        grade < 0 or grade > await response_max_score(db, _attempt, assessment)
+    ):
         raise DomainError(422, "GRADE_OUT_OF_RANGE", "Grade is outside the assessment range")
     draft = await db.scalar(
         select(ReviewDraft).where(ReviewDraft.submission_id == submission_id).with_for_update()
@@ -579,7 +593,7 @@ async def finalize_review(
         submission_id=submission_id,
         teacher_id=teacher_id,
     )
-    if grade < 0 or grade > assessment.max_score:
+    if grade < 0 or grade > await response_max_score(db, attempt, assessment):
         raise DomainError(422, "GRADE_OUT_OF_RANGE", "Grade is outside the assessment range")
     validated_evidence = await _validate_evidence_ids(
         db,

@@ -70,12 +70,33 @@ class FakePage:
     def __init__(self, controls: dict[str, list[Control]]) -> None:
         self.controls = controls
         self.url = ""
+        self.closed = False
 
     def locator(self, selector: str) -> FakeLocator:
         return FakeLocator(self.controls.get(selector, []))
 
     async def content(self) -> str:
         return "<html><body></body></html>"
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def quiz_settings_markup(
+    grading_method: str, *, course_id: str = "549", cmid: str = "777", grade_max: str = "3"
+) -> str:
+    return f"""
+    <html><body class="course-{course_id} path-mod-quiz">
+      <form class="mform">
+        <input name="coursemodule" value="{cmid}">
+        <input name="course" value="{course_id}">
+        <input name="modulename" value="quiz">
+        <input name="grade" value="{grade_max}">
+        <select name="attempts"><option selected value="10">10</option></select>
+        <select name="grademethod"><option selected value="{grading_method}"></option></select>
+      </form>
+    </body></html>
+    """
 
 
 def live_session_state(settings: Settings) -> BrowserStorageState:
@@ -99,7 +120,10 @@ def live_session_state(settings: Settings) -> BrowserStorageState:
 
 
 @pytest.mark.asyncio
-async def test_quiz_grade_uses_canonical_manual_grading_form(settings: Settings) -> None:
+@pytest.mark.parametrize("grading_method", ["1", "2", "3", "4"])
+async def test_quiz_grade_uses_canonical_manual_grading_form(
+    settings: Settings, grading_method: str
+) -> None:
     mark = Control(attributes={"context_text": "Балл из 5,00"})
     textarea = Control(tag="textarea")
     editor = Control(tag="div")
@@ -137,34 +161,58 @@ async def test_quiz_grade_uses_canonical_manual_grading_form(settings: Settings)
     )
     service = MoodleBrowserService(settings)
     visited: list[str] = []
+    guard_page = FakePage({})
+
+    class Context:
+        async def new_page(self) -> FakePage:
+            return guard_page
+
     submit.on_click = lambda: setattr(page, "url", f"{settings.base_url}/mod/quiz/comment.php")
 
     async def goto(fake_page: FakePage, url: str) -> str:
         visited.append(url)
         fake_page.url = url
+        if "/course/modedit.php" in url:
+            return quiz_settings_markup(grading_method)
+        if "/mod/quiz/report.php" in url:
+            # A different aggregate/report grade must not replace the requested
+            # question mark or make a valid manual-grade save fail.
+            return f"""
+            <html><body class="course-549">
+              <a href="{settings.base_url}/course/view.php?id=549">Course</a>
+              <table id="attempts"><tbody><tr>
+                <td><a href="/user/view.php?id=77&amp;course=549">Student</a></td>
+                <td>Завершено</td><td class="grade">3,00 / 3,00</td>
+                <td><a class="reviewlink"
+                  href="/mod/quiz/review.php?attempt=134403&amp;cmid=777">Review</a></td>
+              </tr></tbody></table>
+            </body></html>
+            """
         return await fake_page.content()
 
     async def state(_context: object) -> BrowserStorageState:
         return live_session_state(settings)
 
-    async def global_auth_must_not_be_used(*_args: object) -> None:
-        raise AssertionError("standalone quiz grader has no global navigation")
-
-    async def live_preconditions(*_args: object) -> None:
-        return None
+    async def authenticated(_context: object, markup: str) -> None:
+        assert "course-549" in markup, "standalone quiz grader has no global navigation"
 
     service._goto = goto  # type: ignore[method-assign]
     service._state = state  # type: ignore[method-assign]
-    service._require_authenticated_page = global_auth_must_not_be_used  # type: ignore[method-assign]
-    service._require_live_quiz_grade_preconditions = live_preconditions  # type: ignore[method-assign]
+    service._require_authenticated_page = authenticated  # type: ignore[method-assign]
 
     target, question_max, submitted_mark = await service._grade_quiz_essay(
         page,
-        object(),
+        Context(),
         request,  # type: ignore[arg-type]
     )
 
-    assert visited == [f"{settings.base_url}/mod/quiz/comment.php?attempt=134403&slot=1"]
+    assert visited == [
+        f"{settings.base_url}/mod/quiz/comment.php?attempt=134403&slot=1",
+        f"{settings.base_url}/course/modedit.php?update=777&return=1",
+        f"{settings.base_url}/mod/quiz/report.php?id=777&mode=overview"
+        "&attempts=enrolled_with&onlygraded=0&onlyregraded=0&slotmarks=1&group=0&page=0",
+    ]
+    assert guard_page.closed is True
     assert target == "/mod/quiz/comment.php"
     assert question_max == 5
     assert submitted_mark == 2
@@ -172,6 +220,60 @@ async def test_quiz_grade_uses_canonical_manual_grading_form(settings: Settings)
     assert textarea.value == "<p>Проверено</p><p>Коваленко А.</p>"
     assert editor.value == "Проверено\nКоваленко А."
     assert submit.clicked is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("settings_values", "error"),
+    [
+        ({"grading_method": ""}, "grading method could not be confirmed"),
+        ({"grading_method": "5"}, "grading method could not be confirmed"),
+        ({"grade_max": "5"}, "overall grade scale changed"),
+        ({"grade_max": ""}, "overall grade scale changed"),
+        ({"course_id": "508"}, "identify another activity"),
+        ({"cmid": "31529"}, "identify another activity"),
+    ],
+)
+async def test_quiz_grading_configuration_still_requires_confirmed_policy_identity_and_scale(
+    settings: Settings, settings_values: dict[str, str], error: str
+) -> None:
+    service = MoodleBrowserService(settings)
+    request = GradeRequest.model_validate(
+        {
+            "schema_version": "1.0",
+            "base_url": settings.base_url,
+            "storage_state": {"cookies": [], "origins": []},
+            "payload": {
+                "module": "quiz",
+                "course_id": "549",
+                "cmid": 777,
+                "user_id": "77",
+                "attempt_id": "134403",
+                "question_slot": 1,
+                "grade": 1.2,
+                "grade_scale_max": 3,
+                "quiz_overall_grade_max": 3,
+            },
+            "idempotency_key": "quiz-grade:134403:1:guard",
+        }
+    )
+    page = FakePage({})
+
+    async def goto(fake_page: FakePage, url: str) -> str:
+        fake_page.url = url
+        return quiz_settings_markup(**({"grading_method": "1"} | settings_values))
+
+    async def authenticated(*_args: object) -> None:
+        return None
+
+    service._goto = goto  # type: ignore[method-assign]
+    service._require_authenticated_page = authenticated  # type: ignore[method-assign]
+    with pytest.raises(MoodleProtocolError, match=error):
+        await service._require_live_quiz_grading_configuration(
+            page,  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            request,
+        )
 
 
 @pytest.mark.asyncio

@@ -122,6 +122,7 @@ def _mapping_activity(activity: dict[str, Any]) -> dict[str, Any]:
         "attempt_limit_unlimited",
         "quiz_grading_method",
         "quiz_grading_method_confirmed",
+        "quiz_questions_confirmed",
         "question_count",
         "essay_question_count",
         "random_question_count",
@@ -173,7 +174,8 @@ def _dynamic_statement_policy(activity: dict[str, Any]) -> dict[str, Any]:
             and 0 <= random_count <= 10_000
             else 0
         ),
-        "random_essay_confirmed": deferred,
+        "random_essay_confirmed": activity.get("random_essay_confirmed") is True,
+        "quiz_questions_confirmed": activity.get("quiz_questions_confirmed") is True,
     }
 
 
@@ -344,7 +346,11 @@ async def materialize_moodle_activity_drafts(
                     activity,
                     module=module,
                 )
-                transport_confirmed = answer_transport is not None
+                transport_confirmed = answer_transport is not None or (
+                    module == "quiz"
+                    and activity.get("quiz_questions_confirmed") is True
+                    and moodle_statement_is_deferred(activity)
+                )
                 metadata.update(
                     {
                         "activity": _mapping_activity(activity),
@@ -456,12 +462,20 @@ async def materialize_moodle_activity_drafts(
         description = _bounded(activity.get("description"), 50_000)
         statement = _statement_from_moodle(activity)
         source_description_confirmed = source_confirmation["statement"] and bool(description)
-        quiz_single_essay = module == "quiz" and bool(activity.get("import_supported"))
+        quiz_single_essay = (
+            module == "quiz"
+            and activity.get("question_count") == 1
+            and activity.get("import_supported") is True
+        )
         answer_transport = confirmed_moodle_activity_answer_transport(
             activity,
             module=module,
         )
-        transport_confirmed = answer_transport is not None
+        transport_confirmed = answer_transport is not None or (
+            module == "quiz"
+            and activity.get("quiz_questions_confirmed") is True
+            and moodle_statement_is_deferred(activity)
+        )
         slug = await _available_slug(db, course_id=course.id, module=module, cmid=cmid)
         item = TaskBankItem(
             scope=TaskScope.COURSE.value,

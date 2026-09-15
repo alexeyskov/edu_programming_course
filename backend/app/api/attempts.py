@@ -50,6 +50,8 @@ from app.schemas.attempts import (
     AttemptSubmitRequest,
     ClipboardReceiptCreateRequest,
     ClipboardReceiptRead,
+    QuizSessionQuestionRead,
+    QuizSessionRead,
     WorkspaceFileCreateRead,
     WorkspaceFileCreateRequest,
     WorkspaceFileDeleteRead,
@@ -83,6 +85,7 @@ from app.services.moodle_quiz_runtime import (
     resolve_moodle_assignment_context,
     resolve_moodle_quiz_context,
 )
+from app.services.moodle_quiz_session import quiz_question_for_attempt, quiz_session_questions
 from app.services.policy import (
     ensure_assessment_available,
     require_membership,
@@ -227,11 +230,34 @@ async def _prepare_moodle_quiz_attempt(
                 if pinned is not None
                 else {}
             )
-            result = await browser.prepare_quiz_essay(
-                context.course.external_id,
-                context.cmid,
-                **expected,
-            )
+            try:
+                result = await browser.prepare_quiz_essay(
+                    context.course.external_id,
+                    context.cmid,
+                    **expected,
+                )
+            except IntegrationAttemptFinalized:
+                if active is None or pinned is None:
+                    raise
+                # Moodle no longer offers this exact attempt (for example it
+                # was finished/deleted there). Do not keep pinning it forever,
+                # and NEVER rebind its saved code to a new Moodle attempt.
+                from app.services.sync import _mark_moodle_attempt_finalized
+
+                stale = await db.scalar(
+                    select(Attempt).where(Attempt.id == active.id).with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+                if stale is None or stale.state != AttemptState.ACTIVE.value:
+                    raise IntegrationBusy("Moodle attempt changed while opening") from None
+                await _mark_moodle_attempt_finalized(db, attempt=stale, finalized_at=utcnow())
+                # Archive read-only, retaining all workspaces and snapshots;
+                # no forged delivery receipt or database deletion. Release DB
+                # locks before the next external call, keeping the user lease.
+                await db.commit()
+                result = await browser.prepare_quiz_essay(
+                    context.course.external_id, context.cmid,
+                )
         preparation = result.preparation
         prepared = prepared_moodle_quiz_attempt(
             course_external_id=preparation.course_id,
@@ -242,6 +268,18 @@ async def _prepare_moodle_quiz_attempt(
             answer_transport=preparation.answer_transport,
             available_answer_transports=preparation.available_answer_transports,
             remaining_seconds=preparation.remaining_seconds,
+            question_max_mark=getattr(preparation, "question_max_mark", None),
+            questions=[
+                {
+                    "question_slot": question.question_slot,
+                    "question_text": question.question_text,
+                    "answer_transport": question.answer_transport,
+                    "available_answer_transports": question.available_answer_transports,
+                    "question_max_mark": question.question_max_mark,
+                }
+                for question in getattr(preparation, "questions", ())
+            ]
+            or None,
         )
         if (
             prepared.course_external_id != context.course.external_id
@@ -414,6 +452,14 @@ async def _owned_attempt(
     principal_id: uuid.UUID,
     lock: bool = False,
 ) -> tuple[Attempt, Assessment, Workspace]:
+    if lock:
+        relation = await quiz_question_for_attempt(db, attempt_id)
+        if relation is not None:
+            root = await db.scalar(
+                select(Attempt).where(Attempt.id == relation.root_attempt_id).with_for_update()
+            )
+            if root is None or root.principal_id != principal_id:
+                raise DomainError(404, "ATTEMPT_NOT_FOUND", "Attempt was not found")
     statement = select(Attempt).where(
         Attempt.id == attempt_id,
         Attempt.principal_id == principal_id,
@@ -439,6 +485,19 @@ async def _owned_attempt(
     if workspace is None:
         raise DomainError(500, "WORKSPACE_MISSING", "Attempt workspace is missing")
     return attempt, assessment, workspace
+
+
+async def _ensure_quiz_session_active(db: AsyncSession, attempt: Attempt) -> None:
+    relation = await quiz_question_for_attempt(db, attempt.id)
+    if relation is None:
+        return
+    root = await db.get(Attempt, relation.root_attempt_id)
+    if root is None or root.principal_id != attempt.principal_id:
+        raise DomainError(404, "ATTEMPT_NOT_FOUND", "Attempt was not found")
+    ensure_attempt_not_finalized_in_moodle(root)
+    deadline = _aware(root.deadline_at)
+    if root.state != AttemptState.ACTIVE.value or (deadline and utcnow() >= deadline):
+        raise DomainError(409, "ATTEMPT_READ_ONLY", "Attempt is read-only")
 
 
 async def _active_files(db: AsyncSession, workspace_id: uuid.UUID) -> list[WorkspaceFile]:
@@ -493,9 +552,7 @@ def _bounded_setting_int(
 async def _effective_flags(db: AsyncSession, settings: Settings) -> _EffectiveRuntimeSettings:
     row = await db.scalar(select(SystemSetting).where(SystemSetting.key == "effective"))
     values = row.value if row is not None else {}
-    ai_configured = settings.ai_mock_enabled or (
-        settings.ai_enabled and bool(settings.ai_api_key.get_secret_value())
-    )
+    ai_configured = settings.ai_provider_configured
     runner_configured = settings.runner_mock_enabled or bool(settings.runner_url)
     return {
         "ai_enabled": ai_configured and bool(values.get("ai_enabled", True)),
@@ -590,6 +647,28 @@ async def _attempt_read(
     workspace: Workspace,
     settings: Settings,
 ) -> AttemptStudentRead:
+    relation = await quiz_question_for_attempt(db, attempt.id)
+    root = await db.get(Attempt, relation.root_attempt_id) if relation is not None else attempt
+    if root is None or root.principal_id != attempt.principal_id:
+        raise DomainError(500, "MOODLE_QUIZ_SESSION_INVALID", "Quiz session is invalid")
+    parent_assessment = await db.get(Assessment, root.assessment_id)
+    if parent_assessment is None:
+        raise DomainError(500, "ASSESSMENT_MISSING", "Quiz assessment is missing")
+    quiz_session = None
+    if relation is not None:
+        quiz_session = QuizSessionRead(
+            id=root.id,
+            root_attempt_id=root.id,
+            questions=[
+                QuizSessionQuestionRead(
+                    attempt_id=question.attempt_id,
+                    slot=question.question_slot,
+                    title=question.title,
+                    position=question.position,
+                )
+                for question in await quiz_session_questions(db, root.id)
+            ],
+        )
     version = (
         await db.get(TaskVersion, attempt.assigned_task_version_id)
         if attempt.assigned_task_version_id
@@ -598,46 +677,68 @@ async def _attempt_read(
     flags = await _effective_flags(db, settings)
     checkpoint_at, checkpoint_status = await _checkpoint_state(
         db,
-        attempt.id,
-        terminal_only=attempt.state
+        root.id,
+        terminal_only=root.state
         in {AttemptState.SUBMITTED.value, AttemptState.AUTO_SUBMITTED.value},
     )
     assessment_policy = assessment.policy if isinstance(assessment.policy, dict) else {}
     integrity_policy = (
         attempt.integrity_policy if isinstance(attempt.integrity_policy, dict) else {}
     )
+    parent_policy = parent_assessment.policy if isinstance(parent_assessment.policy, dict) else {}
+    root_integrity = root.integrity_policy if isinstance(root.integrity_policy, dict) else {}
+    # Ordinary untimed Assignments need no session counter. A Quiz without a
+    # parsed live timer is UNKNOWN: student overrides can differ from metadata.
+    # Likewise, never label an explicitly timed Assignment as unlimited.
+    has_time_limit = (
+        True
+        if root.deadline_at is not None or root.expected_end_at is not None
+        else None
+        if parent_policy.get("moodle_metadata_read_only") is True
+        and (
+            root_integrity.get("moodle_answer_transport")
+            not in {"ASSIGN_FILE", "ASSIGN_ONLINE_TEXT"}
+            or bool(parent_assessment.duration_seconds)
+        )
+        else False
+    )
     statement = "\n\n".join(
         part.strip()
-        for part in (assessment.instructions, version.statement if version else "")
+        for part in (parent_assessment.instructions, version.statement if version else "")
         if part and part.strip()
     )
     return AttemptStudentRead(
         id=attempt.id,
-        assessment_id=assessment.id,
-        title=assessment.title,
+        assessment_id=parent_assessment.id,
+        title=parent_assessment.title,
         statement=statement,
-        sequence=attempt.sequence,
-        state=attempt.state,
-        started_at=attempt.started_at,
-        expected_end_at=attempt.expected_end_at,
-        deadline_at=attempt.deadline_at,
+        sequence=root.sequence,
+        state=root.state,
+        started_at=root.started_at,
+        expected_end_at=root.expected_end_at,
+        deadline_at=root.deadline_at,
+        has_time_limit=has_time_limit,
+        moodle_sync_timeout_seconds=root_integrity.get("moodle_sync_timeout_seconds"),
         current_revision=workspace.current_revision,
-        submitted_at=attempt.submitted_at,
+        submitted_at=root.submitted_at,
         paste_policy=assessment.paste_policy,
         ai_enabled=bool(
-            flags["ai_enabled"] and flags["student_ai_enabled"] and assessment.student_ai_enabled
+            flags["ai_enabled"]
+            and flags["student_ai_enabled"]
+            and parent_assessment.student_ai_enabled
         ),
         multi_file=workspace.multi_file,
         last_checkpoint_at=checkpoint_at,
         checkpoint_status=checkpoint_status,
         closure_reason=(
-            "LMS_ATTEMPT_FINALIZED" if attempt.submission_source == "MOODLE_FINALIZED" else None
+            "LMS_ATTEMPT_FINALIZED" if root.submission_source == "MOODLE_FINALIZED" else None
         ),
         requires_live_lms_preparation=bool(
             attempt.state == AttemptState.ACTIVE.value
             and assessment_policy.get("moodle_metadata_read_only") is True
             and integrity_policy.get("moodle_runtime_prepared") is not True
         ),
+        quiz_session=quiz_session,
     )
 
 
@@ -717,6 +818,7 @@ async def create_attempt(
         principal_id=auth.principal_id,
         prepared_moodle_quiz=prepared_moodle_quiz,
         prepared_moodle_assignment=prepared_moodle_assignment,
+        moodle_sync_timeout=request.app.state.settings.moodle_sync_timeout,
         client_context=client_context_from_request(request),
     )
     await db.commit()
@@ -802,6 +904,7 @@ async def patch_workspace_file(
         client_request_id=request_key,
         source=payload.source,
         receipt_id=payload.receipt_id,
+        paste_range=payload.paste_range.model_dump() if payload.paste_range else None,
         client_id=payload.client_id,
         client_context=client_context_from_request(request),
     )
@@ -1395,6 +1498,7 @@ async def create_student_run(
         lock=True,
     )
     deadline = _aware(attempt.deadline_at)
+    await _ensure_quiz_session_active(db, attempt)
     ensure_attempt_not_finalized_in_moodle(attempt)
     if attempt.state != AttemptState.ACTIVE.value or (deadline and utcnow() >= deadline):
         raise DomainError(409, "ATTEMPT_READ_ONLY", "Attempt is read-only")
@@ -1560,6 +1664,7 @@ async def _student_interactive_context(
     )
     deadline = _aware(attempt.deadline_at)
     if require_active:
+        await _ensure_quiz_session_active(db, attempt)
         ensure_attempt_not_finalized_in_moodle(attempt)
     if require_active and (
         attempt.state != AttemptState.ACTIVE.value

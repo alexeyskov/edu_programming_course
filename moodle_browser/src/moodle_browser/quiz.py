@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -81,6 +82,15 @@ class QuizAttempt:
     attachment_urls: tuple[tuple[str, str], ...] = ()
     question_text: str = ""
     remaining_seconds: int | None = None
+    page: int = 0
+    question_max_mark: float | None = None
+    questions: tuple[QuizAttempt, ...] = ()
+
+
+def essay_slot_selector(slot: str) -> str:
+    if not _POSITIVE_ID.fullmatch(slot):
+        raise MoodleMarkupError("Moodle essay slot is invalid")
+    return f".que.essay:is([data-slot='{slot}'], [id$='-{slot}'])"
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,7 +135,7 @@ def _query_positive(url: str, name: str) -> str | None:
 
 
 def _remaining_seconds(html: str, soup: BeautifulSoup) -> int | None:
-    """Read Moodle's live Quiz countdown without making it authoritative locally."""
+    """Read the live per-user Quiz timer, not the course-wide time limit."""
 
     timers = soup.select("#quiz-time-left")
     if len(timers) == 1:
@@ -288,7 +298,9 @@ def parse_quiz_view(
             expected_launches.append(launch)
 
     if expected_attempt_id is not None:
-        if len(expected_launches) != 1:
+        if len(expected_launches) > 1:
+            raise MoodleMarkupError("Moodle quiz has ambiguous bound attempt triggers")
+        if not expected_launches:
             # A start form or a continuation link for another attempt must
             # never be used after the application has bound the local session
             # to a concrete Moodle attempt.  The exact attempt disappearing is
@@ -311,6 +323,7 @@ def parse_attempt_page(
     base_url: str,
     course_id: str,
     cmid: int,
+    question_slot: str | None = None,
 ) -> QuizAttempt:
     soup = BeautifulSoup(html, "html.parser")
     if preview_evidence(html):
@@ -324,6 +337,8 @@ def parse_attempt_page(
     if attempt_id is None or _query_positive(current_url, "cmid") != str(cmid):
         raise MoodleMarkupError("Moodle attempt identifiers are invalid")
     essays = soup.select(ESSAY_SELECTOR)
+    if question_slot is not None:
+        essays = soup.select(essay_slot_selector(question_slot))
     if len(essays) != 1:
         raise MoodleMarkupError("Moodle attempt must contain exactly one essay question")
     essay = essays[0]
@@ -339,18 +354,32 @@ def parse_attempt_page(
         raise MoodleMarkupError("Moodle essay online-text control is ambiguous")
     if not managers and not online_controls:
         raise MoodleMarkupError("Moodle essay has no supported response control")
+    expected_slot = question_slot
     question_slot = str(essay.get("data-slot", "")).strip()
     if not question_slot:
         match = re.search(r"(?:^|-)question-[0-9]+-([0-9]+)$", str(essay.get("id", "")))
         question_slot = match.group(1) if match else ""
     if not _POSITIVE_ID.fullmatch(question_slot):
         raise MoodleMarkupError("Moodle essay has no stable question slot")
+    if expected_slot is not None and question_slot != expected_slot:
+        raise MoodleMarkupError("Moodle essay slot changed")
+    pages = parse_qs(parsed.query).get("page", ["0"])
+    if len(pages) != 1 or not pages[0].isdigit() or int(pages[0]) > 31:
+        raise MoodleMarkupError("Moodle attempt page is out of bounds")
+    mark_max = None
+    grade_node = essay.select_one(".info .grade, .grade")
+    grade_text = _text(grade_node, maximum=256) if grade_node else ""
+    numbers = re.findall(r"[0-9]+(?:[.,][0-9]+)?", grade_text)
+    if numbers:
+        mark_max = float(numbers[-1].replace(",", "."))
+        if not math.isfinite(mark_max) or not 0 < mark_max <= 1_000_000:
+            raise MoodleMarkupError("Moodle question mark scale is invalid")
     names: set[str] = set()
     attachment_urls: set[tuple[str, str]] = set()
     transports: list[Literal["ESSAY_ONLINE_TEXT", "ESSAY_ATTACHMENT"]] = []
     if online_controls:
         control_name = str(online_controls[0].get("name", "")).strip()
-        if not re.fullmatch(r"q[0-9]+:[0-9]+_answer", control_name):
+        if not re.fullmatch(rf"q[0-9]+:{question_slot}_answer", control_name):
             raise MoodleMarkupError("Moodle essay online-text control is not bound to a question")
         transports.append("ESSAY_ONLINE_TEXT")
     else:
@@ -360,9 +389,10 @@ def parse_attempt_page(
         if len(manager.select(".fp-btn-add")) != 1:
             raise MoodleMarkupError("Moodle essay file manager has no unambiguous add button")
         transports.append("ESSAY_ATTACHMENT")
-        for node in manager.select(
-            ".fp-filename, [data-filename], .fp-file [title], .filemanager-container a"
-        ):
+        # File-manager navigation also contains anchors such as "▶" and
+        # toolbar tooltips. Only filename fields are evidence of a file;
+        # a download anchor is accepted separately after its URL is checked.
+        for node in manager.select(".fp-filename, [data-filename]"):
             name = (
                 str(node.get("data-filename", "")).strip()
                 or str(node.get("title", "")).strip()
@@ -392,6 +422,7 @@ def parse_attempt_page(
                 if not (path.startswith("/draftfile.php/") or path.startswith("/pluginfile.php/")):
                     continue
                 if name and PurePosixPath(path).name == name:
+                    names.add(name)
                     attachment_urls.add((name, target))
     return QuizAttempt(
         attempt_id=attempt_id,
@@ -402,7 +433,94 @@ def parse_attempt_page(
         attachment_urls=tuple(sorted(attachment_urls)),
         question_text=question_text,
         remaining_seconds=_remaining_seconds(html, soup),
+        page=int(pages[0]),
+        question_max_mark=mark_max,
     )
+
+
+def parse_attempt_questions(
+    html: str, current_url: str, *, base_url: str, course_id: str, cmid: int
+) -> tuple[QuizAttempt, ...]:
+    """Parse every supported response on one page, never guess a target slot."""
+    soup = BeautifulSoup(html, "html.parser")
+    nodes = soup.select(".que")
+    essays = soup.select(ESSAY_SELECTOR)
+    if not essays or len(essays) > 32 or len(nodes) != len(essays):
+        raise MoodleMarkupError("Moodle attempt must contain only supported Essay questions")
+    slots: list[str] = []
+    for essay in essays:
+        slot = str(essay.get("data-slot", "")).strip()
+        if not slot:
+            match = re.fullmatch(r"question-[0-9]+-([0-9]+)", str(essay.get("id", "")))
+            slot = match.group(1) if match else ""
+        if not _POSITIVE_ID.fullmatch(slot) or slot in slots:
+            raise MoodleMarkupError("Moodle attempt question slots are ambiguous")
+        slots.append(slot)
+    return tuple(
+        parse_attempt_page(
+            html,
+            current_url,
+            base_url=base_url,
+            course_id=course_id,
+            cmid=cmid,
+            question_slot=slot,
+        )
+        for slot in slots
+    )
+
+
+def quiz_attempt_navigation(
+    html: str, *, base_url: str, cmid: int, attempt_id: str, current_url: str | None = None
+) -> dict[str, int]:
+    """Read Moodle's question-to-page map, rejecting incomplete/foreign links."""
+    soup = BeautifulSoup(html, "html.parser")
+    result: dict[str, int] = {}
+    if any(node.name != "a" for node in soup.select(".qnbutton, [id^='quiznavbutton']")):
+        raise MoodleMarkupError("Moodle attempt question navigation is not freely available")
+    for node in soup.select("a.qnbutton, a[id^='quiznavbutton']"):
+        raw = node.get("href")
+        if not isinstance(raw, str):
+            raise MoodleMarkupError("Moodle attempt question navigation is unverified")
+        resolved = urlsplit(
+            urljoin(
+                current_url or f"{base_url}/mod/quiz/attempt.php?attempt={attempt_id}&cmid={cmid}",
+                raw,
+            )
+        )
+        target = _same_origin_url(resolved._replace(fragment="").geturl(), base_url)
+        if not target:
+            raise MoodleMarkupError("Moodle attempt question navigation is unverified")
+        parsed = urlsplit(target)
+        query = parse_qs(parsed.query)
+        pages = query.get("page", ["0"])
+        match = re.fullmatch(r"quiznavbutton([0-9]+)", str(node.get("id", "")))
+        fragment = re.fullmatch(r"question-[0-9]+-([0-9]+)", resolved.fragment)
+        slot = match.group(1) if match else fragment.group(1) if fragment else ""
+        if match and fragment and match.group(1) != fragment.group(1):
+            raise MoodleMarkupError("Moodle attempt navigation slot is ambiguous")
+        if (
+            parsed.path.rstrip("/") != "/mod/quiz/attempt.php"
+            or query.get("attempt") != [attempt_id]
+            or query.get("cmid") not in (None, [str(cmid)])
+            or len(pages) != 1
+            or not pages[0].isdigit()
+            or int(pages[0]) > 31
+            or not _POSITIVE_ID.fullmatch(slot)
+        ):
+            raise MoodleMarkupError("Moodle attempt question navigation changed identity")
+        page = int(pages[0])
+        if slot in result and result[slot] != page:
+            raise MoodleMarkupError("Moodle attempt question page is ambiguous")
+        result[slot] = page
+    if len(result) > 32:
+        raise MoodleMarkupError("Moodle attempt has too many questions")
+    next_button = soup.select_one(NEXT_NAV_SELECTOR)
+    next_text = (
+        str(next_button.get("value", "")) or _text(next_button, maximum=256) if next_button else ""
+    )
+    if not result and re.search(r"next\s+page|следующ", next_text, re.I):
+        raise MoodleMarkupError("Moodle attempt pagination is unverified")
+    return result
 
 
 def parse_summary_page(

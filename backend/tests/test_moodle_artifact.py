@@ -11,6 +11,7 @@ from app.integrations.errors import IntegrationProtocolError
 from app.integrations.moodle_artifact import (
     build_moodle_online_text_artifact,
     build_moodle_quiz_essay_artifact,
+    build_moodle_submission_artifact,
 )
 from app.integrations.moodle_transport import moodle_file_type_allowed
 
@@ -48,6 +49,24 @@ def test_forced_archive_is_stable_for_one_file_and_deterministic() -> None:
     with ZipFile(BytesIO(first.raw_bytes)) as archive:
         assert archive.namelist() == ["src/main.cpp"]
         assert archive.read("src/main.cpp") == b"int main() {}\n"
+
+
+@pytest.mark.parametrize("path", ["main.cpp", "main.c", "src/решение.cpp"])
+def test_empty_attachment_is_archived_without_changing_student_source(path: str) -> None:
+    files = [{"path": path, "content": ""}]
+    artifact = build_moodle_submission_artifact(files)
+    assert artifact.filename == "submission.zip"
+    assert artifact.size > 0
+    assert artifact.raw_bytes == build_moodle_submission_artifact(files).raw_bytes
+    with ZipFile(BytesIO(artifact.raw_bytes)) as archive:
+        assert archive.namelist() == [path]
+        assert archive.read(path) == b""
+
+
+def test_empty_online_answer_stays_empty_text_not_a_zip() -> None:
+    artifact = build_moodle_online_text_artifact([{"path": "main.cpp", "content": ""}])
+    assert artifact.filename == "main.cpp"
+    assert artifact.raw_bytes == b""
 
 
 def test_multifile_zip_is_deterministic_sorted_and_regular() -> None:

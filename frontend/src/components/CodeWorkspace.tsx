@@ -3,8 +3,9 @@ import type * as Monaco from 'monaco-editor';
 import { ChevronRight, FileCode2, FilePlus2, Folder, LockKeyhole, PanelLeftClose, Trash2, X } from 'lucide-react';
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
 import { useTheme } from '../context/ThemeContext';
-import { cn, cppKeywords, findWorkspacePasteSource, isReceiptUsable, languageForPath, workspaceIdentifiers, type InternalClipboardReceipt } from '../lib/utils';
-import type { Diagnostic, WorkspaceFile } from '../types';
+import { cn, cppKeywords, languageForPath, workspaceIdentifiers } from '../lib/utils';
+import { installEditorClipboardGuard, type EditorClipboardSession } from '../lib/editorClipboard';
+import type { Diagnostic, InternalPasteRange, WorkspaceFile } from '../types';
 import { Badge, Button } from './ui';
 
 export interface CodeWorkspaceHandle {
@@ -25,13 +26,15 @@ interface Props {
   files: WorkspaceFile[];
   activeFileId: string;
   onActiveFile(id: string): void;
-  onChange(fileId: string, content: string, source: 'typing' | 'internal_paste', receiptId?: string): void;
+  onChange(fileId: string, content: string, source: 'typing' | 'internal_paste', receiptId?: string, pasteRange?: InternalPasteRange): void;
   onCreateFile?(): void;
   onDeleteFile?(file: WorkspaceFile): void;
   canDeleteFile?(file: WorkspaceFile): boolean;
   readOnly?: boolean;
   strictPaste?: boolean;
   scopeId: string;
+  clipboardScopeId?: string;
+  clipboardSession?: EditorClipboardSession;
   diagnostics?: Diagnostic[];
   highlights?: CodeHighlight[];
   theme?: 'light' | 'dark';
@@ -39,7 +42,7 @@ interface Props {
   explorerVisible?: boolean;
   onExplorerCollapse?(): void;
   onPasteBlocked?(): void;
-  onInternalCopy?(fileId: string, text: string): Promise<string | null>;
+  onInternalCopy?(fileId: string, text: string, sourceAttemptId?: string): Promise<string | null>;
 }
 
 const severityMap: Record<Diagnostic['severity'], Monaco.MarkerSeverity> = {
@@ -50,24 +53,25 @@ export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function Cod
   files, activeFileId, onActiveFile, onChange, onCreateFile, onDeleteFile, canDeleteFile,
   readOnly = false, strictPaste = false,
   scopeId, diagnostics = [], highlights = [], theme: requestedTheme, experiment = false, explorerVisible = true,
-  onExplorerCollapse, onPasteBlocked, onInternalCopy,
+  onExplorerCollapse, onPasteBlocked, onInternalCopy, clipboardScopeId, clipboardSession,
 }, ref) {
   const { theme: applicationTheme } = useTheme();
   const theme = requestedTheme ?? applicationTheme;
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
   const monacoRef = useRef<typeof Monaco | null>(null);
   const highlightDecorationsRef = useRef<Monaco.editor.IEditorDecorationsCollection | null>(null);
-  const receiptRef = useRef<InternalClipboardReceipt | null>(null);
+  const clipboardRootRef = useRef<HTMLDivElement | null>(null);
   const internalPasteRef = useRef(false);
   const internalPasteReceiptRef = useRef<string>();
+  const internalPasteRangeRef = useRef<InternalPasteRange>();
   const [openFiles, setOpenFiles] = useState<string[]>([activeFileId]);
   const active = files.find((file) => file.id === activeFileId) ?? files[0];
   const activeRef = useRef(active);
   const filesRef = useRef(files);
-  const pasteConfigRef = useRef({ strictPaste, readOnly, scopeId, onPasteBlocked, onInternalCopy });
+  const pasteConfigRef = useRef({ strictPaste, readOnly, scopeId, clipboardScopeId, onPasteBlocked, onInternalCopy });
   activeRef.current = active;
   filesRef.current = files;
-  pasteConfigRef.current = { strictPaste, readOnly, scopeId, onPasteBlocked, onInternalCopy };
+  pasteConfigRef.current = { strictPaste, readOnly, scopeId, clipboardScopeId, onPasteBlocked, onInternalCopy };
 
   useEffect(() => {
     if (activeFileId && !openFiles.includes(activeFileId)) setOpenFiles((items) => [...items, activeFileId]);
@@ -180,90 +184,26 @@ export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function Cod
       },
     });
     const completionProviders = [completionProvider('c'), completionProvider('cpp')];
-    const dom = editor.getDomNode();
+    const dom = clipboardRootRef.current;
     if (!dom) { completionProviders.forEach((provider) => provider.dispose()); return; }
-    const copyHandler = (event: ClipboardEvent) => {
-      const selection = editor.getSelection(); const model = editor.getModel();
-      const currentActive = activeRef.current;
-      const config = pasteConfigRef.current;
-      if (!config.strictPaste || !selection || !model || selection.isEmpty() || !currentActive || !config.onInternalCopy) return;
-      const text = model.getValueInRange(selection);
-      receiptRef.current = null;
-      const receiptScope = config.scopeId;
-      void config.onInternalCopy(currentActive.id, text).then((serverReceiptId) => {
-        if (serverReceiptId) {
-          receiptRef.current = { attemptId: receiptScope, text, sourceFileId: currentActive.id, createdAt: Date.now(), serverReceiptId };
-        }
-      });
-      event.clipboardData?.setData('text/plain', text);
-    };
-    const pasteHandler = (event: ClipboardEvent) => {
-      const config = pasteConfigRef.current;
-      if (!config.strictPaste || config.readOnly) return;
-      const text = event.clipboardData?.getData('text/plain') ?? '';
-      event.preventDefault(); event.stopImmediatePropagation();
-      const sourceFile = findWorkspacePasteSource(filesRef.current, text);
-      if (!sourceFile) {
-        config.onPasteBlocked?.(); return;
+    const disposeClipboard = installEditorClipboardGuard(dom, editor, () => ({
+      ...pasteConfigRef.current, active: activeRef.current, files: filesRef.current,
+    }), (receiptId, range, apply) => {
+      internalPasteReceiptRef.current = receiptId;
+      internalPasteRangeRef.current = range;
+      internalPasteRef.current = true;
+      try { apply(); }
+      finally {
+        internalPasteRef.current = false;
+        internalPasteReceiptRef.current = undefined;
+        internalPasteRangeRef.current = undefined;
       }
-      const selection = editor.getSelection();
-      const model = editor.getModel();
-      if (!selection || !model) return;
-      const applyPaste = (receiptId: string) => {
-        internalPasteReceiptRef.current = receiptId;
-        internalPasteRef.current = true;
-        editor.executeEdits('internal-paste', [{ range: selection, text, forceMoveMarkers: true }]);
-        receiptRef.current = null;
-        window.setTimeout(() => { internalPasteRef.current = false; internalPasteReceiptRef.current = undefined; }, 0);
-      };
-      if (isReceiptUsable(receiptRef.current, config.scopeId, text) && receiptRef.current?.serverReceiptId) {
-        applyPaste(receiptRef.current.serverReceiptId);
-        return;
-      }
-      if (!config.onInternalCopy) {
-        config.onPasteBlocked?.();
-        return;
-      }
-      const modelVersion = model.getVersionId();
-      const receiptScope = config.scopeId;
-      void config.onInternalCopy(sourceFile.id, text).then((serverReceiptId) => {
-        const latest = pasteConfigRef.current;
-        if (
-          !serverReceiptId
-          || latest.readOnly
-          || !latest.strictPaste
-          || latest.scopeId !== receiptScope
-          || editor.getModel() !== model
-          || model.getVersionId() !== modelVersion
-        ) return;
-        receiptRef.current = {
-          attemptId: receiptScope,
-          text,
-          sourceFileId: sourceFile.id,
-          createdAt: Date.now(),
-          serverReceiptId,
-        };
-        applyPaste(serverReceiptId);
-      });
-    };
-    const dropHandler = (event: DragEvent) => {
-      const config = pasteConfigRef.current;
-      if (config.strictPaste && !config.readOnly) { event.preventDefault(); event.stopImmediatePropagation(); config.onPasteBlocked?.(); }
-    };
-    const beforeInputHandler = (event: InputEvent) => {
-      const config = pasteConfigRef.current;
-      if (config.strictPaste && event.inputType === 'insertFromPaste' && !internalPasteRef.current) { event.preventDefault(); config.onPasteBlocked?.(); }
-    };
-    dom.addEventListener('copy', copyHandler, true); dom.addEventListener('cut', copyHandler, true);
-    dom.addEventListener('paste', pasteHandler, true); dom.addEventListener('drop', dropHandler, true);
-    dom.addEventListener('beforeinput', beforeInputHandler, true);
+    }, clipboardSession);
     editor.onDidDispose(() => {
       highlightDecorationsRef.current?.clear();
       highlightDecorationsRef.current = null;
       completionProviders.forEach((provider) => provider.dispose());
-      dom.removeEventListener('copy', copyHandler, true); dom.removeEventListener('cut', copyHandler, true);
-      dom.removeEventListener('paste', pasteHandler, true); dom.removeEventListener('drop', dropHandler, true);
-      dom.removeEventListener('beforeinput', beforeInputHandler, true);
+      disposeClipboard();
     });
   };
 
@@ -275,10 +215,10 @@ export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function Cod
 
   if (!active) return <div className="editor-empty"><FileCode2 /><p>В рабочей области пока нет файлов</p>{onCreateFile && <Button variant="secondary" onClick={onCreateFile}><FilePlus2 size={16} /> Создать файл</Button>}</div>;
 
-  return <div className={cn('code-workspace', experiment && 'code-workspace--experiment', !explorerVisible && 'code-workspace--explorer-hidden')}>
+  return <div ref={clipboardRootRef} className={cn('code-workspace', experiment && 'code-workspace--experiment', !explorerVisible && 'code-workspace--explorer-hidden')}>
     {explorerVisible && <aside className="file-explorer"><header><span>Файлы</span><span className="file-explorer__actions">{onCreateFile && !readOnly && <button onClick={onCreateFile} title="Создать файл" aria-label="Создать файл"><FilePlus2 size={15} /></button>}{onExplorerCollapse && <button onClick={onExplorerCollapse} title="Скрыть панель файлов" aria-label="Скрыть файлы"><PanelLeftClose size={15} /></button>}</span></header><div className="folder-label"><ChevronRight size={14} /><Folder size={15} /><span>workspace</span></div><div className="file-list">{files.map((file) => <div key={file.id} className={cn('file-entry', file.id === activeFileId && 'is-active')}><button className="file-entry__open" onClick={() => onActiveFile(file.id)}><FileCode2 size={15} /><span>{file.path}</span>{file.readOnly && <LockKeyhole size={12} />}</button>{onDeleteFile && !readOnly && !file.readOnly && (canDeleteFile?.(file) ?? files.length > 1) && <button className="file-entry__delete" onClick={() => onDeleteFile(file)} title={`Удалить ${file.path}`} aria-label={`Удалить ${file.path}`}><Trash2 size={13} /></button>}</div>)}</div><footer><span>Файлов: {files.length}</span></footer></aside>}
     <section className="editor-stage"><div className="editor-tabs">{openFiles.map((id) => { const file = files.find((item) => item.id === id); return file ? <button key={id} className={cn(id === activeFileId && 'is-active')} onClick={() => onActiveFile(id)}><FileCode2 size={14} /><span>{file.path.split('/').at(-1)}</span>{openFiles.length > 1 && <X size={13} onClick={(event) => { event.stopPropagation(); closeTab(id); }} />}</button> : null; })}<span className="editor-tabs__fill" /></div>
-      <Editor path={`inmemory:///${scopeId}/${active.path}`} value={active.content} language={active.language ?? languageForPath(active.path)} beforeMount={beforeMount} onMount={handleMount} onChange={(value) => onChange(active.id, value ?? '', internalPasteRef.current ? 'internal_paste' : 'typing', internalPasteRef.current ? internalPasteReceiptRef.current : undefined)} theme={theme === 'dark' ? 'eduprog-dark' : 'eduprog-light'} options={{ readOnly: readOnly || active.readOnly, readOnlyMessage: { value: 'Редактирование недоступно в режиме чтения.' }, minimap: { enabled: true, maxColumn: 80 }, fontSize: 14, lineHeight: 23, fontFamily: "'JetBrains Mono', 'SFMono-Regular', Consolas, monospace", fontLigatures: true, padding: { top: 14, bottom: 18 }, smoothScrolling: true, cursorSmoothCaretAnimation: 'on', automaticLayout: true, scrollBeyondLastLine: false, bracketPairColorization: { enabled: true }, guides: { bracketPairs: true, indentation: true }, suggest: { showSnippets: false }, quickSuggestions: !readOnly, inlineSuggest: { enabled: false }, contextmenu: true, dragAndDrop: !strictPaste, wordWrap: 'off', renderValidationDecorations: 'on' }} />
+      <Editor path={`inmemory:///${scopeId}/${active.path}`} value={active.content} language={active.language ?? languageForPath(active.path)} beforeMount={beforeMount} onMount={handleMount} onChange={(value) => onChange(active.id, value ?? '', internalPasteRef.current ? 'internal_paste' : 'typing', internalPasteRef.current ? internalPasteReceiptRef.current : undefined, internalPasteRef.current ? internalPasteRangeRef.current : undefined)} theme={theme === 'dark' ? 'eduprog-dark' : 'eduprog-light'} options={{ readOnly: readOnly || active.readOnly, readOnlyMessage: { value: 'Редактирование недоступно в режиме чтения.' }, minimap: { enabled: true, maxColumn: 80 }, fontSize: 14, lineHeight: 23, fontFamily: "'JetBrains Mono', 'SFMono-Regular', Consolas, monospace", fontLigatures: true, padding: { top: 14, bottom: 18 }, smoothScrolling: true, cursorSmoothCaretAnimation: 'on', automaticLayout: true, scrollBeyondLastLine: false, bracketPairColorization: { enabled: true }, guides: { bracketPairs: true, indentation: true }, suggest: { showSnippets: false }, quickSuggestions: !readOnly, inlineSuggest: { enabled: false }, contextmenu: !strictPaste, pasteAs: { enabled: !strictPaste }, dropIntoEditor: { enabled: !strictPaste }, dragAndDrop: !strictPaste, wordWrap: 'off', renderValidationDecorations: 'on' }} />
     </section>
   </div>;
 });

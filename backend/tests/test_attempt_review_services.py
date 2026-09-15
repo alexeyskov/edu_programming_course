@@ -16,6 +16,7 @@ from app.auth.context import AuthContext
 from app.models.attempts import (
     Attempt,
     EditEvent,
+    MoodleQuizQuestion,
     RunRequest,
     Snapshot,
     Submission,
@@ -45,9 +46,11 @@ from app.models.tasks import (
     TaskVersion,
 )
 from app.schemas.attempts import AttemptStartRequest
+from app.schemas.runs import RunCreateRequest
 from app.services.build_profile import effective_attempt_build_profile
 from app.services.common import DomainError, canonical_hash
 from app.services.delivery_profile import resolve_assessment_workspace_delivery_profile
+from app.services.moodle_materialization import materialize_moodle_activity_drafts
 from app.services.moodle_quiz_runtime import (
     prepared_moodle_assignment,
     prepared_moodle_quiz_attempt,
@@ -65,9 +68,12 @@ from app.services.workspace import (
     MAX_WORKSPACE_BYTES,
     MAX_WORKSPACE_FILES,
     create_clipboard_receipt,
+    create_snapshot,
     create_workspace_file,
     delete_workspace_file,
+    enqueue_checkpoint,
     replace_file_content,
+    retry_submission_checkpoint,
     start_attempt,
     submit_attempt,
 )
@@ -745,6 +751,331 @@ async def _map_deferred_random_quiz(db, assessment: Assessment) -> None:
         )
     )
     await db.flush()
+
+
+def _multi_quiz_preparation(
+    remote_attempt_id="141716", second_statement="Напишите функцию.", question_marks=(3, 5)
+):
+    questions = [
+        {
+            "question_slot": "1",
+            "question_text": "Создайте класс.",
+            "answer_transport": "ESSAY_ATTACHMENT",
+            "available_answer_transports": ["ESSAY_ATTACHMENT"],
+            "question_max_mark": question_marks[0],
+        },
+        {
+            "question_slot": "3",
+            "question_text": second_statement,
+            "answer_transport": "ESSAY_ONLINE_TEXT",
+            "available_answer_transports": ["ESSAY_ONLINE_TEXT"],
+            "question_max_mark": question_marks[1],
+        },
+    ]
+    return prepared_moodle_quiz_attempt(
+        course_external_id="549",
+        cmid=30354,
+        external_attempt_id=remote_attempt_id,
+        remaining_seconds=1200,
+        questions=questions,
+        **questions[0],
+    )
+
+
+async def _start_multi_quiz(db, prepared=None):
+    student, teacher, _other_teacher, assessment = await _seed_course(db)
+    base_version = await _task_version_for(db, assessment)
+    base_version.starter_files = [{"path": "main.cpp", "content": ""}]
+    base_version.statement = ""
+    await _map_deferred_random_quiz(db, assessment)
+    mapping = await db.scalar(
+        select(ExternalMapping).where(ExternalMapping.local_id == assessment.id)
+    )
+    metadata = dict(mapping.metadata_json)
+    metadata["activity"] = {
+        **metadata["activity"],
+        "question_count": 2,
+        "essay_question_count": 1,
+        "random_question_count": 1,
+        "quiz_questions_confirmed": True,
+    }
+    mapping.metadata_json = metadata
+    prepared = prepared or _multi_quiz_preparation()
+    root = await start_attempt(
+        db,
+        assessment_id=assessment.id,
+        principal_id=student.id,
+        prepared_moodle_quiz=prepared,
+    )
+    questions = list(
+        (
+            await db.scalars(
+                select(MoodleQuizQuestion)
+                .where(MoodleQuizQuestion.root_attempt_id == root.id)
+                .order_by(MoodleQuizQuestion.position)
+            )
+        ).all()
+    )
+    return student, teacher, assessment, root, questions
+
+
+async def test_multi_quiz_creates_isolated_writable_solutions_and_shared_dto(db, app_bundle):
+    student, _teacher, assessment, root, questions = await _start_multi_quiz(db)
+    assert [question.question_slot for question in questions] == ["1", "3"]
+    assert questions[0].attempt_id == root.id
+    assert [question.question_max_mark for question in questions] == [Decimal(3), Decimal(5)]
+    child = await db.get(Attempt, questions[1].attempt_id)
+    root_workspace, root_files = await _workspace_and_files(db, root)
+    child_workspace, child_files = await _workspace_and_files(db, child)
+    assert root_workspace.id != child_workspace.id
+    assert root_files[0].id != child_files[0].id
+    assert root_files[0].path == child_files[0].path == "main.cpp"
+    assert root_workspace.multi_file is True
+    assert child_workspace.multi_file is False
+    child_version = await db.get(TaskVersion, child.assigned_task_version_id)
+    assert child_version.statement == "Напишите функцию."
+    assert child_version.max_score == 5
+
+    mutation = await replace_file_content(
+        db,
+        attempt_id=child.id,
+        principal_id=student.id,
+        file_id=child_files[0].id,
+        content="int main() { return 2; }",
+        expected_revision=0,
+        client_request_id="multi-question-edit",
+    )
+    assert mutation.workspace.current_revision == 1
+    assert root_files[0].content == ""
+    assert child_files[0].content == "int main() { return 2; }"
+    snapshot = await create_snapshot(db, child_workspace, "PERIODIC")
+    event = await enqueue_checkpoint(db, attempt=child, snapshot=snapshot, reason="PERIODIC")
+    assert event.attempt_id == root.id
+    assert event.payload["quiz_session_revision"] == 1
+    assert {item["question_slot"] for item in event.payload["quiz_questions"]} == {"1", "3"}
+
+    _app, _factory, settings = app_bundle
+    for attempt, workspace in [(root, root_workspace), (child, child_workspace)]:
+        own_assessment = await db.get(Assessment, attempt.assessment_id)
+        dto = await attempts_api._attempt_read(db, attempt, own_assessment, workspace, settings)
+        assert dto.assessment_id == assessment.id
+        assert dto.state == "ACTIVE"
+        assert dto.quiz_session.root_attempt_id == root.id
+        assert [item.attempt_id for item in dto.quiz_session.questions] == [root.id, child.id]
+        assert dto.expected_end_at == root.expected_end_at
+    replay = await start_attempt(
+        db,
+        assessment_id=assessment.id,
+        principal_id=student.id,
+        prepared_moodle_quiz=_multi_quiz_preparation(),
+    )
+    assert replay.id == root.id
+    assert await db.scalar(select(func.count()).select_from(MoodleQuizQuestion)) == 2
+    assert child_files[0].content == "int main() { return 2; }"
+
+
+async def test_multi_quiz_finish_any_question_freezes_all_and_retries_root(db, app_bundle):
+    student, _teacher, assessment, root, questions = await _start_multi_quiz(db)
+    child = await db.get(Attempt, questions[1].attempt_id)
+    child_workspace, child_files = await _workspace_and_files(db, child)
+    submitted = await submit_attempt(
+        db, attempt_id=child.id, principal_id=student.id, expected_revision=0
+    )
+    assert submitted.attempt_id == child.id
+    assert root.state == child.state == "SUBMITTED"
+    submissions = list((await db.scalars(select(Submission))).all())
+    assert len(submissions) == 2
+    assert {item.external_receipt["moodle_response_id"] for item in submissions} == {"1", "3"}
+    assert {item.external_receipt["moodle_response_position"] for item in submissions} == {1, 2}
+    events = list((await db.scalars(select(SyncOutbox))).all())
+    terminal = [event for event in events if event.payload.get("reason") == "SUBMISSION"]
+    assert len(terminal) == 1
+    event = terminal[0]
+    assert event.attempt_id == root.id
+    assert {item["snapshot_id"] for item in event.payload["quiz_questions"]} == {
+        str(item.snapshot_id) for item in submissions
+    }
+    with pytest.raises(DomainError) as locked:
+        await replace_file_content(
+            db,
+            attempt_id=child.id,
+            principal_id=student.id,
+            file_id=child_files[0].id,
+            content="changed after submit",
+            expected_revision=0,
+            client_request_id="after-submit",
+        )
+    assert locked.value.code == "ATTEMPT_READ_ONLY"
+    assert (await submit_attempt(
+        db, attempt_id=child.id, principal_id=student.id, expected_revision=0
+    )).id == submitted.id
+    event.state = "FAILED"
+    await retry_submission_checkpoint(db, attempt_id=child.id, principal_id=student.id)
+    assert event.state == "RETRY"
+    event.state = "DELIVERED"
+    event.delivered_at = datetime.now(UTC)
+    await db.flush()
+    child_assessment = await db.get(Assessment, child.assessment_id)
+    dto = await attempts_api._attempt_read(
+        db, child, child_assessment, child_workspace, app_bundle[2]
+    )
+    assert dto.checkpoint_status == "SYNCED"
+    assert dto.state == "SUBMITTED"
+    second = await start_attempt(
+        db,
+        assessment_id=assessment.id,
+        principal_id=student.id,
+        prepared_moodle_quiz=_multi_quiz_preparation("141717"),
+    )
+    assert second.id != root.id
+    assert second.sequence == 2
+    assert await db.scalar(select(func.count()).select_from(MoodleQuizQuestion)) == 4
+
+
+async def test_multi_quiz_rejects_changed_question_identity_on_resume(db):
+    student, _teacher, assessment, root, questions = await _start_multi_quiz(db)
+    with pytest.raises(DomainError) as changed:
+        await start_attempt(
+            db,
+            assessment_id=assessment.id,
+            principal_id=student.id,
+            prepared_moodle_quiz=_multi_quiz_preparation(second_statement="A different question"),
+        )
+    assert changed.value.code == "MOODLE_ATTEMPT_BINDING_CONFLICT"
+    assert root.state == "ACTIVE"
+    assert await db.scalar(select(func.count()).select_from(MoodleQuizQuestion)) == len(questions)
+
+
+async def test_multi_quiz_child_run_only_receives_its_own_solution(db, app_bundle, monkeypatch):
+    student, _teacher, _assessment, root, questions = await _start_multi_quiz(db)
+    child = await db.get(Attempt, questions[1].attempt_id)
+    _, root_files = await _workspace_and_files(db, root)
+    _, child_files = await _workspace_and_files(db, child)
+    for attempt, file, code in [
+        (root, root_files[0], "int main() { return 1; }"),
+        (child, child_files[0], "int main() { return 2; }"),
+    ]:
+        await replace_file_content(
+            db,
+            attempt_id=attempt.id,
+            principal_id=student.id,
+            file_id=file.id,
+            content=code,
+            expected_revision=0,
+            client_request_id=f"edit-{attempt.id}",
+        )
+    dispatched = []
+
+    async def dispatch(_adapter, **kwargs):
+        dispatched.append(kwargs)
+        return attempts_api._mock_result(uuid.UUID(kwargs["request_id"]))
+
+    monkeypatch.setattr(attempts_api.RunnerAdapter, "dispatch", dispatch)
+    app, _factory, settings = app_bundle
+    settings.runner_mock_enabled = False
+    settings.runner_url = "http://runner.example.test"
+    request = Request({
+        "type": "http", "app": app, "headers": [], "client": ("127.0.0.1", 1234)
+    })
+    auth = AuthContext(
+        principal_id=student.id,
+        display_name=student.display_name,
+        session_id=uuid.uuid4(),
+        session_key="student-session",
+        roles=("STUDENT",),
+        capabilities=(),
+    )
+    for attempt in (root, child):
+        result = await attempts_api.create_student_run(
+            attempt.id, RunCreateRequest(revision=1), request, auth, db
+        )
+        assert result.status == "COMPLETED"
+    assert [entry["files"] for entry in dispatched] == [
+        [{"path": "main.cpp", "content": "int main() { return 1; }"}],
+        [{"path": "main.cpp", "content": "int main() { return 2; }"}],
+    ]
+    assert dispatched[0]["profile_id"].endswith("-multi")
+    assert dispatched[1]["profile_id"].endswith("-single")
+
+
+async def test_multi_quiz_stale_finish_rolls_back_every_solution(db):
+    student, _teacher, _assessment, root, questions = await _start_multi_quiz(db)
+    root_id, child_id, student_id = root.id, questions[1].attempt_id, student.id
+    with pytest.raises(DomainError) as conflict:
+        async with db.begin_nested():
+            await submit_attempt(
+                db, attempt_id=child_id, principal_id=student_id, expected_revision=10
+            )
+    assert conflict.value.code == "REVISION_CONFLICT"
+    assert await db.scalar(select(func.count()).select_from(Submission)) == 0
+    assert (await db.get(Attempt, root_id)).state == "ACTIVE"
+    assert (await db.get(Attempt, child_id)).state == "ACTIVE"
+
+
+async def test_multi_quiz_fractional_marks_keep_exact_binding_and_valid_review_scale(db):
+    student, teacher, assessment, root, questions = await _start_multi_quiz(
+        db, _multi_quiz_preparation(question_marks=(3.3333333, 0.00001))
+    )
+    assert [question.question_max_mark for question in questions] == [
+        Decimal("3.3333333"), Decimal("0.00001")
+    ]
+    versions = []
+    for question in questions:
+        attempt = await db.get(Attempt, question.attempt_id)
+        versions.append(await db.get(TaskVersion, attempt.assigned_task_version_id))
+    assert [version.max_score for version in versions] == [Decimal("3.33"), Decimal("1.00")]
+    await submit_attempt(db, attempt_id=root.id, principal_id=student.id, expected_revision=0)
+    auth = AuthContext(
+        principal_id=teacher.id,
+        display_name=teacher.display_name,
+        session_id=uuid.uuid4(),
+        session_key="teacher-session",
+        roles=("TEACHER",),
+        capabilities=(),
+    )
+    rows = await list_submissions(str(assessment.id), auth, db, offset=0, limit=100)
+    assert rows
+    for row in rows:
+        row.model_dump(mode="json")
+
+
+async def test_multi_quiz_confirmed_mixed_formats_do_not_report_sync_error(db):
+    _student, teacher, _other_teacher, assessment = await _seed_course(db)
+    course = await db.get(Course, assessment.course_id)
+    activity = {
+        "cmid": 31529,
+        "module": "quiz",
+        "name": "Самостоятельная работа №1",
+        "description": "",
+        "grade_max": 8,
+        "attempt_limit": 10,
+        "quiz_grading_method": "HIGHEST",
+        "quiz_grading_method_confirmed": True,
+        "question_count": 2,
+        "essay_question_count": 2,
+        "random_question_count": 0,
+        "quiz_questions_confirmed": True,
+        "import_supported": True,
+        "statement_deferred": True,
+        "title_confirmed": True,
+        "settings_confirmed": True,
+        "statement_confirmed": False,
+        "schedule_confirmed": True,
+        "duration_confirmed": True,
+        "grade_confirmed": True,
+        "attempt_policy_confirmed": True,
+    }
+    for expected_created in (1, 0):
+        created = await materialize_moodle_activity_drafts(
+            db, course=course, activities=[activity], created_by_id=teacher.id
+        )
+        assert created == expected_created
+        mapping = await db.scalar(
+            select(ExternalMapping).where(ExternalMapping.external_id == "31529")
+        )
+        assert mapping.metadata_json["sync_state"] == "CURRENT"
+        assert mapping.metadata_json["activity"]["quiz_questions_confirmed"] is True
+        assert mapping.metadata_json["moodle_source_confirmation"]["statement_deferred"] is True
 
 
 @pytest.mark.parametrize(

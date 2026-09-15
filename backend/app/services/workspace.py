@@ -14,6 +14,7 @@ from app.models.attempts import (
     Attempt,
     ClipboardReceipt,
     EditEvent,
+    MoodleQuizQuestion,
     Snapshot,
     Submission,
     Workspace,
@@ -38,11 +39,17 @@ from app.services.delivery_profile import resolve_assessment_workspace_delivery_
 from app.services.moodle_quiz_runtime import (
     PreparedMoodleAssignment,
     PreparedMoodleQuizAttempt,
+    apply_prepared_quiz_timer,
     materialize_prepared_task_version,
     pinned_moodle_quiz_binding,
     prepared_binding_matches_attempt,
     resolve_moodle_assignment_context,
     resolve_moodle_quiz_context,
+)
+from app.services.moodle_quiz_session import (
+    ensure_quiz_session,
+    quiz_question_for_attempt,
+    quiz_session_questions,
 )
 from app.services.policy import (
     ensure_assessment_available,
@@ -243,6 +250,46 @@ async def enqueue_checkpoint(
     reason: str,
     heartbeat_generation: int | None = None,
 ) -> SyncOutbox:
+    quiz_questions: list[dict[str, object]] = []
+    quiz_session_revision = 0
+    relation = await quiz_question_for_attempt(db, attempt.id)
+    if relation is not None:
+        root = await db.get(Attempt, relation.root_attempt_id)
+        if root is None or root.principal_id != attempt.principal_id:
+            raise DomainError(500, "MOODLE_QUIZ_SESSION_INVALID", "Quiz session is invalid")
+        for question in await quiz_session_questions(db, root.id):
+            member = await db.get(Attempt, question.attempt_id)
+            workspace = await db.scalar(
+                select(Workspace).where(Workspace.attempt_id == question.attempt_id)
+            )
+            if member is None or member.principal_id != root.principal_id or workspace is None:
+                raise DomainError(500, "MOODLE_QUIZ_SESSION_INVALID", "Quiz session is invalid")
+            if reason in {"SUBMISSION", "DEADLINE"}:
+                submission = await db.scalar(
+                    select(Submission)
+                    .where(Submission.attempt_id == member.id)
+                    .order_by(Submission.revision.desc())
+                )
+                member_snapshot = (
+                    await db.get(Snapshot, submission.snapshot_id) if submission else None
+                )
+                if member_snapshot is None or member.state == AttemptState.ACTIVE.value:
+                    raise DomainError(
+                        409, "QUIZ_SUBMISSION_INCOMPLETE", "All quiz solutions must be finalized"
+                    )
+            else:
+                member_snapshot = await create_snapshot(db, workspace, reason)
+            quiz_questions.append(
+                {
+                    "attempt_id": str(member.id),
+                    "snapshot_id": str(member_snapshot.id),
+                    "question_slot": question.question_slot,
+                }
+            )
+            quiz_session_revision += member_snapshot.revision
+            if member.id == root.id:
+                snapshot = member_snapshot
+        attempt = root
     assessment = await db.get(Assessment, attempt.assessment_id)
     principal = await db.get(ExternalPrincipal, attempt.principal_id)
     if assessment is None or principal is None:
@@ -272,6 +319,9 @@ async def enqueue_checkpoint(
         else "REVISION"
     )
     idempotency_key = f"checkpoint:{attempt.id}:{snapshot.id}:{terminal_generation}"[:100]
+    if quiz_questions:
+        bundle_hash = canonical_hash(quiz_questions)[:32]
+        idempotency_key = f"quiz:{attempt.id}:{bundle_hash}:{terminal_generation}"[:100]
     existing = await db.scalar(
         select(SyncOutbox).where(SyncOutbox.idempotency_key == idempotency_key)
     )
@@ -300,6 +350,9 @@ async def enqueue_checkpoint(
     }
     if heartbeat_generation is not None:
         payload["heartbeat_generation"] = heartbeat_generation
+    if quiz_questions:
+        payload["quiz_questions"] = quiz_questions
+        payload["quiz_session_revision"] = quiz_session_revision
     event = SyncOutbox(
         connection_id=course.connection_id,
         course_id=course.id,
@@ -335,6 +388,7 @@ async def start_attempt(
     principal_id: uuid.UUID,
     prepared_moodle_quiz: PreparedMoodleQuizAttempt | None = None,
     prepared_moodle_assignment: PreparedMoodleAssignment | None = None,
+    moodle_sync_timeout: int = 300,
     client_context: dict[str, str] | None = None,
 ) -> Attempt:
     assessment = await db.scalar(
@@ -484,16 +538,12 @@ async def start_attempt(
                     }
                 )
                 active.integrity_policy = raw_integrity
-                # Moodle is authoritative for per-user overrides and the live
-                # attempt lifetime.  A legacy local deadline may reflect only
-                # the expired global window and must not keep an overridden
-                # active attempt read-only after successful live preparation.
-                active.expected_end_at = (
-                    utcnow() + timedelta(seconds=prepared_moodle_quiz.remaining_seconds)
-                    if prepared_moodle_quiz.remaining_seconds is not None
-                    else None
+                apply_prepared_quiz_timer(
+                    active,
+                    remaining_seconds=prepared_moodle_quiz.remaining_seconds,
+                    reserve_seconds=moodle_sync_timeout,
+                    now=utcnow(),
                 )
-                active.deadline_at = None
                 await db.flush()
             if prepared_moodle_quiz is None:
                 if current_binding is None:
@@ -570,6 +620,10 @@ async def start_attempt(
             active.expected_end_at = None
             active.deadline_at = None
             await db.flush()
+        if prepared_moodle_quiz is not None:
+            await ensure_quiz_session(
+                db, root=active, assessment=assessment, prepared=prepared_moodle_quiz
+            )
         return active
     sequence = len(existing) + 1
     if prepared_moodle_quiz is not None and any(
@@ -711,10 +765,8 @@ async def start_attempt(
         )
         if value is not None
     ]
-    # ``expected_end_at`` is an informational countdown captured from the live
-    # Moodle page.  Moodle remains authoritative for an overridden quiz, so it
-    # must not become a local hard deadline that can make the editor read-only
-    # before Moodle itself closes the attempt.
+    # No deadline from global Moodle metadata: only the prepared per-user
+    # timer below can establish the earlier local submission boundary.
     deadline = None if moodle_managed else min(deadlines) if deadlines else None
     integrity_policy = {"paste_policy": assessment.paste_policy, "variant_locked": True}
     if prepared_moodle_quiz is not None:
@@ -753,6 +805,13 @@ async def start_attempt(
         integrity_policy=integrity_policy,
         client_context=normalize_client_context(client_context),
     )
+    if prepared_moodle_quiz is not None:
+        apply_prepared_quiz_timer(
+            attempt,
+            remaining_seconds=prepared_moodle_quiz.remaining_seconds,
+            reserve_seconds=moodle_sync_timeout,
+            now=now,
+        )
     db.add(attempt)
     await db.flush()
     workspace = Workspace(attempt_id=attempt.id, multi_file=workspace_multi_file)
@@ -771,7 +830,17 @@ async def start_attempt(
     await db.flush()
     await refresh_workspace_hash(db, workspace)
     snapshot = await create_snapshot(db, workspace, "ATTEMPT_STARTED")
-    await enqueue_checkpoint(db, attempt=attempt, snapshot=snapshot, reason="ATTEMPT_STARTED")
+    if prepared_moodle_quiz is not None:
+        await ensure_quiz_session(
+            db, root=attempt, assessment=assessment, prepared=prepared_moodle_quiz
+        )
+    else:
+        await enqueue_checkpoint(db, attempt=attempt, snapshot=snapshot, reason="ATTEMPT_STARTED")
+    # Quiz preparation has already started/resumed the real Moodle attempt.
+    # Keep the starter snapshot locally, but do not upload that untouched
+    # template immediately: its exclusive browser lease otherwise blocks a
+    # student's quick final submission. The regular checkpoint interval saves
+    # the latest edited revision; Submission/Deadline are still immediate.
     await db.flush()
     return attempt
 
@@ -784,6 +853,19 @@ async def _locked_workspace(
     require_active: bool = True,
     require_current_membership: bool = True,
 ) -> tuple[Attempt, Workspace]:
+    relation = await quiz_question_for_attempt(db, attempt_id)
+    if relation is not None:
+        # All solution mutations lock the common root first. Finish-all can
+        # then snapshot every sibling without interleaved writes or deadlocks.
+        root = await db.scalar(
+            select(Attempt).where(Attempt.id == relation.root_attempt_id).with_for_update()
+        )
+        if root is None or root.principal_id != principal_id:
+            raise DomainError(404, "ATTEMPT_NOT_FOUND", "Attempt was not found")
+        if require_active:
+            ensure_attempt_not_finalized_in_moodle(root)
+            if root.state != AttemptState.ACTIVE.value:
+                raise DomainError(409, "ATTEMPT_READ_ONLY", "Attempt is read-only")
     attempt = await db.scalar(select(Attempt).where(Attempt.id == attempt_id).with_for_update())
     if attempt is None or attempt.principal_id != principal_id:
         raise DomainError(404, "ATTEMPT_NOT_FOUND", "Attempt was not found")
@@ -818,6 +900,7 @@ async def replace_file_content(
     client_request_id: str,
     source: str = "TYPING",
     receipt_id: uuid.UUID | None = None,
+    paste_range: dict[str, int] | None = None,
     client_id: str = "",
     max_file_bytes: int = MAX_SOURCE_FILE_BYTES,
     client_context: dict[str, str] | None = None,
@@ -841,6 +924,7 @@ async def replace_file_content(
             "expected_revision": expected_revision,
             "source": requested_source,
             "receipt_id": str(receipt_id) if receipt_id is not None else None,
+            **({"paste_range": paste_range} if paste_range is not None else {}),
             "client_id": normalized_client_id,
         },
     )
@@ -888,6 +972,34 @@ async def replace_file_content(
     previous_content = file.content
     previous_hash = file.content_hash
     delta = contiguous_delta(previous_content, content)
+    if paste_range is not None:
+        offset = paste_range.get("offset")
+        delete_count = paste_range.get("delete_count")
+        if (
+            requested_source != "INTERNAL_PASTE"
+            or set(paste_range) != {"offset", "delete_count"}
+            or type(offset) is not int
+            or type(delete_count) is not int
+            or offset < 0
+            or delete_count < 0
+            or offset + delete_count > len(previous_content)
+        ):
+            raise DomainError(422, "INVALID_PASTE_RANGE", "Invalid internal paste range")
+        inserted_length = len(content) - len(previous_content) + delete_count
+        inserted = content[offset : offset + inserted_length] if inserted_length >= 0 else ""
+        if inserted_length < 0 or content != (
+            previous_content[:offset] + inserted + previous_content[offset + delete_count :]
+        ):
+            raise DomainError(422, "INVALID_PASTE_RANGE", "Paste changed text outside its range")
+        # A minimal diff may trim/reorder repeated characters of a valid paste.
+        # Validate the actual selected range against the receipt, not that diff.
+        delta = {
+            "type": "contiguous_delta",
+            "offset": offset,
+            "delete_count": delete_count,
+            "insert_text": inserted,
+            "offset_encoding": "unicode_codepoint",
+        }
     delta.update(
         {
             "previous_content_hash": previous_hash,
@@ -898,30 +1010,55 @@ async def replace_file_content(
     normalized_source = "EDITOR_CHANGE"
     if requested_source == "INTERNAL_PASTE":
         inserted_text = str(delta["insert_text"])
+        normalized_text = inserted_text.replace("\r\n", "\n")
         receipt = await db.scalar(
             select(ClipboardReceipt)
             .where(
                 ClipboardReceipt.id == receipt_id,
-                ClipboardReceipt.attempt_id == attempt.id,
                 ClipboardReceipt.principal_id == principal_id,
                 ClipboardReceipt.expires_at > utcnow(),
                 ClipboardReceipt.used_at.is_(None),
-                ClipboardReceipt.revision <= workspace.current_revision,
-                ClipboardReceipt.text_hash == sha256_text(inserted_text),
-                ClipboardReceipt.text_length == len(inserted_text),
             )
             .with_for_update()
         )
-        if receipt is None:
+        if receipt is None or (receipt.text_hash, receipt.text_length) not in {
+            (sha256_text(inserted_text), len(inserted_text)),  # legacy receipts
+            (sha256_text(normalized_text), len(normalized_text)),
+        }:
             raise DomainError(
                 422, "INVALID_CLIPBOARD_RECEIPT", "A valid internal clipboard receipt is required"
             )
-        if not any(inserted_text in candidate.content for candidate in active_files):
+        source_revision = workspace.current_revision if receipt.attempt_id == attempt.id else None
+        if receipt.attempt_id != attempt.id:
+            target_question = await quiz_question_for_attempt(db, attempt.id)
+            if target_question is not None:
+                # Question revisions are independent. Only pinned sibling
+                # workspaces of this student's same quiz attempt may share code.
+                # Do not lock the source workspace while holding the target lock.
+                source_revision = await db.scalar(
+                    select(Workspace.current_revision)
+                    .join(Attempt, Attempt.id == Workspace.attempt_id)
+                    .join(MoodleQuizQuestion, MoodleQuizQuestion.attempt_id == Attempt.id)
+                    .where(
+                        Attempt.id == receipt.attempt_id,
+                        Attempt.principal_id == principal_id,
+                        MoodleQuizQuestion.root_attempt_id == target_question.root_attempt_id,
+                    )
+                )
+        if source_revision is None or receipt.revision > source_revision:
             raise DomainError(
-                422,
-                "CLIPBOARD_TEXT_NOT_IN_WORKSPACE",
-                "Pasted text is no longer present in the current workspace",
+                422, "INVALID_CLIPBOARD_RECEIPT", "Clipboard source is outside this quiz attempt"
             )
+        if receipt.attempt_id != attempt.id:
+            delta["clipboard_source"] = {
+                "attempt_id": str(receipt.attempt_id),
+                "file_id": str(receipt.file_id),
+                "revision": receipt.revision,
+                "receipt_id": str(receipt.id),
+            }
+        # The server already verified the source at copy time. It may now have
+        # been cut/deleted; the quiz/principal/hash/TTL and one-use checks above
+        # still apply, so cut-and-paste remains valid without admitting new text.
         receipt.used_at = utcnow()
         normalized_source = "INTERNAL_PASTE"
     elif requested_source in {"PASTE", "EXTERNAL_PASTE", "UNVERIFIED_PASTE"}:
@@ -1247,7 +1384,8 @@ async def create_clipboard_receipt(
             WorkspaceFile.deleted_revision.is_(None),
         )
     )
-    if source_file is None or text not in source_file.content:
+    normalized_text = text.replace("\r\n", "\n")
+    if source_file is None or normalized_text not in source_file.content.replace("\r\n", "\n"):
         raise DomainError(
             422, "CLIPBOARD_TEXT_NOT_IN_WORKSPACE", "Copied text is not present in the source file"
         )
@@ -1256,8 +1394,8 @@ async def create_clipboard_receipt(
         file_id=source_file.id,
         principal_id=principal_id,
         revision=revision,
-        text_hash=sha256_text(text),
-        text_length=len(text),
+        text_hash=sha256_text(normalized_text),
+        text_length=len(normalized_text),
         expires_at=utcnow() + timedelta(seconds=ttl_seconds),
     )
     db.add(receipt)
@@ -1273,6 +1411,79 @@ async def submit_attempt(
     expected_revision: int,
     source: str = "MANUAL",
     client_context: dict[str, str] | None = None,
+) -> Submission:
+    relation = await quiz_question_for_attempt(db, attempt_id)
+    if relation is None:
+        return await _submit_single_attempt(
+            db,
+            attempt_id=attempt_id,
+            principal_id=principal_id,
+            expected_revision=expected_revision,
+            source=source,
+            client_context=client_context,
+        )
+    root, _root_workspace = await _locked_workspace(
+        db,
+        attempt_id=relation.root_attempt_id,
+        principal_id=principal_id,
+        require_active=False,
+        require_current_membership=source.upper() != "DEADLINE",
+    )
+    submitted: dict[uuid.UUID, Submission] = {}
+    for question in await quiz_session_questions(db, root.id):
+        member, workspace = await _locked_workspace(
+            db,
+            attempt_id=question.attempt_id,
+            principal_id=principal_id,
+            require_active=False,
+            require_current_membership=source.upper() != "DEADLINE",
+        )
+        submission = await _submit_single_attempt(
+            db,
+            attempt_id=member.id,
+            principal_id=principal_id,
+            expected_revision=(
+                expected_revision if member.id == attempt_id else workspace.current_revision
+            ),
+            source=source,
+            client_context=client_context,
+            enqueue=False,
+        )
+        submission.external_receipt = {
+            **dict(submission.external_receipt or {}),
+            "moodle_parent_attempt_id": str(root.integrity_policy.get("moodle_attempt_id", "")),
+            "moodle_response_id": question.question_slot,
+            "moodle_response_position": question.position,
+            "moodle_parent_assessment_id": str(root.assessment_id),
+            "moodle_quiz_root_attempt_id": str(root.id),
+            "moodle_question_max_mark": str(question.question_max_mark),
+        }
+        submitted[member.id] = submission
+    root_submission = submitted.get(root.id)
+    if root_submission is None or attempt_id not in submitted:
+        raise DomainError(500, "MOODLE_QUIZ_SESSION_INVALID", "Quiz session is incomplete")
+    root_snapshot = await db.get(Snapshot, root_submission.snapshot_id)
+    if root_snapshot is None:
+        raise DomainError(500, "SNAPSHOT_MISSING", "Quiz submission snapshot is missing")
+    await enqueue_checkpoint(
+        db,
+        attempt=root,
+        snapshot=root_snapshot,
+        reason="DEADLINE" if source.upper() == "DEADLINE" else "SUBMISSION",
+    )
+    await db.flush()
+    return submitted[attempt_id]
+
+
+async def _submit_single_attempt(
+    db: AsyncSession,
+    *,
+    attempt_id: uuid.UUID,
+    principal_id: uuid.UUID,
+    expected_revision: int,
+    source: str = "MANUAL",
+    client_context: dict[str, str] | None = None,
+    enqueue: bool = True,
 ) -> Submission:
     normalized_source = source.upper()
     if normalized_source not in {"MANUAL", "DEADLINE"}:
@@ -1312,13 +1523,20 @@ async def submit_attempt(
             {"current_revision": workspace.current_revision},
         )
     snapshot = await create_snapshot(db, workspace, "SUBMISSION")
+    # The earlier editing boundary reserves delivery time; scheduler polling
+    # inside that reserve does not make a Moodle submission late.
+    lateness_boundary = (
+        attempt.expected_end_at
+        if "moodle_sync_timeout_seconds" in (attempt.integrity_policy or {})
+        else attempt.deadline_at
+    )
     submission = Submission(
         attempt_id=attempt.id,
         snapshot_id=snapshot.id,
         revision=(existing.revision + 1) if existing else 1,
         source=normalized_source,
         submitted_at=now,
-        late=bool(attempt.deadline_at and now > _as_utc(attempt.deadline_at)),
+        late=bool(lateness_boundary and now > _as_utc(lateness_boundary)),
         client_context=normalize_client_context(client_context),
     )
     db.add(submission)
@@ -1330,12 +1548,13 @@ async def submit_attempt(
     attempt.submitted_at = now
     attempt.submission_source = normalized_source
     await db.flush()
-    await enqueue_checkpoint(
-        db,
-        attempt=attempt,
-        snapshot=snapshot,
-        reason="DEADLINE" if normalized_source == "DEADLINE" else "SUBMISSION",
-    )
+    if enqueue:
+        await enqueue_checkpoint(
+            db,
+            attempt=attempt,
+            snapshot=snapshot,
+            reason="DEADLINE" if normalized_source == "DEADLINE" else "SUBMISSION",
+        )
     await db.flush()
     return submission
 
@@ -1367,12 +1586,14 @@ async def retry_submission_checkpoint(
     )
     if submission is None:
         raise DomainError(409, "SUBMISSION_NOT_FOUND", "Submitted attempt has no submission")
+    relation = await quiz_question_for_attempt(db, attempt.id)
+    delivery_attempt_id = relation.root_attempt_id if relation is not None else attempt.id
     events = list(
         (
             await db.scalars(
                 select(SyncOutbox)
                 .where(
-                    SyncOutbox.attempt_id == attempt.id,
+                    SyncOutbox.attempt_id == delivery_attempt_id,
                     SyncOutbox.event_type == "attempt.checkpoint",
                 )
                 .order_by(SyncOutbox.created_at.desc(), SyncOutbox.id.desc())

@@ -1,5 +1,5 @@
 import { AlertTriangle, BookOpenCheck, CheckCircle2, Clock3, FileCode2, Library, Pencil, Plus, Rocket, ShieldCheck, Trash2 } from 'lucide-react';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { Badge, Button, Card, EmptyState, Field, InlineError, Modal, PageLoader, useToast } from '../components/ui';
 import { useAuth } from '../context/AuthContext';
@@ -54,6 +54,7 @@ export function AssessmentIntroPage() {
   const [assessment, setAssessment] = useState<Assessment | null>(null);
   const [loading, setLoading] = useState(true);
   const [starting, setStarting] = useState(false);
+  const startController = useRef<AbortController | null>(null);
   const [editing, setEditing] = useState(false);
   const [accepted, setAccepted] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -65,6 +66,10 @@ export function AssessmentIntroPage() {
     finally { setLoading(false); }
   }, [assessmentId]);
   useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    setStarting(false);
+    return () => { startController.current?.abort(); startController.current = null; };
+  }, [assessmentId]);
   if (loading) return <PageLoader label="Получаем параметры работы…" />;
   if (error && !assessment) return <InlineError message={error} retry={() => void load()} />;
   if (!assessment) return <InlineError message="Работа не найдена" />;
@@ -73,19 +78,29 @@ export function AssessmentIntroPage() {
   const notOpened = Boolean(item.startsAt && new Date(item.startsAt).getTime() > Date.now());
   const closed = item.status === 'CLOSED' || Boolean(item.deadlineAt && new Date(item.deadlineAt).getTime() <= Date.now());
   async function start() {
+    if (startController.current) return;
+    const controller = new AbortController();
+    startController.current = controller;
     setStarting(true); setError(null);
-    try { const attempt = await api.startAttempt(item.id); navigate(`/ide/${attempt.id}`); }
-    catch (caught) { setError(caught instanceof Error ? caught.message : 'Попытка не запущена'); }
-    finally { setStarting(false); }
+    try {
+      const attempt = await api.startAttempt(item.id, controller.signal);
+      if (!controller.signal.aborted) navigate(`/ide/${attempt.id}`);
+    }
+    catch (caught) { if (!controller.signal.aborted) setError(caught instanceof Error ? caught.message : 'Попытка не запущена'); }
+    finally {
+      if (startController.current === controller) { startController.current = null; setStarting(false); }
+    }
   }
   return <div className="content-width narrow-page">
     <Link to="/courses" className="back-link">← Ко всем работам</Link>
     <Card className="assessment-intro">
       <div className="intro-badges"><Badge tone={item.kind === 'EXAM' ? 'danger' : item.kind === 'CONTROL' ? 'warning' : 'neutral'}>{kindLabel[item.kind]}</Badge>{primaryRole === 'TEACHER' && <Badge tone={item.publicationStatus === 'PUBLISHED' ? 'success' : 'warning'}>{item.publicationStatus === 'PUBLISHED' ? 'Опубликована' : item.publicationStatus === 'CLOSED' ? 'Закрыта' : 'Черновик'}</Badge>}</div>
       <h1>{item.title}</h1><p>{item.summary || 'Дополнительные инструкции преподавателем не указаны.'}</p>{error && <InlineError message={error} />}
+      {starting && <p role="status">Открываем попытку в Moodle. Если предыдущий обмен ещё выполняется, запуск продолжится автоматически. Повторно нажимать кнопку не нужно.</p>}
       <div className="intro-facts"><div><Clock3 /><span><small>Продолжительность</small><strong>{item.durationMinutes ? `${item.durationMinutes} минут` : 'Без ограничения'}</strong></span></div><div><FileCode2 /><span><small>{lmsManaged ? 'Формат ответа' : 'Рабочая область'}</small><strong>{lmsManaged ? `Уточняется при запуске · ${item.standard}` : `${item.fileMode === 'MULTI' ? 'Несколько файлов' : 'Один файл'} · ${item.standard}`}</strong></span></div><div><ShieldCheck /><span><small>Правило вставки</small><strong>{item.pastePolicy === 'STRICT' ? 'Только внутри попытки' : 'Разрешена'}</strong></span></div></div>
+      {lmsManaged && item.durationMinutes && <p className="schedule-copy">Указан лимит Moodle. Время решения уточняется при запуске с учётом настроек для вашей учётной записи и резерва на отправку; этот резерв вычитается из таймера Quiz.</p>}
       {item.startsAt && <p className="schedule-copy">Открытие: {formatDate(item.startsAt)}{item.deadlineAt && ` · закрытие: ${formatDate(item.deadlineAt)}`}</p>}
-      {primaryRole === 'TEACHER' ? <div className="teacher-intro-actions"><p>Название, условие, сроки, максимальный балл и число попыток загружаются из Moodle. В Мехмат.Практикуме вы выбираете только группы преподавателя. Возможность сдачи для конкретного студента и способ отправки проверяются непосредственно в Moodle при запуске.</p>{item.publicationStatus !== 'CLOSED' && <div><Button size="lg" onClick={() => setEditing(true)}><ShieldCheck size={16} /> {item.publicationStatus === 'DRAFT' ? 'Настроить доступ' : 'Изменить доступ'}</Button></div>}</div> : <><div className="self-check"><CheckCircle2 /><span><strong>Интерфейс готов к началу</strong><small>{lmsManaged ? 'При запуске Moodle проверит доступность работы именно для вашей учётной записи.' : 'Окончательную доступность, срок и число попыток проверит сервер.'}</small></span></div><label className="rules-check"><input type="checkbox" checked={accepted} onChange={(event) => setAccepted(event.target.checked)} /><span>Я ознакомился с параметрами работы и понимаю, что серверное время является авторитетным.</span></label>{item.attemptId ? <Button size="lg" loading={starting} onClick={() => lmsManaged ? void start() : navigate(`/ide/${item.attemptId}`)}>Продолжить попытку</Button> : <Button size="lg" loading={starting} disabled={!accepted || (!lmsManaged && (notOpened || closed))} onClick={() => void start()}>{!lmsManaged && closed ? 'Работа закрыта' : !lmsManaged && notOpened ? `Откроется ${formatDate(item.startsAt)}` : 'Начать попытку'}</Button>}</>}
+      {primaryRole === 'TEACHER' ? <div className="teacher-intro-actions"><p>Название, условие, сроки, максимальный балл и число попыток загружаются из Moodle. В Мехмат.Практикуме вы выбираете группы преподавателя и разрешаете или запрещаете ИИ-помощь. Возможность сдачи для конкретного студента и способ отправки проверяются непосредственно в Moodle при запуске.</p>{item.publicationStatus !== 'CLOSED' && <div><Button size="lg" onClick={() => setEditing(true)}><ShieldCheck size={16} /> {item.publicationStatus === 'DRAFT' ? 'Настроить доступ' : 'Изменить доступ'}</Button></div>}</div> : <><div className="self-check"><CheckCircle2 /><span><strong>Интерфейс готов к началу</strong><small>{lmsManaged ? 'При запуске Moodle проверит доступность работы именно для вашей учётной записи.' : 'Окончательную доступность, срок и число попыток проверит сервер.'}</small></span></div><label className="rules-check"><input type="checkbox" checked={accepted} onChange={(event) => setAccepted(event.target.checked)} /><span>Я ознакомился с параметрами работы и понимаю, что серверное время является авторитетным.</span></label>{item.attemptId ? <Button size="lg" loading={starting} onClick={() => lmsManaged ? void start() : navigate(`/ide/${item.attemptId}`)}>Продолжить попытку</Button> : <Button size="lg" loading={starting} disabled={!accepted || (!lmsManaged && (notOpened || closed))} onClick={() => void start()}>{!lmsManaged && closed ? 'Работа закрыта' : !lmsManaged && notOpened ? `Откроется ${formatDate(item.startsAt)}` : 'Начать попытку'}</Button>}</>}
     </Card>
     {editing && <MoodlePublicationEditor assessment={item} onUpdated={setAssessment} onClose={() => setEditing(false)} />}
   </div>;
@@ -94,6 +109,7 @@ export function AssessmentIntroPage() {
 function MoodlePublicationEditor({ assessment, onUpdated, onClose }: { assessment: Assessment; onUpdated(value: Assessment): void; onClose(): void }) {
   const [targets, setTargets] = useState<AssessmentPublicationTargets | null>(null);
   const [selectedGroups, setSelectedGroups] = useState<Set<string>>(new Set());
+  const [studentAiEnabled, setStudentAiEnabled] = useState(assessment.aiEnabled);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -128,7 +144,7 @@ function MoodlePublicationEditor({ assessment, onUpdated, onClose }: { assessmen
     setSaving(true);
     setError(null);
     try {
-      const updated = await api.publishAssessment(assessment.id, [...selectedGroups]);
+      const updated = await api.publishAssessment(assessment.id, [...selectedGroups], studentAiEnabled);
       onUpdated(updated);
       toast.push('success', assessment.publicationStatus === 'DRAFT' ? 'Работа открыта выбранным группам' : 'Доступ к работе обновлён');
       onClose();
@@ -146,6 +162,10 @@ function MoodlePublicationEditor({ assessment, onUpdated, onClose }: { assessmen
     <div className="moodle-publication-form">
       <section className="moodle-source-summary"><strong>{assessment.title}</strong><p>{assessment.summary || 'Moodle не опубликовал отдельное условие для этой активности.'}</p><dl><div><dt>Период</dt><dd>{assessment.startsAt ? formatDate(assessment.startsAt) : 'без даты открытия'} · {assessment.deadlineAt ? formatDate(assessment.deadlineAt) : 'без даты закрытия'}</dd></div><div><dt>Оценивание</dt><dd>до {assessment.maxScore} баллов · попыток: {assessment.attemptLimit ?? 'без ограничения'}</dd></div></dl><small>Эти данные доступны только для чтения и обновляются при синхронизации курса с Moodle.</small></section>
       {error && <InlineError message={error} />}
+      <section className="moodle-group-picker">
+        <header><strong>ИИ-помощь студентам</strong><small>Настройка действует для всех задач этой работы только в Мехмат.Практикуме и не меняет Moodle. Администратор может отключить ИИ для всей системы.</small></header>
+        <label className="option-check"><input type="checkbox" checked={studentAiEnabled} disabled={saving} onChange={(event) => setStudentAiEnabled(event.target.checked)} /><span><strong>Разрешить учебного ИИ-помощника</strong><small>Объяснения и подсказки без готового решения.</small></span></label>
+      </section>
       <section className="moodle-group-picker"><header><strong>Группы преподавателя</strong><small>Работа появится у всех студентов выбранных групп. При запуске Moodle отдельно проверит доступность для конкретного студента.</small></header>{loading ? <PageLoader label="Получаем группы…" /> : targets?.groups.length ? targets.groups.map((group) => <label key={group.id} className="option-check"><input type="checkbox" checked={selectedGroups.has(group.id)} onChange={() => toggleGroup(group.id)} /><span><strong>{group.name}</strong><small>Идентификатор группы Moodle: {group.externalId}</small></span></label>) : <p className="modal-copy">Доступных групп нет.</p>}</section>
     </div>
   </Modal>;

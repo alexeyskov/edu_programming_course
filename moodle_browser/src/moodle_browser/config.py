@@ -47,10 +47,17 @@ class Settings:
     base_url: str = "https://edu.mmcs.sfedu.ru"
     headless: bool = True
     # One Chromium process is shared by short interactive logins and longer
-    # background crawls.  Two contexts let us reserve capacity for login while
+    # background crawls. Three heavy contexts reserve capacity for login while
     # still keeping the N150 deployment bounded.
     max_concurrent_operations: int = 3
     queue_wait_seconds: float = 2.0
+    # Student requests wait in a bounded FIFO instead of failing after the
+    # short background-import admission window. Waiting needs no Chromium tab.
+    student_queue_wait_seconds: float = 180.0
+    max_pending_student_operations: int = 64
+    # Script-free student forms have a separate, small pool. A teacher crawl
+    # cannot exhaust it; these contexts do not load Moodle's editors/assets.
+    max_concurrent_student_operations: int = 4
     navigation_timeout_ms: int = 30_000
     max_login_course_role_pages: int = 64
     login_course_role_budget_seconds: float = 15.0
@@ -75,6 +82,18 @@ class Settings:
             raise ValueError("MOODLE_BROWSER_MAX_CONCURRENT_OPERATIONS must be between 1 and 8")
         if not 0.05 <= self.queue_wait_seconds <= 60:
             raise ValueError("MOODLE_BROWSER_QUEUE_WAIT_SECONDS is outside the supported range")
+        if not 0.05 <= self.student_queue_wait_seconds <= 240:
+            raise ValueError(
+                "MOODLE_BROWSER_STUDENT_QUEUE_WAIT_SECONDS is outside the supported range"
+            )
+        if not 20 <= self.max_pending_student_operations <= 256:
+            raise ValueError(
+                "MOODLE_BROWSER_MAX_PENDING_STUDENT_OPERATIONS is outside the supported range"
+            )
+        if not 1 <= self.max_concurrent_student_operations <= 8:
+            raise ValueError(
+                "MOODLE_BROWSER_MAX_CONCURRENT_STUDENT_OPERATIONS must be between 1 and 8"
+            )
         if not 1_000 <= self.navigation_timeout_ms <= 120_000:
             raise ValueError("MOODLE_BROWSER_NAVIGATION_TIMEOUT_MS is outside the supported range")
         if not 1 <= self.max_login_course_role_pages <= 512:
@@ -153,6 +172,15 @@ class Settings:
                 os.environ.get("MOODLE_BROWSER_MAX_CONCURRENT_OPERATIONS", "3")
             ),
             queue_wait_seconds=float(os.environ.get("MOODLE_BROWSER_QUEUE_WAIT_SECONDS", "8")),
+            student_queue_wait_seconds=float(
+                os.environ.get("MOODLE_BROWSER_STUDENT_QUEUE_WAIT_SECONDS", "180")
+            ),
+            max_pending_student_operations=int(
+                os.environ.get("MOODLE_BROWSER_MAX_PENDING_STUDENT_OPERATIONS", "64")
+            ),
+            max_concurrent_student_operations=int(
+                os.environ.get("MOODLE_BROWSER_MAX_CONCURRENT_STUDENT_OPERATIONS", "4")
+            ),
             navigation_timeout_ms=int(
                 os.environ.get("MOODLE_BROWSER_NAVIGATION_TIMEOUT_MS", "30000")
             ),

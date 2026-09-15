@@ -315,6 +315,30 @@ async def publication_student_ids_for_teacher(
     )
 
 
+async def assessment_review_scope_ids(
+    db: AsyncSession,
+    assessment_id: uuid.UUID,
+) -> set[uuid.UUID]:
+    """Include an activity's managed Quiz questions, never unrelated courses.
+
+    A request for an individual child remains scoped to that child. Parent
+    activity queues, however, need both native and imported question responses
+    before latest-attempt selection and pagination can group them correctly.
+    """
+
+    assessment = await db.get(Assessment, assessment_id)
+    if assessment is None:
+        return set()
+    children = await db.scalars(
+        select(Assessment.id).where(
+            Assessment.course_id == assessment.course_id,
+            Assessment.policy["moodle_quiz_question_split"].as_boolean().is_(True),
+            Assessment.policy["moodle_parent_assessment_id"].as_string() == str(assessment_id),
+        )
+    )
+    return {assessment_id, *children.all()}
+
+
 async def visible_submission_ids_for_review(
     db: AsyncSession,
     *,
@@ -336,7 +360,7 @@ async def visible_submission_ids_for_review(
         )
     )
     if assessment_id is not None:
-        base = base.where(Assessment.id == assessment_id)
+        base = base.where(Assessment.id.in_(await assessment_review_scope_ids(db, assessment_id)))
     if allow_system_settings_read:
         return set((await db.scalars(base)).all())
 

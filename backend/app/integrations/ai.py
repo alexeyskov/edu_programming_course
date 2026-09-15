@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from ipaddress import ip_address
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -51,6 +52,17 @@ class AIProvider:
         self.api_style = (
             "chat" if configured_style in {"chat", "chat_completions"} else configured_style
         )
+        if self.api_style == "auto":
+            base = self._validated_base_url()
+            parsed = urlsplit(base)
+            if parsed.path.rstrip("/").endswith(("/api", "/api/chat")) or (
+                not parsed.path.strip("/") and parsed.port == 11434
+            ):
+                self.api_style = "ollama"
+            elif parsed.path.endswith("/responses") or parsed.hostname == "api.openai.com":
+                self.api_style = "responses"
+            else:
+                self.api_style = "chat"
         self.timeout_seconds = float(getattr(settings, "ai_timeout_seconds", 45))
         self.response_limit = int(getattr(settings, "ai_max_response_bytes", 1_000_000))
         self.context_limit = int(
@@ -113,9 +125,9 @@ class AIProvider:
                 model="mock-policy-v1",
             )
         key = secret_value(self.settings.ai_api_key)
-        if not self.settings.ai_enabled or not key:
+        if not self.settings.ai_provider_configured:
             raise IntegrationConfigurationError("AI provider is not configured")
-        if self.api_style not in {"responses", "chat"}:
+        if self.api_style not in {"responses", "chat", "ollama"}:
             raise IntegrationConfigurationError("Unsupported AI API style")
 
         messages = self._bounded_history(history)
@@ -126,10 +138,19 @@ class AIProvider:
         user_content = f"Context: {context_text}\n\nQuestion: {question}"
         system = self._system(normalized_mode)
         base = self._validated_base_url()
-        if self.api_style == "chat":
-            endpoint = f"{base}/chat/completions"
+        if self.api_style in {"chat", "ollama"}:
+            if self.api_style == "ollama":
+                if base.endswith("/api/chat"):
+                    endpoint = base
+                else:
+                    endpoint = f"{base}/chat" if base.endswith("/api") else f"{base}/api/chat"
+            else:
+                endpoint = (
+                    base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+                )
             payload: dict[str, Any] = {
                 "model": self.settings.ai_model,
+                "stream": False,
                 "messages": [
                     {"role": "system", "content": system},
                     *messages,
@@ -137,23 +158,32 @@ class AIProvider:
                 ],
             }
         else:
-            endpoint = f"{base}/responses"
+            endpoint = base if base.endswith("/responses") else f"{base}/responses"
             payload = {
                 "model": self.settings.ai_model,
                 "instructions": system,
                 "input": [*messages, {"role": "user", "content": user_content}],
             }
+        thinking = self.settings.llm_thinking
+        if thinking is not None:
+            if self.api_style == "ollama":
+                payload["think"] = thinking
+            elif urlsplit(base).hostname == "openrouter.ai":
+                payload["reasoning"] = {"enabled": thinking}
+            elif self.api_style == "responses":
+                payload["reasoning"] = {"effort": "medium" if thinking else "none"}
+            else:
+                payload["reasoning_effort"] = "medium" if thinking else "none"
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
         result = await request_json_limited(
             self.client,
             "POST",
             endpoint,
             timeout_seconds=self.timeout_seconds,
             response_limit=self.response_limit,
-            headers={
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
+            headers=headers,
             content=canonical_json(payload),
         )
         if not isinstance(result, dict):
@@ -213,12 +243,18 @@ class AIProvider:
         return accepted
 
     def _content(self, result: dict[str, Any]) -> str:
+        if self.api_style == "ollama":
+            message = result.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            # Never display a provider's thinking/reasoning field as the answer.
+            return content if isinstance(content, str) else ""
         if self.api_style == "chat":
             choices = result.get("choices", [])
             if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
                 return ""
             message = choices[0].get("message", {})
-            return str(message.get("content", "")) if isinstance(message, dict) else ""
+            content = message.get("content") if isinstance(message, dict) else None
+            return content if isinstance(content, str) else ""
         direct = result.get("output_text")
         if isinstance(direct, str) and direct:
             return direct
@@ -294,9 +330,10 @@ class AIProvider:
             return False
 
     def _validated_base_url(self) -> str:
-        base = self.settings.ai_base_url.rstrip("/")
+        base = self.settings.ai_base_url.strip().rstrip("/")
         try:
             parsed = urlsplit(base)
+            _ = parsed.port
         except ValueError as exc:
             raise IntegrationConfigurationError("AI provider URL is invalid") from exc
         if (
@@ -306,10 +343,29 @@ class AIProvider:
             or parsed.password
             or parsed.query
             or parsed.fragment
-            or (parsed.scheme != "https" and not self.settings.debug)
+            or (
+                parsed.scheme != "https"
+                and not self.settings.debug
+                and not self._local_http_host(parsed.hostname)
+            )
         ):
             raise IntegrationConfigurationError("AI provider URL is invalid")
         return base
+
+    @staticmethod
+    def _local_http_host(host: str | None) -> bool:
+        if host in {"localhost", "host.docker.internal", "ollama"}:
+            return True
+        try:
+            address = ip_address(host or "")
+        except ValueError:
+            return False
+        return address.is_loopback or (
+            address.is_private
+            and not address.is_link_local
+            and not address.is_unspecified
+            and not address.is_reserved
+        )
 
     @staticmethod
     def _blocked_input(question: str) -> bool:

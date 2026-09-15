@@ -135,6 +135,7 @@ class SyncOutboxListItemRead(ReadModel):
 
 
 class SyncOutboxRead(SyncOutboxListItemRead):
+    aggregate_title: Annotated[str, StringConstraints(max_length=255)] | None = None
     payload: JsonObject = Field(default_factory=dict)
     idempotency_key: Annotated[str, StringConstraints(min_length=1, max_length=100)]
     receipt: JsonObject = Field(default_factory=dict)

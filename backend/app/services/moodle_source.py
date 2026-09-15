@@ -18,10 +18,10 @@ _QUIZ_GRADING_METHODS = frozenset({"HIGHEST", "AVERAGE", "FIRST", "LAST"})
 def confirmed_moodle_quiz_grading_method(activity: object) -> str | None:
     """Return a bounded Quiz attempt aggregation method with explicit evidence.
 
-    Moodle computes the gradebook value from all finished attempts according
-    to ``grademethod``.  A local decision attached to the latest attempt is not
-    enough to prove that the gradebook will use it, so callers must not infer a
-    safe method from a missing field or from the number of attempts.
+    Moodle computes the gradebook value using ``grademethod``, independently
+    of the mark we export for the latest submitted response. All standard
+    aggregation methods are supported without changing the LMS settings.
+    Never infer a method from a missing field or from the number of attempts.
     """
 
     if not isinstance(activity, dict):
@@ -40,26 +40,44 @@ def moodle_quiz_uses_latest_attempt_grade(activity: object) -> bool:
 
 
 def moodle_statement_is_deferred(activity: dict[str, Any]) -> bool:
-    """Accept a missing static statement only for one proved random Essay slot.
+    """Defer statements only for a completely proved supported Essay quiz.
 
     Moodle does not choose the concrete question from a random slot until an
     attempt starts.  The browser connector therefore cannot truthfully mark a
     statement as confirmed during course discovery.  This exception remains
-    deliberately narrow: discovery must have proved both the single-slot quiz
-    shape and that every candidate in the random pool is an Essay question.
+    deliberately narrow: discovery must prove every slot (including every
+    random pool) is an Essay before live preparation binds individual questions.
     """
 
     question_count = activity.get("question_count")
     random_question_count = activity.get("random_question_count")
-    return (
-        str(activity.get("module", "")).removeprefix("mod_") == "quiz"
+    essay_question_count = activity.get("essay_question_count")
+    proved_multi_question = (
+        activity.get("quiz_questions_confirmed") is True
         and isinstance(question_count, int)
+        and not isinstance(question_count, bool)
+        and 2 <= question_count <= 32
+        and isinstance(essay_question_count, int)
+        and not isinstance(essay_question_count, bool)
+        and isinstance(random_question_count, int)
+        and not isinstance(random_question_count, bool)
+        and essay_question_count >= 0
+        and random_question_count >= 0
+        and essay_question_count + random_question_count == question_count
+        and (random_question_count == 0 or activity.get("random_essay_confirmed") is True)
+    )
+    proved_single_random = (
+        isinstance(question_count, int)
         and not isinstance(question_count, bool)
         and question_count == 1
         and isinstance(random_question_count, int)
         and not isinstance(random_question_count, bool)
         and random_question_count == 1
         and activity.get("random_essay_confirmed") is True
+    )
+    return (
+        str(activity.get("module", "")).removeprefix("mod_") == "quiz"
+        and (proved_single_random or proved_multi_question)
         and activity.get("statement_deferred") is True
         and activity.get("import_supported") is True
         and activity.get("statement_confirmed") is not True

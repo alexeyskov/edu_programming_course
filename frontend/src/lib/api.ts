@@ -7,7 +7,7 @@ import { languageForPath, unwrapList } from './utils';
 import { createUuid } from './uuid';
 import type {
   Assessment, AssessmentPublicationTargets, Attempt, AttemptStatus, AuthConnection, AuthorshipAnalysis, AvailabilityRule, Course, CourseCatalogEntry, CourseGroup, CourseSyncStatus, Diagnostic, EvidenceReport, HiddenTestManifestV1, HistoryEvent, InteractiveRun, LmsActivity, Role, RunResult,
-  CourseImportJob, MoodleHistoryImportEvent, Session, SimilarityAnalysis, SimilarityComparison, SimilarityMatch, Submission, SystemHealth, SystemSettings, TaskBankItem, TaskVersion, TeacherAccessToken, TeacherAccessTokenIssued, TeacherExperiment, WorkspaceFile,
+  CourseImportJob, InternalPasteRange, MoodleHistoryImportEvent, Session, SimilarityAnalysis, SimilarityComparison, SimilarityMatch, Submission, SystemHealth, SystemSettings, TaskBankItem, TaskVersion, TeacherAccessToken, TeacherAccessTokenIssued, TeacherExperiment, WorkspaceFile,
 } from '../types';
 
 type DemoMode = 'always' | 'auto' | 'never';
@@ -47,6 +47,8 @@ const LOCALIZED_API_ERROR_MESSAGES: Readonly<Record<string, string>> = {
   RESPONSE_TOO_LARGE: 'Ответ внешнего сервиса слишком большой.',
   LMS_IMPORT_REQUIRES_CONFIGURATION: 'Импортированная работа ещё не готова. Синхронизируйте курс с Moodle.',
   MOODLE_SOURCE_UNCONFIRMED: 'Moodle не подтвердил все параметры работы. Повторите синхронизацию курса.',
+  MOODLE_QUIZ_GRADING_METHOD_UNCONFIRMED: 'Не удалось подтвердить метод оценивания теста Moodle. Повторите синхронизацию курса.',
+  MOODLE_LAST_ATTEMPT_GRADING_REQUIRED: 'Сервер системы использует устаревшую проверку метода оценивания. Обновите систему: настройки Moodle менять не требуется.',
   MOODLE_ANSWER_TRANSPORT_UNSUPPORTED: 'Moodle не подтвердил поддерживаемый способ отправки программного ответа.',
   LMS_DELIVERY_PROFILE_UNRESOLVED: 'Moodle ещё не подтвердил формат ответа. Синхронизируйте курс и повторите запуск попытки.',
   MOODLE_ONLINE_TEXT_SINGLE_TRANSLATION_UNIT_REQUIRED: 'Это задание Moodle принимает только один основной файл C/C++; вспомогательные текстовые файлы в ответ не отправляются.',
@@ -65,6 +67,9 @@ const LOCALIZED_API_ERROR_MESSAGES: Readonly<Record<string, string>> = {
   MOODLE_ATTEMPT_STILL_FINALIZING: 'Предыдущая попытка ещё сохраняется в Moodle. Подождите несколько секунд и откройте работу снова.',
   INVALID_MOODLE_PREPARATION: 'Moodle вернул неполные параметры задания. Попытка не была запущена; сообщите преподавателю.',
   ATTEMPT_READ_ONLY: 'Эта попытка уже завершена и доступна только для чтения.',
+  INVALID_CLIPBOARD_RECEIPT: 'Подтверждение копирования истекло или уже использовано. Скопируйте фрагмент заново из редактора.',
+  CLIPBOARD_TEXT_NOT_IN_WORKSPACE: 'Не удалось подтвердить фрагмент в исходном файле. Дождитесь сохранения и скопируйте его заново.',
+  INVALID_PASTE_RANGE: 'Код изменился во время вставки. Скопируйте фрагмент заново и повторите вставку.',
   DEADLINE_PASSED: 'Время выполнения работы закончилось. Редактирование и запуск программы недоступны.',
   ATTEMPT_LIMIT_REACHED: 'Доступное число попыток исчерпано.',
   MOODLE_ATTEMPT_SUPERSEDED: 'Эта попытка уже не последняя в Moodle. Проверять и оценивать нужно последнюю попытку после её завершения.',
@@ -179,6 +184,8 @@ async function withDemo<T>(real: () => Promise<T>, demo: () => T | Promise<T>): 
   try {
     return await real();
   } catch (error) {
+    // Navigation cancellation is not an outage and must never open demo data.
+    if (error && typeof error === 'object' && 'name' in error && error.name === 'AbortError') throw error;
     if (demoMode !== 'auto' || !import.meta.env.DEV || (error instanceof ApiError && error.status < 500 && error.status !== 404)) throw error;
     await demoDelay();
     return demo();
@@ -307,6 +314,8 @@ function mapMoodleHistoryImportEvent(raw: any): MoodleHistoryImportEvent {
     courseId: raw.course_id ? String(raw.course_id) : undefined,
     aggregateId: String(raw.aggregate_id ?? ''),
     actorKey: payload.actor_external_subject ? String(payload.actor_external_subject) : undefined,
+    assessmentTitle: raw.aggregate_title ? String(raw.aggregate_title) : undefined,
+    lastError: String(raw.last_error ?? ''),
     state: ['PENDING', 'PROCESSING', 'RETRY', 'DELIVERED', 'FAILED', 'BLOCKED'].includes(state)
       ? state as MoodleHistoryImportEvent['state']
       : 'FAILED',
@@ -458,11 +467,21 @@ function mapAttempt(raw: any, workspace?: any): Attempt {
     revision: Number(workspace?.current_revision ?? workspace?.revision ?? raw.current_revision ?? raw.workspace_revision ?? raw.revision ?? 0),
     acknowledgedRevision: Number(raw.acknowledged_revision ?? workspace?.current_revision ?? workspace?.revision ?? raw.current_revision ?? raw.workspace_revision ?? 0),
     startedAt: raw.started_at ?? new Date().toISOString(), expectedEndAt: raw.expected_end_at ?? undefined, deadlineAt: raw.deadline_at ?? undefined,
+    hasTimeLimit: typeof raw.has_time_limit === 'boolean' ? raw.has_time_limit : undefined,
+    moodleSyncTimeoutSeconds: typeof raw.moodle_sync_timeout_seconds === 'number' ? raw.moodle_sync_timeout_seconds : undefined,
     closureReason: raw.closure_reason ?? undefined, closedAt: raw.closed_at ?? raw.submitted_at ?? undefined,
     lastCheckpointAt: raw.last_checkpoint_at, checkpointStatus: raw.checkpoint_status ?? 'SYNCED',
     pastePolicy: ['ALLOW', 'UNRESTRICTED'].includes(rawPastePolicy) ? 'ALLOW' : 'STRICT', aiEnabled: Boolean(raw.ai_enabled),
     fileMode: (workspace?.multi_file ?? raw.workspace?.multi_file ?? raw.multi_file) ? 'MULTI' : 'SINGLE', files,
     requiresLiveLmsPreparation: Boolean(raw.requires_live_lms_preparation),
+    quizSession: raw.quiz_session ? {
+      id: String(raw.quiz_session.id),
+      rootAttemptId: String(raw.quiz_session.root_attempt_id),
+      questions: unwrapList<any>(raw.quiz_session.questions ?? []).map((question) => ({
+        attemptId: String(question.attempt_id), slot: String(question.slot),
+        title: String(question.title ?? ''), position: Number(question.position),
+      })).sort((left, right) => left.position - right.position),
+    } : undefined,
   };
 }
 
@@ -470,6 +489,10 @@ function mapAttemptStatus(raw: any): AttemptStatus {
   const mapped = mapAttempt(raw);
   return {
     id: mapped.id,
+    aiEnabled: typeof raw.ai_enabled === 'boolean' ? raw.ai_enabled : undefined,
+    deadlineAt: mapped.deadlineAt,
+    expectedEndAt: mapped.expectedEndAt,
+    moodleSyncTimeoutSeconds: mapped.moodleSyncTimeoutSeconds,
     status: mapped.status,
     closureReason: mapped.closureReason,
     closedAt: mapped.closedAt,
@@ -885,13 +908,13 @@ export const api = {
     async () => mapAssessmentPublicationTargets(await request(`/assessments/${assessmentId}/publication-targets`)),
     () => ({ groups: [], principals: [], overridesConfirmed: true }),
   ),
-  publishAssessment: (assessmentId: string, groupIds?: string[]) => withDemo(
+  publishAssessment: (assessmentId: string, groupIds?: string[], studentAiEnabled?: boolean) => withDemo(
     async () => mapAssessment(await request(`/assessments/${assessmentId}/publish`, {
       method: 'POST',
-      body: JSON.stringify(groupIds === undefined ? {} : { group_ids: groupIds }),
+      body: JSON.stringify({ group_ids: groupIds, student_ai_enabled: studentAiEnabled }),
     }), ''),
     () => {
-      assessmentState = assessmentState.map((item) => item.id === assessmentId ? { ...item, publicationStatus: 'PUBLISHED', status: 'AVAILABLE' } : item);
+      assessmentState = assessmentState.map((item) => item.id === assessmentId ? { ...item, aiEnabled: studentAiEnabled ?? item.aiEnabled, publicationStatus: 'PUBLISHED', status: 'AVAILABLE' } : item);
       return cloneDemo(assessmentState.find((item) => item.id === assessmentId)!);
     },
   ),
@@ -1002,16 +1025,43 @@ export const api = {
     async () => mapAttemptStatus(await request(`/attempts/${attemptId}`)),
     () => mapAttemptStatus(attemptState),
   ),
-  startAttempt: (assessmentId: string) => withDemo(
-    async () => { const raw = await request<any>(`/assessments/${assessmentId}/attempts`, { method: 'POST', headers: { 'Idempotency-Key': createUuid() }, body: '{}' }); return mapAttempt(raw, raw.workspace); },
+  startAttempt: (assessmentId: string, signal?: AbortSignal) => withDemo(
+    async () => {
+      const key = createUuid();
+      const waitUntil = Date.now() + 90_000;
+      for (;;) {
+        signal?.throwIfAborted();
+        try {
+          const raw = await request<any>(`/assessments/${assessmentId}/attempts`, {
+            method: 'POST', headers: { 'Idempotency-Key': key }, body: '{}', signal,
+          });
+          return mapAttempt(raw, raw.workspace);
+        } catch (error) {
+          // Busy is an explicit refusal to start while this student's previous
+          // exchange holds the lease. Never replay a timeout/unknown POST result.
+          if (!(error instanceof ApiError) || error.code !== 'MOODLE_SESSION_BUSY'
+            || Date.now() >= waitUntil || signal?.aborted) throw error;
+          await new Promise<void>((resolve, reject) => {
+            const abort = () => {
+              clearTimeout(timer);
+              signal?.removeEventListener('abort', abort);
+              reject(signal?.reason);
+            };
+            const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve(); }, 2_000);
+            signal?.addEventListener('abort', abort, { once: true });
+            if (signal?.aborted) abort();
+          });
+        }
+      }
+    },
     () => cloneDemo(attemptState),
   ),
   getHistory: (attemptId: string) => withDemo(
     async () => mapHistory(unwrapList<any>(await request(`/attempts/${attemptId}/history`))).sort((left, right) => new Date(right.at).getTime() - new Date(left.at).getTime()),
     () => cloneDemo(demoHistory),
   ),
-  saveFile: (attemptId: string, file: WorkspaceFile, revision: number, source: 'typing' | 'internal_paste' = 'typing', receiptId?: string) => withDemo(async () => {
-    const raw = await request<any>(`/attempts/${attemptId}/workspace/files/${file.id}`, { method: 'PATCH', headers: { 'If-Match': String(revision) }, body: JSON.stringify({ content: file.content, source: source.toUpperCase(), receipt_id: receiptId }) });
+  saveFile: (attemptId: string, file: WorkspaceFile, revision: number, source: 'typing' | 'internal_paste' = 'typing', receiptId?: string, pasteRange?: InternalPasteRange) => withDemo(async () => {
+    const raw = await request<any>(`/attempts/${attemptId}/workspace/files/${file.id}`, { method: 'PATCH', headers: { 'If-Match': String(revision) }, body: JSON.stringify({ content: file.content, source: source.toUpperCase(), receipt_id: receiptId, paste_range: pasteRange ? { offset: pasteRange.offset, delete_count: pasteRange.deleteCount } : undefined }) });
     return { revision: Number(raw.workspace_revision ?? raw.revision ?? revision + 1) };
   }, () => {
     attemptState.files = attemptState.files.map((item) => item.id === file.id ? cloneDemo(file) : item);
@@ -1088,7 +1138,7 @@ export const api = {
     () => cloneDemo(assessmentId && assessmentId !== 'all' ? submissionsState.filter((item) => item.assessmentId === assessmentId) : submissionsState),
   ),
   getMoodleHistoryImportEvents: () => withDemo(
-    async () => unwrapList<any>(await request('/integrations/lms/outbox?limit=500'))
+    async () => unwrapList<any>(await request('/integrations/lms/outbox?event_type=moodle.history.import&latest_per_activity=true&limit=500'))
       .filter((item) => String(item.event_type ?? '') === 'moodle.history.import')
       .map(mapMoodleHistoryImportEvent),
     () => [] as MoodleHistoryImportEvent[],

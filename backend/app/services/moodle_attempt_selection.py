@@ -297,7 +297,21 @@ def latest_completed_moodle_submission_ids(
             # the durable remote mapping and response observations needed for
             # tamper verification. The app-authored Submission remains audit
             # history but must not create a duplicate queue row.
-            latest_rows = imported_rows
+            imported_slots = {
+                str(dict(row[0].external_receipt or {}).get("moodle_response_id", ""))
+                for row in imported_rows
+            }
+            # A crawl may have read only the first of several responses so far.
+            # Keep native sibling answers until their own exact slot is imported.
+            native_siblings = [
+                row
+                for row in latest_rows
+                if row[0].source != "MOODLE_IMPORT"
+                and dict(row[1].integrity_policy or {}).get("moodle_quiz_root_attempt_id")
+                and str(dict(row[0].external_receipt or {}).get("moodle_response_id", ""))
+                not in imported_slots
+            ]
+            latest_rows = [*imported_rows, *native_siblings]
         selected.update(row[0].id for row in latest_rows)
     return selected
 

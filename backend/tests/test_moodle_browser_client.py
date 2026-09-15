@@ -307,6 +307,87 @@ async def test_discovery_rejects_wrong_course_and_unconfirmed_teacher() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "code", ["ASSIGN_TABLE_NOT_FOUND", "QUIZ_TABLE_NOT_FOUND", "private-token", None]
+)
+async def test_history_error_preserves_only_known_connector_diagnostics(code: str | None) -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            502,
+            headers={"X-Moodle-Error-Code": code} if code else {},
+            json={"detail": "secret-bearing page body"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        browser = MoodleBrowserClient(
+            settings(), client, service_url="http://moodle-browser:8082",
+            shared_secret="b" * 32, storage_state=storage_state(),
+        )
+        with pytest.raises(IntegrationProtocolError) as error:
+            await browser.discover_historical_submissions(
+                course_id="549", actor_external_subject="42", module="assign", cmid=777,
+            )
+
+    message = str(error.value)
+    if code in ("ASSIGN_TABLE_NOT_FOUND", "QUIZ_TABLE_NOT_FOUND"):
+        assert code in message
+    else:
+        assert "HTTP 502" in message
+    assert "secret-bearing" not in message
+    assert "private-token" not in message
+
+
+@pytest.mark.parametrize("operation", ["sync_quiz_essay", "sync_quiz_answers"])
+@pytest.mark.parametrize("code", [
+    "MOODLE_RESPONSE_TIMEOUT", "MOODLE_DOCUMENT_TIMEOUT", "MOODLE_DNS_ERROR",
+    "MOODLE_CONNECTION_ERROR", "MOODLE_TLS_ERROR", "MOODLE_HTTP_ERROR",
+    "MOODLE_NAVIGATION_ERROR", "private-token", None,
+])
+async def test_navigation_errors_preserve_safe_diagnostics_and_retries(operation, code):
+    async def handler(_request):
+        return httpx.Response(
+            503, headers={"X-Moodle-Error-Code": code} if code else {},
+            json={"detail": "secret-bearing page body"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        browser = MoodleBrowserClient(
+            settings(), client, service_url="http://moodle-browser:8082",
+            shared_secret="b" * 32, storage_state=storage_state(),
+        )
+        with pytest.raises(IntegrationUnavailable) as caught:
+            await browser._call(operation, {})
+    assert caught.value.retryable
+    if code and code.startswith("MOODLE_"):
+        assert code in str(caught.value)
+    assert "secret-bearing" not in str(caught.value)
+    assert "private-token" not in str(caught.value)
+
+
+@pytest.mark.parametrize("operation", ["sync_quiz_essay", "sync_quiz_answers"])
+@pytest.mark.parametrize("code", ["UPLOAD_INVALID_FILE", "UPLOAD_INVALID_TYPE", "private-token"])
+async def test_upload_errors_preserve_safe_diagnostics(operation, code) -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            502, headers={"X-Moodle-Error-Code": code},
+            json={"detail": "secret-bearing page body"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        browser = MoodleBrowserClient(
+            settings(), client, service_url="http://moodle-browser:8082",
+            shared_secret="b" * 32, storage_state=storage_state(),
+        )
+        with pytest.raises(IntegrationProtocolError) as caught:
+            await browser._call(operation, {})
+    if code.startswith("UPLOAD_"):
+        assert code in str(caught.value)
+    else:
+        assert "HTTP 502" in str(caught.value)
+    assert "secret-bearing" not in str(caught.value)
+    assert "private-token" not in str(caught.value)
+
+
 async def test_historical_submission_discovery_is_bounded_and_refreshes_state() -> None:
     captured: dict[str, object] = {}
 

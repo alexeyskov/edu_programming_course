@@ -267,6 +267,71 @@ def test_assignment_students_without_submissions_are_not_unidentified_rows() -> 
     assert index.skipped_rows == 0
 
 
+@pytest.mark.parametrize("graded", [False, True])
+def test_assignment_standard_submissions_table_is_recognized(graded: bool) -> None:
+    # Moodle's assign_grading_table sets the HTML id to "submissions";
+    # mod_assign_grading-<context> is its internal table preference key.
+    html = fixture("assign_grading_historical.html").replace(
+        'id="mod_assign_grading" class="gradingtable"',
+        'id="submissions" class="generaltable"',
+    )
+    if not graded:
+        html = html.replace("9 из 10", "Ещё не оценено")
+
+    index = parse_assignment_grading_page(
+        html, base_url=BASE_URL, course_id="549", cmid=777, page_number=0,
+    )
+
+    assert index.skipped_rows == 0
+    assert len(index.items) == 1
+    assert index.items[0]["user_id"] == "77"
+    assert index.items[0]["attempt_id"] == "user-77-attempt-2"
+    assert index.items[0]["grade"] == (9 if graded else None)
+    assert index.items[0]["state"] == ("GRADED" if graded else "SUBMITTED")
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        "",
+        '<tr class="emptyrow"><td colspan="17"> </td></tr>',
+        '<tr><td><a href="/user/view.php?id=77&amp;course=549">Test User</a></td>'
+        '<td>No submission</td><td class="grade">-</td></tr>',
+    ],
+)
+def test_assignment_standard_empty_table_is_successful(rows: str) -> None:
+    html = (
+        '<body class="course-549"><main id="region-main">'
+        f'<table id="submissions" class="generaltable"><tbody>{rows}</tbody></table>'
+        '</main></body>'
+    )
+    index = parse_assignment_grading_page(
+        html, base_url=BASE_URL, course_id="549", cmid=777, page_number=0,
+    )
+    assert index.items == []
+    assert index.has_next is False
+    assert index.skipped_rows == 0
+
+    with pytest.raises(MoodleMarkupError, match="another course context"):
+        parse_assignment_grading_page(
+            html, base_url=BASE_URL, course_id="550", cmid=777, page_number=0,
+        )
+
+
+@pytest.mark.parametrize("row", [
+    '<tr class="emptyrow"><td>Ответ сдан, неизвестный студент</td></tr>',
+    '<tr class="emptyrow"><td><a href="/unrecognized"> </a></td></tr>',
+    '<tr class="emptyrow"><td><input name="unknown" value="77"></td></tr>',
+    '<tr class="emptyrow" data-userid="77"><td> </td></tr>',
+])
+def test_emptyrow_class_cannot_hide_unidentified_assignment_data(row: str) -> None:
+    html = f'<body class="course-549"><table id="submissions"><tbody>{row}</tbody></table></body>'
+    index = parse_assignment_grading_page(
+        html, base_url=BASE_URL, course_id="549", cmid=777, page_number=0,
+    )
+    assert index.skipped_rows == 1
+
+
 def test_quiz_report_treats_finished_not_graded_row_as_submitted() -> None:
     html = fixture("quiz_report_historical.html").replace(
         '<td class="grade">8,00 / 10,00</td>',

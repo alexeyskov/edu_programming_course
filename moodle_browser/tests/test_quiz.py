@@ -249,6 +249,8 @@ async def test_moodle_52_preflight_launch_clicks_opener_then_exact_start_trigger
             self.name = name
 
         async def count(self) -> int:
+            if self.name == 'preflight-trigger' and 'document:ready' not in events:
+                return 0
             return 1
 
         async def click(self) -> None:
@@ -263,6 +265,10 @@ async def test_moodle_52_preflight_launch_clicks_opener_then_exact_start_trigger
             return FakeLocator("direct-trigger")
 
     class FakePage:
+        async def wait_for_load_state(self, mode: str) -> None:
+            assert mode == 'domcontentloaded'
+            events.append('document:ready')
+
         def locator(self, selector: str) -> FakeLocator:
             if selector == QUIZ_DIRECT_START_FORM_SELECTOR:
                 return FakeLocator("direct-form")
@@ -284,6 +290,7 @@ async def test_moodle_52_preflight_launch_clicks_opener_then_exact_start_trigger
 
     assert events == [
         "click:direct-trigger",
+        "document:ready",
         "wait:preflight-form",
         "click:preflight-trigger",
     ]
@@ -461,6 +468,19 @@ def test_bound_quiz_attempt_accepts_only_explicit_post_continuation_form() -> No
         )
 
 
+def test_duplicate_bound_launch_is_not_proof_of_a_finished_attempt() -> None:
+    source = fixture("quiz_view.html").replace("Начать тестирование", "Продолжить текущую попытку")
+    source = source.replace(
+        "</body>",
+        f'<a href="{BASE_URL}/mod/quiz/attempt.php?attempt=123&amp;cmid=777">Continue</a></body>',
+    )
+    with pytest.raises(MoodleMarkupError, match="ambiguous bound") as error:
+        parse_quiz_view(
+            source, base_url=BASE_URL, course_id="549", cmid=777, expected_attempt_id="123"
+        )
+    assert not isinstance(error.value, QuizAttemptNotActive)
+
+
 def test_expected_quiz_attempt_identity_must_be_complete() -> None:
     payload = request(finalize=False).model_dump(mode="json")
 
@@ -511,7 +531,7 @@ async def test_bound_completed_quiz_attempt_never_starts_a_new_attempt(
 
 
 @pytest.mark.asyncio
-async def test_bound_quiz_attempt_disappearing_before_click_is_terminal(
+async def test_bound_quiz_trigger_error_is_not_evidence_of_terminal_attempt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = MoodleBrowserService(Settings(shared_secret=SHARED_SECRET))
@@ -542,7 +562,7 @@ async def test_bound_quiz_attempt_disappearing_before_click_is_terminal(
     monkeypatch.setattr(service, "_require_authenticated_page", authenticated)
     monkeypatch.setattr(service, "_activate_quiz_launch", vanished)
 
-    with pytest.raises(MoodleAttemptFinalized, match="stopped being available"):
+    with pytest.raises(MoodleProtocolError, match="continue trigger changed"):
         await service._open_real_quiz_attempt(
             FakePage(),  # type: ignore[arg-type]
             object(),  # type: ignore[arg-type]
@@ -661,8 +681,8 @@ async def test_bound_quiz_attempt_identity_change_is_terminal(
     monkeypatch.setattr(service, "_require_authenticated_page", authenticated)
     monkeypatch.setattr(service, "_activate_quiz_launch", activate)
     monkeypatch.setattr(
-        "moodle_browser.service.parse_attempt_page",
-        lambda *_args, **_kwargs: QuizAttempt("123", "2", ()),
+        "moodle_browser.service.parse_attempt_questions",
+        lambda *_args, **_kwargs: (QuizAttempt("123", "2", ()),),
     )
 
     with pytest.raises(MoodleAttemptFinalized, match="no longer be edited safely"):
@@ -1614,6 +1634,9 @@ async def test_quiz_managed_overwrite_uses_receipt_when_lazy_manager_has_no_url(
         async def click(self) -> None:
             clicks.append(self.name)
 
+        async def evaluate(self, _script: str) -> bool:
+            return False
+
         async def set_input_files(self, _payload: object) -> None:
             return None
 
@@ -1622,6 +1645,9 @@ async def test_quiz_managed_overwrite_uses_receipt_when_lazy_manager_has_no_url(
 
         async def text_content(self) -> str:
             return "main.cpp"
+
+        def filter(self, **_kwargs: object) -> FakeLocator:
+            return self
 
         def get_by_text(self, _text: object, **_kwargs: object) -> FakeLocator:
             # Reproduce the newer Moodle lazy manager: no existing filename is
@@ -1650,6 +1676,12 @@ async def test_quiz_managed_overwrite_uses_receipt_when_lazy_manager_has_no_url(
 
     monkeypatch.setattr(service, "_wait_for_unique_locator", unique)
     content = b"int main() { return 1; }\n"
+
+    async def uploaded(_page: object, button: FakeLocator) -> bool:
+        await button.click()
+        return True
+
+    monkeypatch.setattr(service, "_upload_repository_file", uploaded)
     await service._replace_quiz_attachment(
         FakePage(),  # type: ignore[arg-type]
         "main.cpp",
@@ -1686,6 +1718,9 @@ async def test_quiz_lazy_overwrite_without_exact_receipt_is_rejected(
             if self.overwrite:
                 overwrite_clicked = True
 
+        async def evaluate(self, _script: str) -> bool:
+            return False
+
         async def set_input_files(self, _payload: object) -> None:
             return None
 
@@ -1694,6 +1729,9 @@ async def test_quiz_lazy_overwrite_without_exact_receipt_is_rejected(
 
         async def text_content(self) -> str:
             return "main.cpp"
+
+        def filter(self, **_kwargs: object) -> FakeLocator:
+            return self
 
         def get_by_text(self, _text: object, **_kwargs: object) -> FakeLocator:
             return FakeLocator(count=0)
@@ -1717,6 +1755,12 @@ async def test_quiz_lazy_overwrite_without_exact_receipt_is_rejected(
         return locator
 
     monkeypatch.setattr(service, "_wait_for_unique_locator", unique)
+
+    async def uploaded(_page: object, button: FakeLocator) -> bool:
+        await button.click()
+        return True
+
+    monkeypatch.setattr(service, "_upload_repository_file", uploaded)
     with pytest.raises(MoodleProtocolError, match="without connector ownership"):
         await service._replace_quiz_attachment(
             FakePage(),  # type: ignore[arg-type]

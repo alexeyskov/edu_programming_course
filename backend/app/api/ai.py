@@ -36,6 +36,7 @@ from app.schemas.ai import (
 )
 from app.schemas.common import EmptyMutation
 from app.services.common import DomainError
+from app.services.moodle_quiz_session import quiz_question_for_attempt
 from app.services.policy import (
     require_decision_support,
     require_membership,
@@ -117,9 +118,7 @@ async def _role_course_ids(
 
 async def _effective_ai_flags(db: AsyncSession, settings: Settings) -> tuple[bool, bool]:
     row = await db.scalar(select(SystemSetting).where(SystemSetting.key == SYSTEM_SETTINGS_KEY))
-    configured = settings.ai_mock_enabled or (
-        settings.ai_enabled and bool(settings.ai_api_key.get_secret_value())
-    )
+    configured = settings.ai_provider_configured
     values = row.value if row is not None else {}
     globally_enabled = configured and bool(values.get("ai_enabled", True))
     student_enabled = globally_enabled and bool(values.get("student_ai_enabled", True))
@@ -268,6 +267,25 @@ async def _student_context(
     assessment = await db.get(Assessment, attempt.assessment_id)
     if assessment is None:
         raise DomainError(500, "ASSESSMENT_MISSING", "Attempt assessment is missing")
+    # Question workspaces share the visible work's current teaching policy.
+    # Historical child assessments are deliberately AI-disabled and must not
+    # override a teacher's choice for an active multi-question Quiz.
+    relation = await quiz_question_for_attempt(db, attempt.id)
+    if relation is not None:
+        root = await db.get(Attempt, relation.root_attempt_id)
+        if root is None or root.principal_id != principal_id:
+            raise DomainError(404, "ATTEMPT_NOT_FOUND", "Quiz session was not found")
+        ensure_attempt_not_finalized_in_moodle(root)
+        if root.state != AttemptState.ACTIVE.value:
+            raise DomainError(409, "ATTEMPT_READ_ONLY", "Only an active attempt can use student AI")
+        if root.deadline_at is not None and utcnow() >= _aware(root.deadline_at):
+            raise DomainError(409, "DEADLINE_PASSED", "The attempt deadline has passed")
+        parent = await db.get(Assessment, root.assessment_id)
+        if parent is None or parent.course_id != assessment.course_id:
+            raise DomainError(500, "ASSESSMENT_MISSING", "Quiz assessment is missing")
+        policy_assessment = parent
+    else:
+        policy_assessment = assessment
     if expected_course_id is not None and assessment.course_id != expected_course_id:
         raise DomainError(404, "ATTEMPT_NOT_FOUND", "Attempt was not found in this course")
     await require_membership(
@@ -277,7 +295,7 @@ async def _student_context(
         role=CourseRole.STUDENT,
     )
     globally_enabled, student_enabled = await _effective_ai_flags(db, settings)
-    if not globally_enabled or not student_enabled or not assessment.student_ai_enabled:
+    if not globally_enabled or not student_enabled or not policy_assessment.student_ai_enabled:
         raise DomainError(403, "STUDENT_AI_DISABLED", "Student AI help is disabled")
     workspace = await db.scalar(select(Workspace).where(Workspace.attempt_id == attempt.id))
     if workspace is None:

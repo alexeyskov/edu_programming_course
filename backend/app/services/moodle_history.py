@@ -880,7 +880,12 @@ def _question_score(response: dict[str, Any], fallback: Decimal) -> Decimal:
     if value is None or value <= 0 or value > Decimal("999999.99"):
         return fallback
     try:
-        return value.quantize(Decimal("0.01"))
+        rounded = value.quantize(Decimal("0.01"))
+        # Match native Quiz workspaces: a positive Moodle mark smaller than
+        # local two-decimal precision still needs a nonzero grading scale.
+        # _imported_grade keeps the remote maximum and scales the received mark
+        # proportionally, so this must not manufacture a full-score decision.
+        return rounded if rounded > 0 else Decimal("1.00")
     except DecimalException:
         return fallback
 
@@ -1555,6 +1560,7 @@ async def _mark_managed_quiz_as_split_container(
     metadata = dict(mapping.metadata_json or {}) if mapping is not None else {}
     if metadata.get("managed_by") != "MOODLE_ACTIVITY_IMPORT":
         return
+    was_legacy_container = metadata.get("historical_quiz_split_container") is True
     policy = dict(parent.policy or {})
     policy["historical_quiz_split_container"] = True
     parent.policy = policy
@@ -1572,8 +1578,10 @@ async def _mark_managed_quiz_as_split_container(
     ).first()
     if attached is not None:
         _assessment_item, task_version, task_item = attached
-        if task_version.status == TaskVersionStatus.DRAFT.value:
-            task_item.archived_at = task_item.archived_at or utcnow()
+        # Splitting historical responses must not archive the launchable work.
+        # Repair drafts archived by the old split-only representation.
+        if was_legacy_container and task_version.status == TaskVersionStatus.DRAFT.value:
+            task_item.archived_at = None
 
 
 async def _materialize_flat_historical_submissions(

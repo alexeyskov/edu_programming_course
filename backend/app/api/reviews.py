@@ -27,7 +27,14 @@ from app.db.base import utcnow
 from app.db.session import get_db
 from app.integrations.errors import IntegrationError
 from app.integrations.runner import RunnerAdapter, RunnerResult
-from app.models.attempts import Attempt, EditEvent, RunRequest, Snapshot, Submission
+from app.models.attempts import (
+    Attempt,
+    EditEvent,
+    MoodleQuizQuestion,
+    RunRequest,
+    Snapshot,
+    Submission,
+)
 from app.models.courses import (
     Course,
     CourseGroup,
@@ -81,6 +88,7 @@ from app.services.moodle_attempt_selection import (
     latest_reviewable_moodle_submission_ids,
 )
 from app.services.policy import (
+    assessment_review_scope_ids,
     require_submission_review_access,
     submission_review_access,
     visible_submission_ids_for_review,
@@ -93,6 +101,7 @@ from app.services.review import (
     release_claim,
     require_teacher_experiment_access,
     reset_teacher_experiment,
+    response_max_score,
     save_review_draft,
     update_experiment_file,
 )
@@ -296,7 +305,7 @@ async def _submission_list_item(
         submitted_at=submission.submitted_at,
         status=review_status,
         score=decision.grade if decision else None,
-        max_score=assessment.max_score,
+        max_score=await response_max_score(db, attempt, assessment),
         claim=await _claim_read(db, claim, principal_id=teacher_id) if claim else None,
         risk="UNKNOWN",
         tests_passed=evidence.passed_cases if evidence else 0,
@@ -419,6 +428,16 @@ async def _submission_list_items(
     for principal_id, course_id, name in group_rows:
         group_names.setdefault((principal_id, course_id), []).append(name)
 
+    question_marks = dict(
+        (
+            await db.execute(
+                select(MoodleQuizQuestion.attempt_id, TaskVersion.max_score)
+                .join(Attempt, Attempt.id == MoodleQuizQuestion.attempt_id)
+                .join(TaskVersion, TaskVersion.id == Attempt.assigned_task_version_id)
+                .where(MoodleQuizQuestion.attempt_id.in_([attempt.id for _, attempt, _, _ in rows]))
+            )
+        ).all()
+    )
     result: list[SubmissionListItemRead] = []
     for submission, _attempt, assessment, student in rows:
         claim = claims_by_submission.get(submission.id)
@@ -450,7 +469,7 @@ async def _submission_list_items(
                 submitted_at=submission.submitted_at,
                 status=review_status,
                 score=decision.grade if decision else None,
-                max_score=assessment.max_score,
+                max_score=question_marks.get(_attempt.id, assessment.max_score),
                 claim=claim_read,
                 risk="UNKNOWN",
                 tests_passed=evidence.passed_cases if evidence else 0,
@@ -482,11 +501,18 @@ def _review_queue_group_key(
     similarly numbered attempts, other quizzes and other students cannot mix.
     """
 
-    if submission.source != "MOODLE_IMPORT" or attempt.state == AttemptState.VOID.value:
-        return None
     receipt = dict(submission.external_receipt or {})
+    native_session = bool(dict(attempt.integrity_policy or {}).get("moodle_quiz_root_attempt_id"))
+    if (
+        submission.source != "MOODLE_IMPORT" and not native_session
+    ) or attempt.state == AttemptState.VOID.value:
+        return None
     parent_attempt_id = str(receipt.get("moodle_parent_attempt_id", "")).strip()
-    raw_parent_id = dict(assessment.policy or {}).get("moodle_parent_assessment_id")
+    raw_parent_id = (
+        receipt.get("moodle_parent_assessment_id")
+        if native_session
+        else dict(assessment.policy or {}).get("moodle_parent_assessment_id")
+    )
     try:
         parent_assessment_id = uuid.UUID(str(raw_parent_id))
     except (TypeError, ValueError, AttributeError):
@@ -791,7 +817,9 @@ async def list_submissions(
         assessment = await db.get(Assessment, assessment_id)
         if assessment is None:
             raise DomainError(404, "ASSESSMENT_NOT_FOUND", "Assessment was not found")
-        statement = statement.where(Attempt.assessment_id == assessment.id)
+        statement = statement.where(
+            Attempt.assessment_id.in_(await assessment_review_scope_ids(db, assessment.id))
+        )
     visible_ids = await visible_submission_ids_for_review(
         db,
         principal_id=auth.principal_id,
@@ -983,7 +1011,9 @@ async def _submission_review_group(
     receipt = dict(submission.external_receipt or {})
     parent_attempt_id = str(receipt.get("moodle_parent_attempt_id", "")).strip()
     policy = dict(assessment.policy or {})
-    raw_parent_id = policy.get("moodle_parent_assessment_id")
+    raw_parent_id = receipt.get("moodle_parent_assessment_id") or policy.get(
+        "moodle_parent_assessment_id"
+    )
     try:
         parent_assessment_id = uuid.UUID(str(raw_parent_id))
     except (TypeError, ValueError, AttributeError):
@@ -1004,7 +1034,7 @@ async def _submission_review_group(
                     Attempt.principal_id == attempt.principal_id,
                     Attempt.state != AttemptState.VOID.value,
                     Assessment.course_id == assessment.course_id,
-                    Submission.source == "MOODLE_IMPORT",
+                    Submission.source.in_(["MOODLE_IMPORT", "MANUAL", "DEADLINE"]),
                 )
             )
         ).all()
@@ -1016,7 +1046,10 @@ async def _submission_review_group(
         if (
             sibling_attempt.principal_id != attempt.principal_id
             or str(sibling_receipt.get("moodle_parent_attempt_id", "")).strip() != parent_attempt_id
-            or str(sibling_policy.get("moodle_parent_assessment_id", ""))
+            or str(
+                sibling_receipt.get("moodle_parent_assessment_id")
+                or sibling_policy.get("moodle_parent_assessment_id", "")
+            )
             != str(parent_assessment_id)
         ):
             continue
@@ -1086,6 +1119,18 @@ async def _submission_review_group(
             by_position[position] = row
     grouped = list(by_position.values())
 
+    question_marks = dict(
+        (
+            await db.execute(
+                select(MoodleQuizQuestion.attempt_id, TaskVersion.max_score)
+                .join(Attempt, Attempt.id == MoodleQuizQuestion.attempt_id)
+                .join(TaskVersion, TaskVersion.id == Attempt.assigned_task_version_id)
+                .where(MoodleQuizQuestion.attempt_id.in_(
+                    [sibling.attempt_id for _, sibling, _ in grouped]
+                ))
+            )
+        ).all()
+    )
     items: list[SubmissionReviewGroupItemRead] = []
     for position, sibling, sibling_assessment in sorted(
         grouped,
@@ -1099,7 +1144,7 @@ async def _submission_review_group(
                 position=position,
                 title=sibling_assessment.title,
                 score=decision.grade if decision is not None else None,
-                max_score=sibling_assessment.max_score,
+                max_score=question_marks.get(sibling.attempt_id, sibling_assessment.max_score),
                 status="CLAIMED" if claim is not None else "GRADED" if decision else "UNGRADED",
             )
         )

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 
-from app.api.authoring import _require_latest_attempt_quiz_grading_for_publication
+from app.api.authoring import _require_confirmed_quiz_grading_for_publication
 from app.models.integration import ExternalMapping
 from app.services.moodle_source import (
     confirmed_moodle_quiz_grading_method,
@@ -26,24 +26,42 @@ def _publication_mapping(method: str | None) -> ExternalMapping:
     return mapping
 
 
-def test_multiple_attempt_publication_requires_last_attempt_grading() -> None:
-    mapping = _publication_mapping("HIGHEST")
+@pytest.mark.parametrize("method", ["HIGHEST", "AVERAGE", "FIRST", "LAST"])
+@pytest.mark.parametrize("attempt_limit", [1, 10])
+def test_publication_accepts_confirmed_moodle_grading_methods(
+    method: str, attempt_limit: int
+) -> None:
+    mapping = _publication_mapping(method)
+    mapping.metadata_json["activity"]["attempt_limit"] = attempt_limit
+    _require_confirmed_quiz_grading_for_publication(mapping)
+    assert mapping.metadata_json["activity"]["quiz_grading_method"] == method
+
+
+@pytest.mark.parametrize("method", [None, "", "SUM"])
+def test_publication_rejects_missing_or_unknown_grading_method(method: str | None) -> None:
+    mapping = _publication_mapping(method)
     with pytest.raises(HTTPException) as blocked:
-        _require_latest_attempt_quiz_grading_for_publication(mapping)
+        _require_confirmed_quiz_grading_for_publication(mapping)
     assert blocked.value.status_code == 409
-    assert blocked.value.detail["code"] == "MOODLE_LAST_ATTEMPT_GRADING_REQUIRED"
+    assert blocked.value.detail["code"] == "MOODLE_QUIZ_GRADING_METHOD_UNCONFIRMED"
 
 
-def test_multiple_attempt_publication_accepts_last_attempt_grading() -> None:
-    mapping = _publication_mapping("LAST")
-    _require_latest_attempt_quiz_grading_for_publication(mapping)
-
-
-def test_group_publication_requires_last_attempt_grading_even_before_a_retry() -> None:
-    mapping = _publication_mapping("HIGHEST")
+@pytest.mark.parametrize("method", ["HIGHEST", "AVERAGE", "FIRST", "LAST"])
+def test_publication_rejects_unconfirmed_grading_method(method: str) -> None:
+    mapping = _publication_mapping(method)
+    mapping.metadata_json["activity"]["quiz_grading_method_confirmed"] = False
     with pytest.raises(HTTPException) as blocked:
-        _require_latest_attempt_quiz_grading_for_publication(mapping)
-    assert blocked.value.detail["code"] == "MOODLE_LAST_ATTEMPT_GRADING_REQUIRED"
+        _require_confirmed_quiz_grading_for_publication(mapping)
+    assert blocked.value.detail["code"] == "MOODLE_QUIZ_GRADING_METHOD_UNCONFIRMED"
+
+
+def test_assignment_publication_does_not_require_quiz_grading_method() -> None:
+    mapping = ExternalMapping(
+        external_type="mod_assign",
+        external_id="30354",
+        metadata_json={"module": "assign", "cmid": 30354},
+    )
+    _require_confirmed_quiz_grading_for_publication(mapping)
 
 
 def test_quiz_attempt_policy_requires_confirmed_grading_method() -> None:

@@ -7,7 +7,13 @@ import pytest
 from conftest import BASE_URL, auth_headers, encoded, storage_state
 from fastapi.testclient import TestClient
 
-from moodle_browser.service import MoodleAttemptFinalized
+from moodle_browser.models import QuizAnswersSyncRequest, QuizAnswersSyncResponse
+from moodle_browser.service import (
+    BrowserNavigationUnavailable,
+    MoodleAttemptFinalized,
+    MoodleProtocolError,
+    PlaywrightError,
+)
 
 
 def login_payload() -> dict[str, object]:
@@ -25,6 +31,82 @@ def test_health_is_public_and_reports_browser_readiness(client: TestClient) -> N
     ready = client.get("/health/ready")
     assert ready.status_code == 200
     assert ready.json()["ready"] is True
+
+
+def test_navigation_error_passes_only_a_fixed_diagnostic_to_core(client, monkeypatch):
+    async def fail(_request):
+        raise BrowserNavigationUnavailable(
+            "response", PlaywrightError("net::ERR_NAME_NOT_RESOLVED https://private/secret")
+        )
+
+    monkeypatch.setattr(client.app.state.moodle_browser_service, "login", fail)
+    body = encoded(login_payload())
+    response = client.post(
+        "/internal/v1/moodle/login", content=body, headers=auth_headers(body)
+    )
+    assert response.status_code == 503
+    assert response.headers["X-Moodle-Error-Code"] == "MOODLE_DNS_ERROR"
+    assert "private" not in response.text and "secret" not in response.text
+
+
+def test_quiz_answer_bundle_endpoint_requires_hmac_and_returns_each_slot(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts = [b"first answer", b"second answer"]
+    payload = {
+        "schema_version": "1.0",
+        "base_url": BASE_URL,
+        "course_id": "508",
+        "cmid": 31529,
+        "expected_attempt_id": "123",
+        "finalize": True,
+        "idempotency_key": "batch:123:wire",
+        "storage_state": storage_state(),
+        "answers": [
+            {
+                "question_slot": str(index + 1),
+                "answer_transport": "ESSAY_ATTACHMENT",
+                "artifact": {
+                    "filename": "main.cpp",
+                    "sha256": hashlib.sha256(artifact).hexdigest(),
+                    "content_base64": base64.b64encode(artifact).decode(),
+                },
+            }
+            for index, artifact in enumerate(artifacts)
+        ],
+    }
+
+    async def sync(request: QuizAnswersSyncRequest) -> QuizAnswersSyncResponse:
+        return QuizAnswersSyncResponse.model_validate(
+            {
+                "status": "FINALIZED",
+                "storage_state": request.storage_state,
+                "receipts": [
+                    {
+                        "course_id": request.course_id,
+                        "cmid": request.cmid,
+                        "attempt_id": request.expected_attempt_id,
+                        "question_slot": answer.question_slot,
+                        "filename": answer.artifact.filename,
+                        "sha256": answer.artifact.sha256,
+                        "size_bytes": len(artifacts[index]),
+                        "idempotency_key": request.idempotency_key,
+                    }
+                    for index, answer in enumerate(request.answers)
+                ],
+            }
+        )
+
+    monkeypatch.setattr(
+        client.app.state.moodle_browser_service, "sync_quiz_answers", sync, raising=False
+    )
+    body = encoded(payload)
+    endpoint = "/internal/v1/moodle/quiz/answers/sync"
+    assert client.post(endpoint, content=body).status_code == 401
+    response = client.post(endpoint, content=body, headers=auth_headers(body))
+    assert response.status_code == 200
+    assert [receipt["question_slot"] for receipt in response.json()["receipts"]] == ["1", "2"]
 
 
 def test_login_requires_hmac_and_nonce_cannot_be_replayed(client: TestClient) -> None:
@@ -177,6 +259,47 @@ def test_historical_submissions_are_hmac_protected_and_cursor_bounded(
     assert invalid.status_code == 422
 
 
+@pytest.mark.parametrize(
+    ("detail", "code"),
+    [
+        ("Moodle assignment grading page has no submissions table", "ASSIGN_TABLE_NOT_FOUND"),
+        ("Moodle quiz report has no attempts table", "QUIZ_TABLE_NOT_FOUND"),
+        ("Moodle upload rejected: upload_error_invalid_file", "UPLOAD_INVALID_FILE"),
+        ("Moodle upload rejected: invalidfiletype", "UPLOAD_INVALID_TYPE"),
+        ("Moodle upload rejected: maxbytesfile", "UPLOAD_TOO_LARGE"),
+        ("Moodle upload rejected: repository_error", "UPLOAD_REJECTED"),
+        ("unrecognized private-response-text", None),
+    ],
+)
+def test_history_protocol_diagnostic_is_allowlisted(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, detail: str, code: str | None,
+) -> None:
+    async def fail(_request):
+        raise MoodleProtocolError(detail)
+
+    monkeypatch.setattr(
+        client.app.state.moodle_browser_service, "discover_historical_submissions", fail
+    )
+    body = encoded({
+        "schema_version": "1.0",
+        "base_url": BASE_URL,
+        "course_id": "549",
+        "actor_external_subject": "42",
+        "activity": {"module": "assign", "cmid": 777},
+        "cursor": "0:0",
+        "limit": 5,
+        "storage_state": storage_state(),
+    })
+    response = client.post(
+        "/internal/v1/moodle/activity/submissions/discover",
+        content=body, headers=auth_headers(body),
+    )
+    assert response.status_code == 502
+    assert response.headers.get("X-Moodle-Error-Code") == code
+    assert response.json().get("code") == code
+    assert detail not in response.text
+
+
 def test_request_body_is_bounded_before_json_parsing(client: TestClient) -> None:
     body = b"x" * (6 * 1024 * 1024 + 1)
     response = client.post(
@@ -246,6 +369,7 @@ def test_quiz_essay_prepare_uses_hmac_and_returns_bound_question(client: TestCli
             "answer_transport": "ESSAY_ATTACHMENT",
             "available_answer_transports": ["ESSAY_ATTACHMENT"],
             "remaining_seconds": None,
+            "questions": [],
         },
         "storage_state": storage_state(),
     }

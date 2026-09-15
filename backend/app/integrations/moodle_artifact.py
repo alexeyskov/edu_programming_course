@@ -127,7 +127,27 @@ def build_moodle_quiz_essay_artifact(
     )
 
 
-build_moodle_submission_artifact = build_moodle_quiz_essay_artifact
+def build_moodle_submission_artifact(
+    files: Sequence[Mapping[str, object]],
+    *,
+    force_archive: bool = False,
+    maximum_bytes: int = MOODLE_QUIZ_ESSAY_ARTIFACT_MAX_BYTES,
+) -> MoodleSubmissionArtifact:
+    """Preserve empty source files without asking Moodle to upload zero bytes.
+
+    Moodle's upload repository rejects empty files. An archive retains the
+    exact filename and zero-byte contents; adding whitespace or sample code
+    would instead change the student's answer. Online-text answers deliberately
+    use the raw-source builder below, since an empty textarea is valid.
+    """
+    artifact = build_moodle_quiz_essay_artifact(
+        files, force_archive=force_archive, maximum_bytes=maximum_bytes
+    )
+    if artifact.size == 0:
+        return build_moodle_quiz_essay_artifact(
+            files, force_archive=True, maximum_bytes=maximum_bytes
+        )
+    return artifact
 
 
 def build_moodle_online_text_artifact(
@@ -159,7 +179,7 @@ def build_moodle_online_text_artifact(
         raise IntegrationProtocolError(
             "Moodle online-text delivery requires exactly one C/C++ translation unit"
         )
-    return build_moodle_submission_artifact(
+    return build_moodle_quiz_essay_artifact(
         translation_units,
         maximum_bytes=maximum_bytes,
     )

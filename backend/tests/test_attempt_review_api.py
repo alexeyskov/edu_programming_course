@@ -340,6 +340,7 @@ async def test_student_attempt_and_teacher_review_lifecycle_via_api(
                 "receipt_id": receipt.json()["id"],
                 "client_id": "browser-e2e",
                 "client_request_id": "internal-paste-1",
+                "paste_range": {"offset": len(main["content"]), "delete_count": 0},
             },
         )
         assert pasted.status_code == 200, pasted.text

@@ -31,7 +31,8 @@ async def run_sync_worker(
 
     Course discovery can legitimately spend several minutes reading Moodle.  A
     single sequential loop would keep student checkpoints queued for that whole
-    interval, so production uses two lanes by default.  ``once`` deliberately
+    interval, so production reserves two additional lanes for final student
+    checkpoints beside the two general-purpose lanes. ``once`` deliberately
     remains single-lane for deterministic maintenance commands and tests.
     """
 
@@ -55,7 +56,7 @@ async def run_sync_worker(
         else httpx.AsyncClient(follow_redirects=False, trust_env=False)
     )
 
-    async def run_lane() -> int:
+    async def run_lane(terminal_only: bool = terminal_checkpoints_only) -> int:
         delivered_or_transitioned = 0
         while stop_event is None or not stop_event.is_set():
             try:
@@ -64,7 +65,7 @@ async def run_sync_worker(
                     settings,
                     bridge_factory=bridge_factory,
                     client=active_client,
-                    terminal_checkpoints_only=terminal_checkpoints_only,
+                    terminal_checkpoints_only=terminal_only,
                 )
             except Exception:
                 # A row-level error is normally persisted by the service; this guards DB outages.
@@ -79,9 +80,22 @@ async def run_sync_worker(
         return delivered_or_transitioned
 
     try:
-        if lane_count == 1:
+        reserved = (
+            0
+            if once or terminal_checkpoints_only or concurrency is not None
+            else int(getattr(settings, "sync_terminal_concurrency", 2))
+        )
+        if lane_count == 1 and reserved == 0:
             return await run_lane()
-        return sum(await asyncio.gather(*(run_lane() for _ in range(lane_count))))
+        # Sorting the outbox cannot preempt an import already occupying a
+        # lane. Reserve consumers that never claim course/history jobs, so a
+        # whole class's final submissions do not wait minutes for those jobs.
+        return sum(
+            await asyncio.gather(
+                *(run_lane() for _ in range(lane_count)),
+                *(run_lane(True) for _ in range(reserved)),
+            )
+        )
     finally:
         if owns_client:
             await active_client.aclose()

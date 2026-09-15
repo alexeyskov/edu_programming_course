@@ -92,7 +92,9 @@ class LMSSubmissionFingerprint(UUIDTimestampModel):
 
     __tablename__ = "core_lmssubmissionfingerprint"
     __table_args__ = (
-        UniqueConstraint("outbox_id", name="unique_lms_submission_fingerprint_outbox"),
+        UniqueConstraint(
+            "outbox_id", "external_question_slot", name="unique_lms_fingerprint_outbox_slot"
+        ),
         Index(
             "core_lmsfingerprint_lookup_idx",
             "course_id",

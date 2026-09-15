@@ -2545,16 +2545,21 @@ async def test_playwright_historical_assignment_grade_targets_exact_reopened_att
 
 
 @pytest.mark.parametrize(
-    ("quiz_grading_method", "grade_confirmed", "expected_error"),
+    ("quiz_grading_method", "method_confirmed", "grade_confirmed", "expected_error"),
     [
-        ("LAST", True, None),
-        ("HIGHEST", True, "MOODLE_LAST_ATTEMPT_GRADING_REQUIRED"),
-        ("LAST", False, "QUIZ_GRADE_SCALE_UNCONFIRMED"),
+        ("LAST", True, True, None),
+        ("HIGHEST", True, True, None),
+        ("AVERAGE", True, True, None),
+        ("FIRST", True, True, None),
+        ("UNKNOWN", True, True, "MOODLE_QUIZ_GRADING_METHOD_UNCONFIRMED"),
+        ("HIGHEST", False, True, "MOODLE_QUIZ_GRADING_METHOD_UNCONFIRMED"),
+        ("LAST", True, False, "QUIZ_GRADE_SCALE_UNCONFIRMED"),
     ],
 )
 async def test_playwright_exports_historical_quiz_essay_grade_to_exact_slot(
     app_bundle,
     quiz_grading_method: str,
+    method_confirmed: bool,
     grade_confirmed: bool,
     expected_error: str | None,
 ) -> None:
@@ -2665,7 +2670,7 @@ async def test_playwright_exports_historical_quiz_essay_grade_to_exact_slot(
                         "grade_confirmed": grade_confirmed,
                         "grade_max": 3.0,
                         "quiz_grading_method": quiz_grading_method,
-                        "quiz_grading_method_confirmed": True,
+                        "quiz_grading_method_confirmed": method_confirmed,
                     },
                 },
             )
@@ -2747,6 +2752,8 @@ async def _seed_app_quiz_grade_delivery(
     policy_cmid: int = 777,
     mapping_cmid: int = 777,
     remote_attempt_id: str = "141720",
+    quiz_grading_method: str = "LAST",
+    quiz_grading_method_confirmed: bool = True,
 ) -> tuple[ClaimedOutboxEvent, ConnectionTarget, uuid.UUID, uuid.UUID, uuid.UUID]:
     """Create a locally authored Quiz submission with an exact terminal attestation."""
 
@@ -2810,8 +2817,8 @@ async def _seed_app_quiz_grade_delivery(
                         "cmid": mapping_cmid,
                         "grade_confirmed": True,
                         "grade_max": 3.0,
-                        "quiz_grading_method": "LAST",
-                        "quiz_grading_method_confirmed": True,
+                        "quiz_grading_method": quiz_grading_method,
+                        "quiz_grading_method_confirmed": quiz_grading_method_confirmed,
                     },
                 },
             )
@@ -2910,12 +2917,14 @@ async def _seed_app_quiz_grade_delivery(
         return claim, target, attempt.id, submission.id, assessment.id
 
 
+@pytest.mark.parametrize("quiz_grading_method", ["LAST", "HIGHEST", "AVERAGE", "FIRST"])
 async def test_app_authored_latest_quiz_attempt_exports_grade_before_history_import(
     app_bundle,
+    quiz_grading_method: str,
 ) -> None:
     _, session_factory, settings = app_bundle
     claim, target, _attempt_id, submission_id, _assessment_id = await _seed_app_quiz_grade_delivery(
-        session_factory, settings
+        session_factory, settings, quiz_grading_method=quiz_grading_method,
     )
 
     async with session_factory() as db:
@@ -2936,8 +2945,27 @@ async def test_app_authored_latest_quiz_attempt_exports_grade_before_history_imp
     }
 
 
+@pytest.mark.parametrize(
+    ("method", "confirmed"), [("UNKNOWN", True), ("HIGHEST", False)],
+)
+async def test_app_authored_quiz_grade_requires_confirmed_aggregation_method(
+    app_bundle, method: str, confirmed: bool,
+) -> None:
+    _, session_factory, settings = app_bundle
+    claim, target, *_ = await _seed_app_quiz_grade_delivery(
+        session_factory, settings,
+        quiz_grading_method=method, quiz_grading_method_confirmed=confirmed,
+    )
+    async with session_factory() as db:
+        with pytest.raises(_BlockedDelivery) as blocked:
+            await _prepare_grade(db, settings, claim, target)
+    assert blocked.value.code == "MOODLE_QUIZ_GRADING_METHOD_UNCONFIRMED"
+
+
+@pytest.mark.parametrize("quiz_grading_method", ["LAST", "HIGHEST", "AVERAGE", "FIRST"])
 async def test_app_authored_older_quiz_attempt_grade_is_rejected(
     app_bundle,
+    quiz_grading_method: str,
 ) -> None:
     _, session_factory, settings = app_bundle
     (
@@ -2950,6 +2978,7 @@ async def test_app_authored_older_quiz_attempt_grade_is_rejected(
         session_factory,
         settings,
         remote_attempt_id="141719",
+        quiz_grading_method=quiz_grading_method,
     )
     async with session_factory() as db, db.begin():
         older = await db.get(Attempt, older_attempt_id)

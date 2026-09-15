@@ -12,6 +12,24 @@ describe('backend DTO normalization', () => {
     expect(error.message).toBe('Сеанс работы завершён через Moodle.');
   });
 
+  it.each([
+    {
+      code: 'MOODLE_QUIZ_GRADING_METHOD_UNCONFIRMED',
+      serverMessage: 'The Moodle Quiz grading method has not been confirmed',
+      message: 'Не удалось подтвердить метод оценивания теста Moodle. Повторите синхронизацию курса.',
+    },
+    {
+      code: 'MOODLE_LAST_ATTEMPT_GRADING_REQUIRED',
+      serverMessage: "Moodle Quiz must use the 'Last attempt' grading method",
+      message: 'Сервер системы использует устаревшую проверку метода оценивания. Обновите систему: настройки Moodle менять не требуется.',
+    },
+  ])('localizes $code without requesting Moodle settings changes', ({ code, serverMessage, message }) => {
+    const error = new ApiError(409, code, serverMessage);
+
+    expect(error.message).toBe(message);
+    expect(error.message).not.toContain(serverMessage);
+  });
+
   it('maps the session contract and SYSTEM_SETTINGS elevation', () => {
     const session = apiNormalizers.mapSession({
       principal: { id: 'p1', display_name: 'Иван Иванов' },
@@ -56,11 +74,48 @@ describe('backend DTO normalization', () => {
     expect(open.pastePolicy).toBe('ALLOW');
   });
 
+  it('preserves the local editing deadline and separate Moodle upload reserve', () => {
+    const result = apiNormalizers.mapAttempt({
+      id: 'timed', state: 'ACTIVE',
+      deadline_at: '2026-09-10T10:10:00Z', expected_end_at: '2026-09-10T10:15:00Z',
+      moodle_sync_timeout_seconds: 300,
+    });
+    expect(result.deadlineAt).toBe('2026-09-10T10:10:00Z');
+    expect(result.expectedEndAt).toBe('2026-09-10T10:15:00Z');
+    expect(result.moodleSyncTimeoutSeconds).toBe(300);
+    expect(apiNormalizers.mapAttempt({ id: 'untimed' }).moodleSyncTimeoutSeconds).toBeUndefined();
+  });
+
   it('preserves the safe live-Moodle preparation hint on an attempt', () => {
     expect(apiNormalizers.mapAttempt({
       id: 'a1', assessment_id: 'as1', state: 'ACTIVE',
       requires_live_lms_preparation: true,
     }, { current_revision: 0, files: [] }).requiresLiveLmsPreparation).toBe(true);
+  });
+
+  it.each([true, false, null, undefined])('preserves the tri-state time limit hint %s', (hasTimeLimit) => {
+    const attempt = apiNormalizers.mapAttempt({ id: 'a1', state: 'ACTIVE', has_time_limit: hasTimeLimit });
+    expect(attempt.hasTimeLimit).toBe(typeof hasTimeLimit === 'boolean' ? hasTimeLimit : undefined);
+  });
+
+  it('maps the pre-created quiz question workspaces in Moodle order', () => {
+    expect(apiNormalizers.mapAttempt({
+      id: 'attempt-2', state: 'ACTIVE',
+      quiz_session: {
+        id: 'session-1', root_attempt_id: 'attempt-1',
+        questions: [
+          { attempt_id: 'attempt-2', slot: '7', title: 'Массивы', position: 2 },
+          { attempt_id: 'attempt-1', slot: 3, title: 'Строки', position: 1 },
+        ],
+      },
+    }).quizSession).toEqual({
+      id: 'session-1', rootAttemptId: 'attempt-1',
+      questions: [
+        { attemptId: 'attempt-1', slot: '3', title: 'Строки', position: 1 },
+        { attemptId: 'attempt-2', slot: '7', title: 'Массивы', position: 2 },
+      ],
+    });
+    expect(apiNormalizers.mapAttempt({ id: 'single-attempt', state: 'ACTIVE' }).quizSession).toBeUndefined();
   });
 
   it.each(['FINISHING', 'LOCKED', 'VOID', 'EXPIRED', 'CLOSED', 'TIMED_OUT', 'CANCELLED', 'ENDED', 'TERMINATED', 'FUTURE_UNKNOWN_STATE'])('keeps terminal or unknown attempt state %s read-only', (state) => {

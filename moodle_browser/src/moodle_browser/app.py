@@ -24,6 +24,8 @@ from .models import (
     HistoricalSubmissionsResponse,
     LoginRequest,
     LoginResponse,
+    QuizAnswersSyncRequest,
+    QuizAnswersSyncResponse,
     QuizEssayPrepareRequest,
     QuizEssayPrepareResponse,
     QuizEssaySyncRequest,
@@ -32,6 +34,7 @@ from .models import (
 from .security import AuthenticationError, ReplayError, RequestAuthenticator
 from .service import (
     BrowserBusy,
+    BrowserNavigationUnavailable,
     BrowserUnavailable,
     IdempotencyConflict,
     MoodleActivityUnavailable,
@@ -47,6 +50,18 @@ from .service import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Only fixed diagnostic codes cross the service boundary, never page bodies,
+# response text or credentials embedded in an unexpected exception.
+_PROTOCOL_ERROR_CODES = {
+    "Moodle assignment grading page has no submissions table": "ASSIGN_TABLE_NOT_FOUND",
+    "Moodle quiz report has no attempts table": "QUIZ_TABLE_NOT_FOUND",
+    "Moodle upload rejected: upload_error_invalid_file": "UPLOAD_INVALID_FILE",
+    "Moodle upload rejected: invalidfiletype": "UPLOAD_INVALID_TYPE",
+    "Moodle upload rejected: maxbytesfile": "UPLOAD_TOO_LARGE",
+    "Moodle upload rejected: maxareabytes": "UPLOAD_TOO_LARGE",
+    "Moodle upload rejected: repository_error": "UPLOAD_REJECTED",
+}
 
 
 def create_app(
@@ -190,6 +205,10 @@ def create_app(
         return JSONResponse(
             {"detail": "Moodle browser is unavailable"},
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            headers=(
+                {"X-Moodle-Error-Code": exc.diagnostic_code}
+                if isinstance(exc, BrowserNavigationUnavailable) else None
+            ),
         )
 
     @application.exception_handler(MoodleProtocolError)
@@ -203,9 +222,14 @@ def create_app(
             type(exc).__name__,
             exc,
         )
+        content = {"detail": "Moodle returned an unsupported page"}
+        diagnostic = _PROTOCOL_ERROR_CODES.get(str(exc))
+        if diagnostic is not None:
+            content["code"] = diagnostic
         return JSONResponse(
-            {"detail": "Moodle returned an unsupported page"},
+            content,
             status_code=status.HTTP_502_BAD_GATEWAY,
+            headers={"X-Moodle-Error-Code": diagnostic} if diagnostic is not None else None,
         )
 
     @application.exception_handler(MoodleContractError)
@@ -323,5 +347,13 @@ def create_app(
     )
     async def sync_quiz_essay(payload: QuizEssaySyncRequest) -> QuizEssaySyncResponse:
         return await actual_service.sync_quiz_essay(payload)
+
+    @application.post(
+        "/internal/v1/moodle/quiz/answers/sync",
+        response_model=QuizAnswersSyncResponse,
+        dependencies=signature,
+    )
+    async def sync_quiz_answers(payload: QuizAnswersSyncRequest) -> QuizAnswersSyncResponse:
+        return await actual_service.sync_quiz_answers(payload)
 
     return application

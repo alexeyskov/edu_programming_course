@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
@@ -12,6 +13,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     SmallInteger,
     String,
     Text,
@@ -54,6 +56,31 @@ class Attempt(UUIDTimestampModel):
     reopen_reason: Mapped[str] = mapped_column(Text, default="")
     integrity_policy: Mapped[dict[str, Any]] = mapped_column(JSONValue, default=dict)
     client_context: Mapped[dict[str, Any]] = mapped_column(JSONValue, default=dict)
+
+
+class MoodleQuizQuestion(UUIDTimestampModel):
+    """A pinned solution workspace within one live Moodle Quiz attempt.
+
+    The root Attempt also owns the first solution and coordinates finalization.
+    Slots are Moodle identities, never array positions supplied by a client.
+    """
+
+    __tablename__ = "core_moodlequizquestion"
+    __table_args__ = (
+        UniqueConstraint("root_attempt_id", "question_slot", name="unique_quiz_session_slot"),
+        UniqueConstraint("root_attempt_id", "position", name="unique_quiz_session_position"),
+    )
+
+    root_attempt_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("core_attempt.id", ondelete="CASCADE"), index=True
+    )
+    attempt_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("core_attempt.id", ondelete="CASCADE"), unique=True
+    )
+    question_slot: Mapped[str] = mapped_column(String(64))
+    position: Mapped[int] = mapped_column(SmallInteger)
+    title: Mapped[str] = mapped_column(String(255))
+    question_max_mark: Mapped[Decimal] = mapped_column(Numeric(16, 7))
 
 
 class Workspace(UUIDTimestampModel):

@@ -176,6 +176,12 @@ export interface Assessment {
   requiresLiveLmsPreparation?: boolean;
 }
 
+export interface InternalPasteRange {
+  /** Unicode code-point offsets, not Monaco's UTF-16 offsets. */
+  offset: number;
+  deleteCount: number;
+}
+
 export interface WorkspaceFile {
   id: string;
   path: string;
@@ -195,6 +201,8 @@ export interface Attempt {
   startedAt: string;
   expectedEndAt?: string;
   deadlineAt?: string;
+  hasTimeLimit?: boolean;
+  moodleSyncTimeoutSeconds?: number;
   closureReason?: string;
   closedAt?: string;
   lastCheckpointAt?: string;
@@ -204,10 +212,19 @@ export interface Attempt {
   fileMode: 'SINGLE' | 'MULTI';
   files: WorkspaceFile[];
   requiresLiveLmsPreparation?: boolean;
+  quizSession?: {
+    id: string;
+    rootAttemptId: string;
+    questions: Array<{ attemptId: string; slot: string; title: string; position: number }>;
+  };
 }
 
 export interface AttemptStatus {
   id: string;
+  aiEnabled?: boolean;
+  deadlineAt?: string;
+  expectedEndAt?: string;
+  moodleSyncTimeoutSeconds?: number;
   status: Attempt['status'];
   closureReason?: string;
   closedAt?: string;
@@ -477,6 +494,8 @@ export interface MoodleHistoryImportEvent {
   id: string;
   courseId?: string;
   aggregateId: string;
+  assessmentTitle?: string;
+  lastError?: string;
   actorKey?: string;
   state: 'PENDING' | 'PROCESSING' | 'RETRY' | 'DELIVERED' | 'FAILED' | 'BLOCKED';
   createdAt: string;

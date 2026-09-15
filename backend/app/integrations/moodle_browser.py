@@ -37,6 +37,7 @@ _ENDPOINTS = {
     "prepare_assignment_submission": "/internal/v1/moodle/assignment/submission/prepare",
     "prepare_quiz_essay": "/internal/v1/moodle/quiz/essay/prepare",
     "sync_quiz_essay": "/internal/v1/moodle/quiz/essay/sync",
+    "sync_quiz_answers": "/internal/v1/moodle/quiz/answers/sync",
     "discover_historical_submissions": "/internal/v1/moodle/activity/submissions/discover",
 }
 _MAX_COURSES = 512
@@ -114,6 +115,32 @@ class MoodleBrowserQuizEssayResult:
 
 
 @dataclass(frozen=True, slots=True)
+class MoodleBrowserQuizAnswer:
+    question_slot: str
+    artifact: MoodleBrowserQuizEssayArtifact
+    answer_transport: Literal["ESSAY_ATTACHMENT", "ESSAY_ONLINE_TEXT"]
+    previous_managed_filename: str | None = None
+    previous_managed_sha256: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MoodleBrowserQuizAnswersResult:
+    status: Literal["DRAFT_SAVED", "FINALIZED"]
+    receipts: tuple[MoodleBrowserQuizEssayReceipt, ...]
+    storage_state: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class MoodleBrowserQuizQuestionPreparation:
+    question_slot: str
+    question_text: str
+    answer_transport: Literal["ESSAY_ATTACHMENT", "ESSAY_ONLINE_TEXT"]
+    available_answer_transports: tuple[Literal["ESSAY_ATTACHMENT", "ESSAY_ONLINE_TEXT"], ...]
+    page: int = 0
+    question_max_mark: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class MoodleBrowserQuizEssayPreparation:
     course_id: str
     cmid: int
@@ -123,6 +150,7 @@ class MoodleBrowserQuizEssayPreparation:
     answer_transport: Literal["ESSAY_ATTACHMENT", "ESSAY_ONLINE_TEXT"]
     available_answer_transports: tuple[Literal["ESSAY_ATTACHMENT", "ESSAY_ONLINE_TEXT"], ...]
     remaining_seconds: int | None = None
+    questions: tuple[MoodleBrowserQuizQuestionPreparation, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,6 +502,182 @@ class MoodleBrowserClient:
             storage_state=self.storage_state or {},
         )
 
+    async def sync_quiz_answers(
+        self,
+        course_id: str,
+        cmid: int,
+        answers: tuple[MoodleBrowserQuizAnswer, ...],
+        *,
+        expected_attempt_id: str,
+        finalize: bool,
+        idempotency_key: str,
+    ) -> MoodleBrowserQuizAnswersResult:
+        """Save independent responses and verify every receipt before accepting completion."""
+
+        course_id = self._positive_id(course_id, "Moodle course id")
+        cmid = self._positive_int(cmid, "Moodle activity id")
+        attempt_id = self._positive_id(expected_attempt_id, "Moodle attempt id")
+        if (
+            not isinstance(finalize, bool)
+            or not isinstance(idempotency_key, str)
+            or not _IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key)
+        ):
+            raise IntegrationProtocolError("Moodle quiz batch flags are invalid")
+        if not isinstance(answers, tuple | list) or not 1 <= len(answers) <= 32:
+            raise IntegrationProtocolError("Moodle quiz answer count is invalid")
+        request_answers: list[dict[str, Any]] = []
+        expected: dict[str, tuple[str, str, int]] = {}
+        for answer in answers:
+            if not isinstance(answer, MoodleBrowserQuizAnswer):
+                raise IntegrationProtocolError("Moodle quiz answer is invalid")
+            slot = self._positive_id(answer.question_slot, "Moodle question slot")
+            if (
+                slot in expected
+                or not isinstance(answer.answer_transport, str)
+                or answer.answer_transport
+                not in {
+                    "ESSAY_ATTACHMENT",
+                    "ESSAY_ONLINE_TEXT",
+                }
+            ):
+                raise IntegrationProtocolError("Moodle quiz answer slots or transports are invalid")
+            filename, content = self._normalise_quiz_artifact(answer.artifact)
+            digest = hashlib.sha256(content).hexdigest()
+            if (answer.previous_managed_filename is None) != (
+                answer.previous_managed_sha256 is None
+            ):
+                raise IntegrationProtocolError("Moodle previous managed receipt is incomplete")
+            if answer.previous_managed_filename is not None and (
+                answer.previous_managed_filename not in _MANAGED_SUBMISSION_FILENAMES
+                or not _SHA256_RE.fullmatch(answer.previous_managed_sha256 or "")
+            ):
+                raise IntegrationProtocolError("Moodle previous managed receipt is invalid")
+            expected[slot] = (filename, digest, len(content))
+            request_answers.append(
+                {
+                    "question_slot": slot,
+                    "answer_transport": answer.answer_transport,
+                    "artifact": {
+                        "filename": filename,
+                        "content_base64": base64.b64encode(content).decode("ascii"),
+                        "sha256": digest,
+                    },
+                    "previous_managed_filename": answer.previous_managed_filename,
+                    "previous_managed_sha256": answer.previous_managed_sha256,
+                }
+            )
+        result = await self._call(
+            "sync_quiz_answers",
+            {
+                "schema_version": "1.0",
+                "base_url": self.base_url,
+                "course_id": course_id,
+                "cmid": cmid,
+                "expected_attempt_id": attempt_id,
+                "answers": request_answers,
+                "finalize": finalize,
+                "idempotency_key": idempotency_key,
+                "storage_state": self._required_storage_state(),
+            },
+        )
+        status = "FINALIZED" if finalize else "DRAFT_SAVED"
+        raw_receipts = result.get("receipts")
+        if (
+            result.get("status") != status
+            or not isinstance(raw_receipts, list)
+            or len(raw_receipts) != len(expected)
+        ):
+            raise IntegrationProtocolError("Moodle quiz batch confirmation is incomplete")
+        receipts: dict[str, MoodleBrowserQuizEssayReceipt] = {}
+        for raw in raw_receipts:
+            if not isinstance(raw, dict):
+                raise IntegrationProtocolError("Moodle quiz batch receipt is invalid")
+            slot = self._positive_id(raw.get("question_slot"), "Moodle question slot")
+            if slot not in expected or slot in receipts:
+                raise IntegrationProtocolError("Moodle quiz batch returned different answer slots")
+            filename, digest, size = expected[slot]
+            receipt = self._normalise_quiz_receipt(
+                raw,
+                course_id=course_id,
+                cmid=cmid,
+                filename=filename,
+                digest=digest,
+                size_bytes=size,
+                idempotency_key=idempotency_key,
+            )
+            if receipt.attempt_id != attempt_id:
+                raise IntegrationProtocolError("Moodle quiz batch returned another attempt")
+            receipts[slot] = receipt
+        self._storage_state = self._response_storage_state(result)
+        return MoodleBrowserQuizAnswersResult(
+            status=cast(Literal["DRAFT_SAVED", "FINALIZED"], status),
+            receipts=tuple(receipts[slot] for slot in expected),
+            storage_state=self.storage_state or {},
+        )
+
+    def _normalise_prepared_quiz_questions(
+        self,
+        raw: Any,
+    ) -> tuple[MoodleBrowserQuizQuestionPreparation, ...]:
+        if raw is None:
+            return ()  # Older connector: the scalar one-question contract remains valid.
+        if not isinstance(raw, list) or not 1 <= len(raw) <= 32:
+            raise IntegrationProtocolError("Moodle prepared question count is invalid")
+        questions = []
+        slots: set[str] = set()
+        supported = {"ESSAY_ATTACHMENT", "ESSAY_ONLINE_TEXT"}
+        for value in raw:
+            if not isinstance(value, dict):
+                raise IntegrationProtocolError("Moodle prepared question is invalid")
+            slot = self._positive_id(value.get("question_slot"), "Moodle question slot")
+            statement = self._required_text(
+                value.get("question_text"), 50_000, "Moodle question text"
+            )
+            transport = value.get("answer_transport")
+            available = value.get("available_answer_transports")
+            page = value.get("page", 0)
+            mark = value.get("question_max_mark")
+            if (
+                slot in slots
+                or not isinstance(transport, str)
+                or transport not in supported
+                or not isinstance(available, list)
+                or not 1 <= len(available) <= 2
+                or any(not isinstance(item, str) or item not in supported for item in available)
+                or len(set(available)) != len(available)
+                or transport not in available
+                or isinstance(page, bool)
+                or not isinstance(page, int)
+                or not 0 <= page < 64
+                or (mark is None and len(raw) > 1)
+                or (
+                    mark is not None
+                    and (
+                        isinstance(mark, bool)
+                        or not isinstance(mark, int | float)
+                        or not math.isfinite(mark)
+                        or not 0 < mark <= 999_999.99
+                    )
+                )
+            ):
+                raise IntegrationProtocolError(
+                    "Moodle prepared question configuration is inconsistent"
+                )
+            slots.add(slot)
+            questions.append(
+                MoodleBrowserQuizQuestionPreparation(
+                    question_slot=slot,
+                    question_text=statement,
+                    answer_transport=cast(
+                        Literal["ESSAY_ATTACHMENT", "ESSAY_ONLINE_TEXT"], transport
+                    ),
+                    available_answer_transports=tuple(available),
+                    page=page,
+                    question_max_mark=mark,
+                )
+            )
+        return tuple(questions)
+
     async def prepare_quiz_essay(
         self,
         course_id: str,
@@ -566,6 +770,14 @@ class MoodleBrowserClient:
             or not 0 <= remaining_seconds <= 315_360_000
         ):
             raise IntegrationProtocolError("Moodle browser returned an invalid quiz remaining time")
+        questions = self._normalise_prepared_quiz_questions(raw.get("questions"))
+        if questions and (
+            questions[0].question_slot != question_slot
+            or questions[0].question_text != question_text
+            or questions[0].answer_transport != answer_transport
+            or questions[0].available_answer_transports != available
+        ):
+            raise IntegrationProtocolError("Moodle preparation changed the first question binding")
         refreshed_state = self._response_storage_state(result)
         self._storage_state = refreshed_state
         return MoodleBrowserQuizEssayPrepareResult(
@@ -584,6 +796,7 @@ class MoodleBrowserClient:
                     available,
                 ),
                 remaining_seconds=remaining_seconds,
+                questions=questions,
             ),
             storage_state=self.storage_state or {},
         )
@@ -946,12 +1159,25 @@ class MoodleBrowserClient:
                 ) from exc
             if status_code == 429:
                 raise IntegrationBusy("Moodle browser connector is busy") from exc
+            if status_code == 503 and isinstance(cause, httpx.HTTPStatusError):
+                diagnostic = cause.response.headers.get("X-Moodle-Error-Code")
+                if diagnostic in {
+                    "MOODLE_RESPONSE_TIMEOUT", "MOODLE_DOCUMENT_TIMEOUT",
+                    "MOODLE_DNS_ERROR", "MOODLE_CONNECTION_ERROR", "MOODLE_TLS_ERROR",
+                    "MOODLE_HTTP_ERROR", "MOODLE_NAVIGATION_ERROR",
+                }:
+                    # Keep the cause in durable outbox diagnostics while
+                    # preserving retries. Never relay arbitrary headers/bodies.
+                    raise IntegrationUnavailable(
+                        f"{diagnostic}: Moodle page could not be opened"
+                    ) from exc
             if (
                 operation
                 in {
                     "prepare_quiz_essay",
                     "prepare_assignment_submission",
                     "sync_quiz_essay",
+                    "sync_quiz_answers",
                     "sync_assignment_submission",
                 }
                 and status_code == 423
@@ -963,7 +1189,7 @@ class MoodleBrowserClient:
                 raise IntegrationConfigurationError(
                     "Moodle browser grade writing is not implemented"
                 ) from exc
-            if operation == "sync_quiz_essay" and status_code == 501:
+            if operation in {"sync_quiz_essay", "sync_quiz_answers"} and status_code == 501:
                 raise IntegrationConfigurationError(
                     "Moodle browser quiz synchronization is not implemented"
                 ) from exc
@@ -987,8 +1213,27 @@ class MoodleBrowserClient:
                 raise IntegrationProtocolError(
                     "Moodle quiz idempotency key conflicts with another artifact"
                 ) from exc
+            if status_code == 502 and isinstance(cause, httpx.HTTPStatusError):
+                # Error bodies are deliberately not read by the bounded HTTP
+                # transport. Accept only known codes from the internal service.
+                diagnostic = cause.response.headers.get("X-Moodle-Error-Code")
+                if operation == "discover_historical_submissions" and diagnostic in (
+                    "ASSIGN_TABLE_NOT_FOUND", "QUIZ_TABLE_NOT_FOUND"
+                ):
+                    raise IntegrationProtocolError(
+                        f"{diagnostic}: Moodle submissions table was not recognized"
+                    ) from exc
+                if diagnostic in {
+                    "UPLOAD_INVALID_FILE", "UPLOAD_INVALID_TYPE", "UPLOAD_TOO_LARGE",
+                    "UPLOAD_REJECTED",
+                }:
+                    raise IntegrationProtocolError(
+                        f"{diagnostic}: Moodle rejected the uploaded file"
+                    ) from exc
             if status_code in {400, 403, 409, 413, 422, 502}:
-                raise IntegrationProtocolError("Moodle browser rejected the operation") from exc
+                raise IntegrationProtocolError(
+                    f"Moodle browser rejected the operation (HTTP {status_code})"
+                ) from exc
             raise
         if not isinstance(result, dict):
             raise IntegrationProtocolError("Moodle browser returned an invalid response")

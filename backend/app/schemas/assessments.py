@@ -196,6 +196,8 @@ class AssessmentPublishRequest(EmptyMutation):
 
     group_ids: list[UUID] | None = Field(default=None, max_length=200)
     principal_ids: list[UUID] | None = Field(default=None, max_length=200)
+    # Local teaching policy only; never written to Moodle.
+    student_ai_enabled: bool | None = None
 
     @model_validator(mode="after")
     def unique_targets(self) -> AssessmentPublishRequest:

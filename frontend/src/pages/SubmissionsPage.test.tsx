@@ -86,6 +86,8 @@ describe('student submissions views', () => {
 
     expect(screen.getByRole('button', { name: 'Открыть следующую' })).toBeInTheDocument();
     expect(within(rowFor('Мария Воронова')).getByRole('button', { name: /^Открыть$/ })).toBeInTheDocument();
+    expect(within(rowFor('Мария Воронова')).getByText('Не проверено')).toBeInTheDocument();
+    expect(screen.queryByText('Свободна')).not.toBeInTheDocument();
     expect(within(rowFor('Илья Морозов')).getByRole('button', { name: /Продолжить/ })).toBeInTheDocument();
     expect(within(rowFor('Никита Орлов')).getByRole('button', { name: /^Открыть$/ })).toBeInTheDocument();
     fireEvent.click(within(rowFor('Софья Лебедева')).getByRole('button', { name: /Открыть результат/ }));
@@ -203,6 +205,44 @@ describe('student submissions views', () => {
 
     expect(await screen.findByText('Сданных работ пока нет')).toBeInTheDocument();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('does not resurrect an old failed import merely because it was updated late', async () => {
+    mocks.getMoodleHistoryImportEvents.mockResolvedValue([
+      { id: 'old', aggregateId: 'assessment-1', state: 'FAILED', createdAt: '2026-09-09T08:00:00Z', updatedAt: '2026-09-09T11:00:00Z' },
+      { id: 'new', aggregateId: 'assessment-1', state: 'DELIVERED', createdAt: '2026-09-09T09:00:00Z', updatedAt: '2026-09-09T10:00:00Z', receipt: { complete: true, created: 0 } },
+    ]);
+    renderPage();
+    await screen.findByText('Мария Воронова');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('names the work and actual cause rather than assuming every failure requires a login', async () => {
+    mocks.getMoodleHistoryImportEvents.mockResolvedValue([
+      { id: 'failed', aggregateId: 'assessment-1', assessmentTitle: 'Лабораторная №3', lastError: 'TIMEOUT: External service timed out', state: 'FAILED', createdAt: '', updatedAt: '' },
+      { id: 'active', aggregateId: 'assessment-2', state: 'PROCESSING', createdAt: '', updatedAt: '' },
+    ]);
+    renderPage();
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Лабораторная №3');
+    expect(alert).toHaveTextContent('Moodle не ответил вовремя');
+    expect(alert).toHaveTextContent('Другие работы продолжают загружаться');
+    expect(alert).not.toHaveTextContent('Проверьте вход');
+  });
+
+  it('explains an unrecognized Assignment table without treating it as no submissions', async () => {
+    mocks.getSubmissions.mockResolvedValue([]);
+    mocks.getMoodleHistoryImportEvents.mockResolvedValue([{
+      id: 'failed', aggregateId: 'assessment-1', assessmentTitle: 'Задание №1',
+      lastError: 'INVALID_RESPONSE: ASSIGN_TABLE_NOT_FOUND: Moodle submissions table was not recognized',
+      state: 'FAILED', createdAt: '', updatedAt: '',
+    }]);
+    renderPage();
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Задание №1');
+    expect(alert).toHaveTextContent('Не распознана таблица сдач Moodle');
+    expect(alert).toHaveTextContent('это не означает отсутствие работ');
+    expect(screen.queryByText('Сданных работ пока нет')).not.toBeInTheDocument();
   });
 
   it.each(['FAILED', 'BLOCKED'])('keeps a genuine %s import error visible even with zero submissions', async (state) => {

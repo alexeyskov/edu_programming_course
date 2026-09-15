@@ -120,6 +120,8 @@ load_host_environment() {
     DBLOGIN DBPASSWORD
     POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD POSTGRES_VOLUME_NAME DATABASE_URL
     OPENROUTER_API_KEY OPENROUTER_API_BASE OPENROUTER_MODEL
+    LLM_API_ADDRESS LLM_API_KEY LLM_MODEL LLM_THINKING
+    MOODLE_SYNC_TIMEOUT
     AI_ENABLED AI_BASE_URL AI_API_KEY AI_MODEL AI_API_STYLE
   )
   for key in "${allowed_keys[@]}"; do
@@ -241,13 +243,23 @@ map_legacy_environment() {
     export DATABASE_URL="postgresql://${encoded_user}:${encoded_password}@postgres:5432/${encoded_database}"
   fi
 
-  if [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
+  if [[ -n "${LLM_API_ADDRESS:-}" || -n "${LLM_MODEL:-}" || -n "${LLM_API_KEY:-}" ]]; then
+    export AI_ENABLED="${AI_ENABLED:-true}"
+    export AI_BASE_URL="${LLM_API_ADDRESS:-${AI_BASE_URL:-${OPENROUTER_API_BASE:-https://openrouter.ai/api/v1}}}"
+    # An explicitly empty new key means no authentication (local Ollama).
+    export AI_API_KEY="${LLM_API_KEY-${AI_API_KEY:-${OPENROUTER_API_KEY:-}}}"
+    export AI_MODEL="${LLM_MODEL:-${AI_MODEL:-${OPENROUTER_MODEL:-gpt-5-mini}}}"
+    export AI_API_STYLE="${AI_API_STYLE:-auto}"
+  elif [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
     export AI_ENABLED="${AI_ENABLED:-true}"
     export AI_BASE_URL="${AI_BASE_URL:-${OPENROUTER_API_BASE:-https://openrouter.ai/api/v1}}"
     export AI_API_KEY="${AI_API_KEY:-$OPENROUTER_API_KEY}"
     export AI_MODEL="${AI_MODEL:-${OPENROUTER_MODEL:-deepseek/deepseek-v4-pro}}"
     export AI_API_STYLE="${AI_API_STYLE:-chat_completions}"
   fi
+  export LLM_API_ADDRESS="${AI_BASE_URL:-}"
+  export LLM_API_KEY="${AI_API_KEY:-}"
+  export LLM_MODEL="${AI_MODEL:-}"
 
   if [[ -z "${POSTGRES_VOLUME_NAME:-}" ]]; then
     if docker volume inspect eduprog_postgres-data >/dev/null 2>&1; then
@@ -379,24 +391,40 @@ diagnose_runner() {
 
 diagnose_ai() {
   local launcher_key_status="not configured"
-  if [[ -n "${AI_API_KEY:-}" ]]; then
+  if [[ -n "${LLM_API_KEY:-}" ]]; then
     launcher_key_status="configured"
   fi
 
   log "effective AI configuration in the launcher (the API key is never printed)"
   printf 'AI_ENABLED=%s\n' "${AI_ENABLED:-false}"
-  printf 'AI_BASE_URL=%s\n' "${AI_BASE_URL:-}"
-  printf 'AI_MODEL=%s\n' "${AI_MODEL:-}"
+  printf 'LLM_API_ADDRESS=%s\n' "${LLM_API_ADDRESS:-}"
+  printf 'LLM_MODEL=%s\n' "${LLM_MODEL:-}"
+  printf 'LLM_THINKING=%s\n' "${LLM_THINKING:-provider default}"
   printf 'AI_API_STYLE=%s\n' "${AI_API_STYLE:-}"
-  printf 'AI_API_KEY=%s\n' "$launcher_key_status"
+  printf 'LLM_API_KEY=%s\n' "$launcher_key_status"
 
   if compose ps --status running --services 2>/dev/null | grep -qx backend; then
     log "effective AI configuration inside the running backend"
     compose exec -T backend python -c \
-      "import os; names=('AI_ENABLED','AI_BASE_URL','AI_MODEL','AI_API_STYLE'); [print(f'{name}={os.getenv(name, \"\")}') for name in names]; print('AI_API_KEY=' + ('configured' if os.getenv('AI_API_KEY') else 'not configured'))"
+      "from app.core.config import get_settings; s=get_settings(); print('AI_ENABLED=' + str(s.ai_enabled)); print('LLM_API_ADDRESS=' + s.ai_base_url); print('LLM_MODEL=' + s.ai_model); print('AI_API_STYLE=' + s.ai_api_style); print('LLM_THINKING=' + str(s.llm_thinking)); print('LLM_API_KEY=' + ('configured' if s.ai_api_key.get_secret_value() else 'not configured'))"
   else
     log "backend is not running; only launcher values are shown"
   fi
+}
+
+diagnose_moodle_submission() {
+  [[ $# -eq 1 ]] || die "usage: diagnose-moodle-submission <attempt-uuid>"
+  [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+    || die "attempt id must be a UUID from the /ide/ address"
+  local diagnostic_container
+  diagnostic_container="$(docker ps -q \
+    --filter label=com.docker.compose.project=eduprog \
+    --filter label=com.docker.compose.service=sync-worker)"
+  [[ "$diagnostic_container" =~ ^[0-9a-f]{12,64}$ ]] \
+    || die "exactly one running eduprog sync-worker is required"
+  log "read-only submission diagnostic; source files and session secrets are not printed"
+  docker exec -i "$diagnostic_container" python - "$1" \
+    < "$PROJECT_DIR/scripts/diagnose_moodle_submission.py"
 }
 
 prepare_stack() {
@@ -469,6 +497,8 @@ Commands:
              Interactively generate an Argon2id administrator-token verifier
   diagnose-moodle-login [base-url]
              Diagnose Moodle mobile login using a hidden password prompt
+  diagnose-moodle-submission <attempt-uuid>
+             Read submission queue and probe the saved student session; no retry or restart
   diagnose-runner
              Print runner readiness and effective container limits
   diagnose-ai
@@ -481,7 +511,9 @@ Commands:
 
 Environment:
   DBLOGIN / DBPASSWORD are accepted as POSTGRES_USER / POSTGRES_PASSWORD aliases.
-  OPENROUTER_API_KEY / OPENROUTER_MODEL enable the chat-completions AI adapter.
+  LLM_API_ADDRESS / LLM_API_KEY / LLM_MODEL configure the AI provider.
+  LLM_THINKING=0/1 controls model thinking where supported by the provider/model.
+  OPENROUTER_* and AI_* remain supported as legacy provider settings.
   EDUPROG_ENV_FILE selects the persistent runtime configuration file.
   EDUPROG_HOST_ENV_FILE selects the host deployment env (default: ~/cpp_markup.env).
   EDUPROG_LEGACY_ENV_FILE selects an existing runtime file to copy once.
@@ -496,6 +528,14 @@ if [[ "$command_name" == "help" || "$command_name" == "--help" || "$command_name
 fi
 
 [[ -d "$PROJECT_DIR" ]] || die "project directory does not exist: $PROJECT_DIR"
+# Diagnose the deployed process without creating/migrating runtime secrets,
+# loading Compose env overrides, building images or restarting any service.
+if [[ "$command_name" == "diagnose-moodle-submission" ]]; then
+  require_command docker
+  shift
+  diagnose_moodle_submission "$@"
+  exit 0
+fi
 [[ -f "$COMPOSE_FILE" ]] || die "Compose file does not exist: $COMPOSE_FILE"
 require_command docker
 require_command openssl

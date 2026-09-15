@@ -5,11 +5,12 @@ import base64
 import hashlib
 import hmac
 import html
+import logging
 import re
 from collections import OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
@@ -22,6 +23,7 @@ from playwright.async_api import (
     Locator,
     Page,
     Playwright,
+    Response,
     async_playwright,
 )
 from playwright.async_api import (
@@ -31,6 +33,7 @@ from playwright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
 )
 
+from .assets import PublicAssetCache, individual_amd_url
 from .assignment import (
     ASSIGNMENT_FILEMANAGER_SELECTOR,
     ASSIGNMENT_ONLINE_TEXT_SELECTOR,
@@ -66,6 +69,8 @@ from .models import (
     HistoricalSubmissionsResponse,
     LoginRequest,
     LoginResponse,
+    QuizAnswersSyncRequest,
+    QuizAnswersSyncResponse,
     QuizEssayPrepareRequest,
     QuizEssayPrepareResponse,
     QuizEssaySyncRequest,
@@ -114,11 +119,20 @@ from .quiz import (
     QuizAttemptUnavailable,
     QuizLaunch,
     QuizSummary,
+    essay_slot_selector,
     finalize_text_matches,
     parse_attempt_page,
+    parse_attempt_questions,
     parse_quiz_view,
     parse_summary_page,
+    quiz_attempt_navigation,
     validate_final_page,
+)
+from .quiz_upload import (
+    DraftSessionExpired,
+    DraftUnavailable,
+    draft_request,
+    parse_essay_draft,
 )
 from .storage import InvalidStorageState, has_moodle_session, sanitize_storage_state
 
@@ -126,6 +140,9 @@ if TYPE_CHECKING:
     from playwright.async_api import Request, Route
 
 
+# Use the server's configured INFO handler even when request access logging is
+# disabled (the Docker entrypoint intentionally uses --no-access-log).
+_LOGGER = logging.getLogger("uvicorn.error.moodle_browser")
 _LOGIN_ROLE_PAGE_MAX_BYTES = 2 * 1024 * 1024
 _LOGIN_ROLE_FETCH_TIMEOUT_MS = 3_000
 _ACTIVITY_DETAIL_FETCH_TIMEOUT_MS = 2_000
@@ -188,9 +205,9 @@ def _managed_target_replace_existing(
 
     A Moodle filename is not ownership evidence.  A pre-existing target may be
     overwritten only when a durable receipt for this attempt names that exact
-    target.  A previous artifact with another name is deliberately retained:
-    deleting by a rendered basename cannot prove that the entry is a root file
-    rather than a nested or user-owned attachment.
+    target. A previous artifact with another name is not ownership evidence
+    for the new target. Packaging transitions require separate byte and
+    root-path verification before removing the old managed attachment.
     """
 
     if target_filename not in existing_filenames:
@@ -339,6 +356,46 @@ class BrowserUnavailable(MoodleBrowserError):
     pass
 
 
+class BrowserNavigationUnavailable(BrowserUnavailable):
+    """A fixed, safe diagnostic; never include Playwright's URL/call log."""
+
+    def __init__(
+        self, phase: str, error: Exception | None = None, *, http_status: int | None = None,
+    ) -> None:
+        phase = phase if phase in {"response", "document", "content"} else "response"
+        reason = "BROWSER_ERROR"
+        code = "MOODLE_NAVIGATION_ERROR"
+        if isinstance(error, TimeoutError | PlaywrightTimeoutError):
+            reason = "TIMEOUT"
+            code = (
+                "MOODLE_RESPONSE_TIMEOUT" if phase == "response" else "MOODLE_DOCUMENT_TIMEOUT"
+            )
+        elif error is not None:
+            # Playwright exceptions can contain a complete URL, cookies in
+            # headers and a multi-line call log. Only known Chromium codes
+            # may leave this boundary.
+            for marker, diagnostic in {
+                "ERR_NAME_NOT_RESOLVED": "MOODLE_DNS_ERROR",
+                "ERR_CONNECTION_REFUSED": "MOODLE_CONNECTION_ERROR",
+                "ERR_CONNECTION_RESET": "MOODLE_CONNECTION_ERROR",
+                "ERR_CONNECTION_CLOSED": "MOODLE_CONNECTION_ERROR",
+                "ERR_CONNECTION_TIMED_OUT": "MOODLE_CONNECTION_ERROR",
+                "ERR_ADDRESS_UNREACHABLE": "MOODLE_CONNECTION_ERROR",
+                "ERR_INTERNET_DISCONNECTED": "MOODLE_CONNECTION_ERROR",
+                "ERR_CERT_AUTHORITY_INVALID": "MOODLE_TLS_ERROR",
+                "ERR_CERT_DATE_INVALID": "MOODLE_TLS_ERROR",
+                "ERR_CERT_COMMON_NAME_INVALID": "MOODLE_TLS_ERROR",
+                "ERR_SSL_PROTOCOL_ERROR": "MOODLE_TLS_ERROR",
+            }.items():
+                if f"net::{marker}" in str(error):
+                    reason, code = marker, diagnostic
+                    break
+        if type(http_status) is int and 500 <= http_status <= 599:
+            reason, code = f"HTTP_{http_status}", "MOODLE_HTTP_ERROR"
+        self.diagnostic_code = code
+        super().__init__(f"Moodle navigation failed: phase={phase} reason={reason}")
+
+
 class BrowserBusy(MoodleBrowserError):
     pass
 
@@ -388,6 +445,7 @@ class _StudentSessionLock:
 class MoodleBrowserService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self._public_asset_cache = PublicAssetCache(settings.base_url)
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_operations)
@@ -408,7 +466,15 @@ class MoodleBrowserService:
         # while an operation is active or waiting.
         self._student_session_locks: dict[bytes, _StudentSessionLock] = {}
         self._student_session_locks_guard = asyncio.Lock()
+        self._pending_student_operations = 0
+        self._student_http_semaphore = asyncio.Semaphore(
+            settings.max_concurrent_student_operations
+        )
         self._quiz_sync_cache: OrderedDict[str, tuple[str, QuizEssaySyncResponse]] = OrderedDict()
+        self._quiz_answers_cache: OrderedDict[str, tuple[str, QuizAnswersSyncResponse]] = (
+            OrderedDict()
+        )
+        self._quiz_answers_progress: OrderedDict[str, tuple[str, set[str], bool]] = OrderedDict()
         # A Quiz save and its final submission are two separate Moodle
         # mutations.  Retain the exact saved attempt while an idempotent
         # terminal request is in flight so a transport timeout retries only
@@ -473,52 +539,52 @@ class MoodleBrowserService:
         *,
         interactive: bool = False,
         foreground: bool = False,
+        student: bool = False,
+        lightweight: bool = False,
     ):
-        background_acquired = False
-        non_login_acquired = False
-        total_acquired = False
-        try:
+        if lightweight and not student:
+            raise ValueError("Script-free student capacity requires a student operation")
+        if student and (
+            self._pending_student_operations >= self.settings.max_pending_student_operations
+        ):
+            raise BrowserBusy("Moodle student operation queue is full")
+        if student:
+            self._pending_student_operations += 1
+        wait_seconds = (
+            self.settings.student_queue_wait_seconds
+            if student else self.settings.queue_wait_seconds
+        )
+        wait_started = asyncio.get_running_loop().time()
+        acquired: list[asyncio.Semaphore] = []
+        if lightweight:
+            # No full Moodle JS application is loaded in these contexts.
+            # Their bounded pool is independent of long teacher imports and
+            # heavyweight filepicker workflows, not twenty extra browsers.
+            permits = [self._student_http_semaphore]
+        else:
+            permits = []
             if not interactive and not foreground:
-                # Acquire the narrowest (background-only) permit first.  A
-                # queued background crawl must not hold one of the permits
-                # reserved for foreground synchronization while it merely
-                # waits for another background crawl to finish.
-                await asyncio.wait_for(
-                    self._background_semaphore.acquire(),
-                    timeout=self.settings.queue_wait_seconds,
-                )
-                background_acquired = True
+                permits.append(self._background_semaphore)
             if not interactive:
-                await asyncio.wait_for(
-                    self._non_login_semaphore.acquire(),
-                    timeout=self.settings.queue_wait_seconds,
-                )
-                non_login_acquired = True
-            await asyncio.wait_for(
-                self._semaphore.acquire(),
-                timeout=self.settings.queue_wait_seconds,
-            )
-            total_acquired = True
-        except BaseException as exc:
-            if background_acquired:
-                self._background_semaphore.release()
-            if non_login_acquired:
-                self._non_login_semaphore.release()
-            if isinstance(exc, TimeoutError):
-                raise BrowserBusy("Moodle browser is busy") from exc
-            raise
+                permits.append(self._non_login_semaphore)
+            permits.append(self._semaphore)
         try:
+            for permit in permits:
+                remaining = wait_seconds - (asyncio.get_running_loop().time() - wait_started)
+                try:
+                    await asyncio.wait_for(permit.acquire(), timeout=max(0, remaining))
+                except TimeoutError as exc:
+                    raise BrowserBusy("Moodle browser is busy") from exc
+                acquired.append(permit)
             browser = self._browser
             if browser is None or not browser.is_connected():
                 raise BrowserUnavailable("Chromium is not connected")
             yield browser
         finally:
-            if total_acquired:
-                self._semaphore.release()
-            if background_acquired:
-                self._background_semaphore.release()
-            if non_login_acquired:
-                self._non_login_semaphore.release()
+            for permit in reversed(acquired):
+                permit.release()
+            if student:
+                self._pending_student_operations -= 1
 
     @staticmethod
     def _student_session_key(state: BrowserStorageState) -> bytes:
@@ -601,17 +667,64 @@ class MoodleBrowserService:
         browser: Browser,
         *,
         storage_state: BrowserStorageState | None = None,
+        html_only: bool = False,
+        server_rendered: bool = False,
     ) -> BrowserContext:
         options: dict[str, Any] = {
             "accept_downloads": False,
             "service_workers": "block",
+            "java_script_enabled": not (html_only or server_rendered),
             "viewport": {"width": 1365, "height": 900},
         }
         if storage_state is not None:
             options["storage_state"] = storage_state.model_dump(mode="json")
         context = await browser.new_context(**options)
+        # Static readers retain CSS for faithful innerText/whitespace, but
+        # have no editors to initialize. Their load event waits only for CSS.
+        context._eduprog_navigation_mode = (
+            "load" if server_rendered else "domcontentloaded" if html_only else "interactive"
+        )
         context.set_default_timeout(self.settings.navigation_timeout_ms)
         context.set_default_navigation_timeout(self.settings.navigation_timeout_ms)
+
+        captures: set[asyncio.Task[None]] = set()
+
+        async def capture_public_asset(response: Response) -> None:
+            try:
+                headers = await response.all_headers()
+                declared_length = headers.get("content-length", "")
+                if declared_length.isdigit() and (
+                    len(declared_length) > 10
+                    or int(declared_length) > self._public_asset_cache.max_asset_bytes
+                ):
+                    return
+                if self._public_asset_cache.response_ttl(
+                    response.url, status=response.status, headers=headers
+                ) is not None:
+                    self._public_asset_cache.put(
+                        response.url, status=response.status, headers=headers,
+                        body=await response.body(),
+                    )
+            except PlaywrightError:
+                # Interrupted navigation/cache collection must never affect the
+                # underlying operation; the next request uses the network.
+                pass
+
+        def response_received(response: Response) -> None:
+            request = response.request
+            if self._public_asset_cache.candidate(
+                response.url, request.resource_type, request.method
+            ):
+                task = asyncio.create_task(capture_public_asset(response))
+                captures.add(task)
+                task.add_done_callback(captures.discard)
+
+        def context_closed(_context: BrowserContext) -> None:
+            for task in tuple(captures):
+                task.cancel()
+
+        context.on("response", response_received)
+        context.on("close", context_closed)
 
         async def restrict_route(route: Route, request: Request) -> None:
             try:
@@ -623,26 +736,117 @@ class MoodleBrowserService:
             if origin != self.settings.base_url:
                 await route.abort("blockedbyclient")
                 return
+            if html_only and request.resource_type not in {"document", "fetch", "xhr"}:
+                # Native forms and metadata need no theme assets. Bounded,
+                # same-origin role/metadata fetches remain available.
+                await route.abort("blockedbyclient")
+                return
+            if server_rendered and request.resource_type not in {
+                "document", "stylesheet", "fetch", "xhr",
+            }:
+                await route.abort("blockedbyclient")
+                return
+            cached = self._public_asset_cache.get(
+                request.url, request.resource_type, request.method
+            )
+            if cached is not None:
+                # response.body() is decompressed: let Playwright generate the
+                # correct transport headers instead of replaying gzip/length.
+                await route.fulfill(status=200, content_type=cached.content_type, body=cached.body)
+                return
+            if request.resource_type == "script":
+                # Only a same-origin public AMD asset changes representation.
+                # Keep native JS/file-picker execution; do not fetch the full
+                # Moodle plugin bundle for each individual required module.
+                script_url = individual_amd_url(request.url, base_url=self.settings.base_url)
+                if script_url is not None:
+                    await route.continue_(url=script_url)
+                    return
             await route.continue_()
 
         await context.route("**/*", restrict_route)
         return context
 
     async def _goto(self, page: Page, url: str) -> str:
+        mode = getattr(
+            getattr(page, "context", None), "_eduprog_navigation_mode", "domcontentloaded"
+        )
+        started = asyncio.get_running_loop().time()
+        phase = "response"
+        # Route names are fixed labels, not user identifiers, query strings,
+        # filenames, cookies, sesskeys or arbitrary paths supplied by Moodle.
+        target = {
+            "/login/index.php": "login",
+            "/course/view.php": "course",
+            "/mod/quiz/attempt.php": "quiz_attempt",
+            "/mod/quiz/summary.php": "quiz_summary",
+            "/mod/quiz/review.php": "quiz_review",
+            "/mod/quiz/view.php": "quiz_view",
+            "/mod/quiz/report.php": "quiz_report",
+            "/mod/assign/view.php": "assignment",
+        }.get(urlsplit(url).path, "other")
         try:
-            response = await page.goto(url, wait_until="domcontentloaded")
-        except (PlaywrightTimeoutError, PlaywrightError) as exc:
-            raise BrowserUnavailable("Moodle navigation failed") from exc
-        if response is not None and response.status >= 500:
-            raise BrowserUnavailable("Moodle returned a server error")
+            # One navigation budget covers receiving headers AND preparing the
+            # document. Previously the interactive reader could spend the full
+            # timeout on each, while static readers hid both behind page.goto.
+            async with asyncio.timeout(self.settings.navigation_timeout_ms / 1_000):
+                response = await page.goto(url, wait_until="commit")
+                _LOGGER.info(
+                    "Moodle navigation response target=%s mode=%s status=%s elapsed_ms=%d",
+                    target, mode, response.status if response is not None else None,
+                    round((asyncio.get_running_loop().time() - started) * 1_000),
+                )
+                if response is not None and response.status >= 500:
+                    # An error document may itself contain stalled assets. It
+                    # cannot satisfy the contract, so fail before waiting for JS.
+                    raise BrowserNavigationUnavailable(phase, http_status=response.status)
+                self._require_navigation_origin(page.url)
+                phase = "document"
+                await self._wait_for_document(page)
+                self._require_navigation_origin(page.url)
+                phase = "content"
+                markup = await page.content()
+                _LOGGER.info(
+                    "Moodle navigation ready target=%s mode=%s elapsed_ms=%d",
+                    target, mode,
+                    round((asyncio.get_running_loop().time() - started) * 1_000),
+                )
+                return markup
+        except (TimeoutError, PlaywrightTimeoutError, PlaywrightError) as exc:
+            failure = BrowserNavigationUnavailable(phase, exc)
+            _LOGGER.warning(
+                "Moodle navigation interrupted target=%s mode=%s elapsed_ms=%d detail=%s",
+                target, mode,
+                round((asyncio.get_running_loop().time() - started) * 1_000), failure,
+            )
+            raise failure from exc
+
+    def _require_navigation_origin(self, url: str) -> None:
         try:
-            current = urlsplit(page.url)
+            current = urlsplit(url)
             current_origin = exact_https_origin(f"{current.scheme}://{current.netloc}")
         except ValueError as exc:
             raise MoodleProtocolError("Moodle redirected outside its configured origin") from exc
         if current_origin != self.settings.base_url:
             raise MoodleProtocolError("Moodle redirected outside its configured origin")
-        return await page.content()
+
+    async def _wait_for_document(self, page: Page) -> None:
+        mode = getattr(
+            getattr(page, "context", None), "_eduprog_navigation_mode", "domcontentloaded"
+        )
+        if mode != "interactive":
+            await page.wait_for_load_state(mode)
+            return
+        # DOMContentLoaded also waits for every deferred script/module (theme,
+        # notifications, React). Server-rendered forms are already complete at
+        # interactive. Editors/file managers keep their own scoped readiness
+        # checks; slow unrelated modules are not an unavailable Moodle page.
+        ready = await page.wait_for_function(
+            "document.readyState === 'interactive' || document.readyState === 'complete'",
+            polling=50,
+            timeout=self.settings.navigation_timeout_ms,
+        )
+        await ready.dispose()
 
     async def _state(self, context: BrowserContext) -> BrowserStorageState:
         try:
@@ -669,7 +873,11 @@ class MoodleBrowserService:
     async def login(self, request: LoginRequest) -> LoginResponse:
         self._require_origin(request.base_url)
         async with self._operation(interactive=True) as browser:
-            context = await self._new_context(browser)
+            # Moodle's native credential form and identity evidence are server
+            # rendered. Theme scripts must not block authentication. This does
+            # not disable automation's bounded role probes or affect the JS
+            # contexts used by Quiz editors and uploads.
+            context = await self._new_context(browser, html_only=True)
             try:
                 page = await context.new_page()
                 await self._goto(page, f"{self.settings.base_url}/login/index.php")
@@ -677,7 +885,7 @@ class MoodleBrowserService:
                     await page.locator("#username").fill(request.username)
                     await page.locator("#password").fill(request.password.get_secret_value())
                     await page.locator("#loginbtn").click()
-                    await page.wait_for_load_state("domcontentloaded")
+                    await self._wait_for_document(page)
                     html = await page.content()
                 except (PlaywrightTimeoutError, PlaywrightError) as exc:
                     raise BrowserUnavailable("Moodle login page could not be operated") from exc
@@ -844,7 +1052,9 @@ class MoodleBrowserService:
             raise MoodleSessionExpired("Moodle browser session is missing")
 
         async with self._operation(foreground=request.interactive) as browser:
-            context = await self._new_context(browser, storage_state=input_state)
+            context = await self._new_context(
+                browser, storage_state=input_state, html_only=True
+            )
             try:
                 page = await context.new_page()
                 course_url = f"{self.settings.base_url}/course/view.php?" + urlencode(
@@ -985,7 +1195,9 @@ class MoodleBrowserService:
 
         page_number, offset = (int(value) for value in request.cursor.split(":"))
         async with self._operation() as browser:
-            context = await self._new_context(browser, storage_state=input_state)
+            context = await self._new_context(
+                browser, storage_state=input_state, server_rendered=True
+            )
             try:
                 page = await context.new_page()
                 course_url = f"{self.settings.base_url}/course/view.php?" + urlencode(
@@ -1014,6 +1226,9 @@ class MoodleBrowserService:
                             "id": cmid,
                             "mode": "overview",
                             "attempts": "enrolled_with",
+                            # Include every attempt, not just the one Moodle's
+                            # first/highest/last policy uses for the gradebook.
+                            "onlygraded": 0,
                             "onlyregraded": 0,
                             "slotmarks": 1,
                             "group": 0,
@@ -1298,6 +1513,7 @@ class MoodleBrowserService:
         cmid: int,
         attempt_id: str,
         user_id: str,
+        require_complete_answers: bool = False,
     ) -> dict[str, Any]:
         """Collect every Essay question from one bounded Moodle Quiz review.
 
@@ -1311,6 +1527,10 @@ class MoodleBrowserService:
         async def parse_page(
             html: str, url: str
         ) -> tuple[list[dict[str, Any]], str | None, list[str]]:
+            if require_complete_answers and len(html.encode("utf-8")) > 1_000_000:
+                raise MoodleProtocolError(
+                    "Moodle review is too large for exact answer verification"
+                )
             parsed = parse_quiz_review_page(
                 html,
                 url,
@@ -1325,7 +1545,11 @@ class MoodleBrowserService:
             # browser-rendered ``innerText`` while the corresponding review
             # page is still active.  BeautifulSoup cannot reproduce CSS
             # whitespace semantics of Moodle editors.
-            rendered_answers = await self._historical_quiz_inner_text(page)
+            rendered_answers = (
+                await self._historical_quiz_inner_text(page, require_complete=True)
+                if require_complete_answers
+                else await self._historical_quiz_inner_text(page)
+            )
             for response, rendered in zip(
                 parsed.get("responses", []), rendered_answers, strict=False
             ):
@@ -1484,7 +1708,9 @@ class MoodleBrowserService:
             "responses_complete": complete and not response_limit_hit,
         }
 
-    async def _historical_quiz_inner_text(self, page: Page) -> list[str]:
+    async def _historical_quiz_inner_text(
+        self, page: Page, *, require_complete: bool = False
+    ) -> list[str]:
         """Read Essay code exactly as Chromium renders it, bounded and ordered."""
 
         if not hasattr(page, "locator"):
@@ -1503,6 +1729,8 @@ class MoodleBrowserService:
                     result.append("")
                     continue
                 value = await response.inner_text()
+                if require_complete and len(value) > 1_000_000:
+                    raise MoodleProtocolError("Moodle review answer exceeds verification limit")
                 value = value.replace("\r\n", "\n").replace("\r", "\n").replace("\xa0", " ")
                 # The old Selenium implementation trimmed only the boundaries;
                 # indentation, tabs, blank lines and trailing spaces inside the
@@ -1820,6 +2048,7 @@ class MoodleBrowserService:
                                         summary.pop("_essay_question_query_name", "")
                                     )
                                     random_qbank_url = str(summary.pop("_random_qbank_url", ""))
+                                    question_references = summary.pop("_questions", [])
                                     # A single Essay slot proves only structure.
                                     # Publication remains closed until the
                                     # question editor proves the concrete Moodle
@@ -1903,6 +2132,68 @@ class MoodleBrowserService:
                                                             "import_supported": True,
                                                         }
                                                     )
+                                    if question_references:
+                                        confirmed = True
+                                        for question in question_references:
+                                            if detail_count >= _ACTIVITY_DETAIL_MAX_PAGES:
+                                                confirmed = False
+                                                break
+                                            detail_count += 1
+                                            bank_url = str(question.get("_random_qbank_url", ""))
+                                            edit_url = str(question.get("_essay_edit_url", ""))
+                                            target_url = bank_url or edit_url
+                                            parsed_target = urlsplit(target_url)
+                                            target_query = parse_qs(parsed_target.query)
+                                            markup = await self._fetch_bounded_html(
+                                                page,
+                                                context,
+                                                target_url,
+                                                expected_path=parsed_target.path.rstrip("/"),
+                                                expected_query=target_query,
+                                            )
+                                            if markup is None:
+                                                confirmed = False
+                                                break
+                                            try:
+                                                if bank_url:
+                                                    bank = parse_quiz_random_question_bank(
+                                                        markup,
+                                                        base_url=self.settings.base_url,
+                                                        course_id=course_id,
+                                                    )
+                                                    confirmed = bool(
+                                                        bank["complete"]
+                                                        and bank["all_essay"]
+                                                        and bank["question_count"] > 0
+                                                    )
+                                                else:
+                                                    answer = parse_quiz_essay_question_edit(
+                                                        markup,
+                                                        course_id=course_id,
+                                                        cmid=cmid,
+                                                        question_id=str(
+                                                            question["_essay_question_id"]
+                                                        ),
+                                                    )
+                                                    confirmed = answer.get("answer_transport") in {
+                                                        "ESSAY_ONLINE_TEXT",
+                                                        "ESSAY_ATTACHMENT",
+                                                    }
+                                            except MoodleMarkupError:
+                                                confirmed = False
+                                            if not confirmed:
+                                                break
+                                        if confirmed:
+                                            activity.update(
+                                                {
+                                                    "quiz_questions_confirmed": True,
+                                                    "random_essay_confirmed": bool(
+                                                        summary.get("random_question_count")
+                                                    ),
+                                                    "statement_deferred": True,
+                                                    "import_supported": True,
+                                                }
+                                            )
                         activities.append(activity)
                     section["activities"] = activities
                     sections.append(section)
@@ -2467,7 +2758,7 @@ class MoodleBrowserService:
 
         guard_page = await context.new_page()
         try:
-            await self._require_live_quiz_last_attempt_grading(guard_page, context, request)
+            await self._require_live_quiz_grading_configuration(guard_page, context, request)
             await self._require_latest_terminal_quiz_attempt(guard_page, context, request)
         finally:
             await guard_page.close()
@@ -2489,6 +2780,7 @@ class MoodleBrowserService:
                     "id": request.payload.cmid,
                     "mode": "overview",
                     "attempts": "enrolled_with",
+                    "onlygraded": 0,
                     "onlyregraded": 0,
                     "slotmarks": 1,
                     "group": 0,
@@ -2537,13 +2829,18 @@ class MoodleBrowserService:
         if attempts[latest_attempt_id] not in {"SUBMITTED", "GRADED"}:
             raise MoodleProtocolError("Moodle quiz grade target is not finalized")
 
-    async def _require_live_quiz_last_attempt_grading(
+    async def _require_live_quiz_grading_configuration(
         self,
         page: Page,
         context: BrowserContext,
         request: GradeRequest,
     ) -> None:
-        """Fail closed if Moodle no longer grades this Quiz by its last attempt."""
+        """Confirm the Quiz policy and scale without changing Moodle settings.
+
+        Manual grading targets one question in the proven latest attempt, not
+        the aggregated gradebook entry. Moodle remains responsible for applying
+        its configured highest/average/first/last attempt policy afterwards.
+        """
 
         target = f"{self.settings.base_url}/course/modedit.php?" + urlencode(
             {"update": request.payload.cmid, "return": 1}
@@ -2565,13 +2862,10 @@ class MoodleBrowserService:
             )
         except MoodleMarkupError as exc:
             raise MoodleProtocolError(str(exc)) from exc
-        if (
-            activity.get("quiz_grading_method_confirmed") is not True
-            or activity.get("quiz_grading_method") != "LAST"
-        ):
-            raise MoodleProtocolError(
-                "Moodle quiz must use the latest attempt for its final grade"
-            )
+        if activity.get("quiz_grading_method_confirmed") is not True or activity.get(
+            "quiz_grading_method"
+        ) not in {"HIGHEST", "AVERAGE", "FIRST", "LAST"}:
+            raise MoodleProtocolError("Moodle quiz grading method could not be confirmed")
         live_grade_max = activity.get("grade_max")
         if (
             activity.get("grade_confirmed") is not True
@@ -2605,8 +2899,10 @@ class MoodleBrowserService:
         async with self._student_session_operation(input_state):
             # Student admission is latency-sensitive and must not queue behind
             # a long course/history crawl.
-            async with self._operation(foreground=True) as browser:
-                context = await self._new_context(browser, storage_state=input_state)
+            async with self._operation(foreground=True, student=True, lightweight=True) as browser:
+                context = await self._new_context(
+                    browser, storage_state=input_state, html_only=True
+                )
                 try:
                     page = await context.new_page()
                     submission = await self._open_assignment_submission(page, context, request)
@@ -2685,7 +2981,7 @@ class MoodleBrowserService:
                 return response.model_copy(update={"storage_state": input_state}, deep=True)
 
             # Saving/finalizing a student's answer is a foreground operation.
-            async with self._operation(foreground=True) as browser:
+            async with self._operation(foreground=True, student=True) as browser:
                 context = await self._new_context(browser, storage_state=input_state)
                 try:
                     page = await context.new_page()
@@ -2869,7 +3165,7 @@ class MoodleBrowserService:
 
             # Student answer delivery must remain available while background
             # course discovery occupies its dedicated lane.
-            async with self._operation(foreground=True) as browser:
+            async with self._operation(foreground=True, student=True) as browser:
                 context = await self._new_context(browser, storage_state=input_state)
                 try:
                     page = await context.new_page()
@@ -2900,6 +3196,635 @@ class MoodleBrowserService:
                 self._quiz_sync_cache.popitem(last=False)
             return result.model_copy(deep=True)
 
+    def _quiz_answer_request(
+        self,
+        request: QuizAnswersSyncRequest,
+        slot: str,
+    ) -> QuizEssaySyncRequest:
+        answer = next(answer for answer in request.answers if answer.question_slot == slot)
+        return QuizEssaySyncRequest.model_validate(
+            {
+                "schema_version": request.schema_version,
+                "base_url": request.base_url,
+                "course_id": request.course_id,
+                "cmid": request.cmid,
+                "expected_attempt_id": request.expected_attempt_id,
+                "expected_question_slot": slot,
+                "artifact": answer.artifact,
+                "answer_transport": answer.answer_transport,
+                "previous_managed_filename": answer.previous_managed_filename,
+                "previous_managed_sha256": answer.previous_managed_sha256,
+                "finalize": request.finalize,
+                "idempotency_key": request.idempotency_key,
+                "storage_state": request.storage_state,
+            }
+        )
+
+    async def sync_quiz_answers(self, request: QuizAnswersSyncRequest) -> QuizAnswersSyncResponse:
+        """Save a slot-bound bundle, then finish the one shared attempt exactly once."""
+        self._require_origin(request.base_url)
+        try:
+            state = sanitize_storage_state(
+                request.storage_state,
+                base_url=self.settings.base_url,
+                maximum_bytes=self.settings.storage_state_max_bytes,
+                reject_foreign=True,
+            )
+        except InvalidStorageState as exc:
+            raise MoodleContractError(str(exc)) from exc
+        if not has_moodle_session(state):
+            raise MoodleSessionExpired("Moodle browser session is missing")
+        fingerprint = canonical_hash(
+            {
+                "course_id": request.course_id,
+                "cmid": request.cmid,
+                "attempt_id": request.expected_attempt_id,
+                "finalize": request.finalize,
+                "answers": [
+                    answer.model_dump(mode="json")
+                    for answer in sorted(
+                        request.answers, key=lambda answer: int(answer.question_slot)
+                    )
+                ],
+            }
+        )
+        per_slot = {
+            answer.question_slot: self._quiz_answer_request(request, answer.question_slot)
+            for answer in request.answers
+        }
+        artifacts = {slot: self._decode_artifact(item) for slot, item in per_slot.items()}
+        for slot, item in per_slot.items():
+            if item.answer_transport == "ESSAY_ONLINE_TEXT":
+                try:
+                    text = artifacts[slot].decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise MoodleContractError("Moodle online-text Essay requires UTF-8") from exc
+                if "\0" in text:
+                    raise MoodleContractError("Moodle online-text Essay source contains NUL")
+        delivery_started = asyncio.get_running_loop().time()
+
+        def trace(stage: str, page_number: int | None = None) -> None:
+            # Only routing identifiers and timings: no cookies, source code,
+            # request bodies or authorization/idempotency secrets in logs.
+            _LOGGER.info(
+                "Moodle Quiz delivery attempt=%s cmid=%s final=%s stage=%s page=%s elapsed_ms=%d",
+                request.expected_attempt_id, request.cmid, request.finalize, stage, page_number,
+                round((asyncio.get_running_loop().time() - delivery_started) * 1_000),
+            )
+
+        trace("queued")
+        async with self._student_session_operation(state, terminal=request.finalize):
+            cached = self._quiz_answers_cache.get(request.idempotency_key)
+            if cached:
+                if cached[0] != fingerprint:
+                    raise IdempotencyConflict("Moodle quiz answer bundle idempotency conflict")
+                trace("cached")
+                return cached[1].model_copy(update={"storage_state": state}, deep=True)
+            progress = self._quiz_answers_progress.get(request.idempotency_key)
+            if progress and progress[0] != fingerprint:
+                raise IdempotencyConflict("Moodle quiz answer bundle idempotency conflict")
+            saved_slots = progress[1] if progress else set()
+            finalization_started = progress[2] if progress else False
+            self._quiz_answers_progress[request.idempotency_key] = (
+                fingerprint,
+                saved_slots,
+                finalization_started,
+            )
+            self._quiz_answers_progress.move_to_end(request.idempotency_key)
+            while len(self._quiz_answers_progress) > self.settings.idempotency_cache_entries:
+                self._quiz_answers_progress.popitem(last=False)
+            async with self._operation(foreground=True, student=True, lightweight=True) as browser:
+                context = await self._new_context(browser, storage_state=state, html_only=True)
+                context._eduprog_quiz_native_upload = True
+                browser_succeeded = False
+                try:
+                    page = await context.new_page()
+                    page._eduprog_quiz_binding = (
+                        request.course_id, request.cmid, request.expected_attempt_id,
+                    )
+                    trace("browser_ready")
+                    first_slot = min(per_slot, key=int)
+                    if finalization_started:
+                        trace("resuming_finalization")
+                        # The whole immutable bundle was verified before this
+                        # marker; a timeout after Finish never uploads it again.
+                        await self._resume_quiz_answers_finalization(
+                            context,
+                            page,
+                            request,
+                            per_slot,
+                            artifacts,
+                        )
+                    else:
+                        preparation = QuizEssayPrepareRequest.model_validate(
+                            {
+                                "schema_version": request.schema_version,
+                                "base_url": request.base_url,
+                                "course_id": request.course_id,
+                                "cmid": request.cmid,
+                                "expected_attempt_id": request.expected_attempt_id,
+                                "expected_question_slot": first_slot,
+                                "storage_state": state,
+                            }
+                        )
+                        root = await self._open_bound_quiz_attempt(page, context, preparation)
+                        questions = {
+                            question.question_slot: question
+                            for question in root.questions or (root,)
+                        }
+                        if not set(per_slot).issubset(questions) or (
+                            request.finalize and set(per_slot) != set(questions)
+                        ):
+                            raise MoodleContractError(
+                                "Moodle Quiz answer bundle has missing or foreign slots"
+                            )
+                        # Validate every transport before the first mutation.
+                        if any(
+                            item.answer_transport not in questions[slot].available_transports
+                            for slot, item in per_slot.items()
+                        ):
+                            raise MoodleProtocolError("Moodle Quiz answer transport changed")
+                        trace("contract_ready")
+                        pages: dict[int, list[str]] = {}
+                        for slot in sorted(per_slot, key=int):
+                            pages.setdefault(questions[slot].page, []).append(slot)
+                        for page_number in sorted(pages):
+                            page_slots = pages[page_number]
+                            changed = False
+                            # A single Moodle form saves every answer on its
+                            # page. Reuse the page reached by Next and fill all
+                            # its slots before saving; never navigate away
+                            # between two edits in that same form.
+                            for slot in page_slots:
+                                item = per_slot[slot]
+                                question = await self._read_quiz_question(
+                                    page, context, item, questions[slot], reuse_current_page=True
+                                )
+                                same = await self._quiz_answer_matches(
+                                    page,
+                                    item,
+                                    question,
+                                    artifacts[slot],
+                                    allow_named_attachment=slot in saved_slots,
+                                )
+                                if not same and item.answer_transport == "ESSAY_ATTACHMENT":
+                                    await self._replace_quiz_attachment(
+                                        page,
+                                        item.artifact.filename,
+                                        artifacts[slot],
+                                        replace_existing=item.artifact.filename
+                                        in question.existing_filenames,
+                                        existing_filenames=question.existing_filenames,
+                                        attachment_urls=question.attachment_urls,
+                                        previous_managed_filename=item.previous_managed_filename,
+                                        previous_managed_sha256=item.previous_managed_sha256,
+                                        question_slot=slot,
+                                    )
+                                elif not same:
+                                    await self._replace_quiz_online_text(
+                                        page,
+                                        question,
+                                        artifacts[slot],
+                                        question_scoped=True,
+                                    )
+                                changed |= not same
+                            if changed:
+                                await self._save_quiz_question_page(
+                                    page, context, item, question
+                                )
+                            if not request.finalize:
+                                # A periodic checkpoint has no final bundle
+                                # verification below, so verify its page now.
+                                for index, slot in enumerate(page_slots):
+                                    item = per_slot[slot]
+                                    returned = await self._read_quiz_question(
+                                        page, context, item, questions[slot],
+                                        reuse_current_page=index > 0,
+                                    )
+                                    if not await self._quiz_answer_matches(
+                                        page, item, returned, artifacts[slot],
+                                        allow_named_attachment=True, require_verified_match=True,
+                                    ):
+                                        raise MoodleProtocolError(
+                                            "Moodle did not preserve a Quiz answer"
+                                        )
+                            saved_slots.update(page_slots)
+                            trace("page_saved" if changed else "page_unchanged", page_number)
+                        if request.finalize:
+                            # Re-read every saved slot just before Finish. No
+                            # partial bundle can close the student's attempt.
+                            # One fresh read per page is enough: doing the same
+                            # download both after Save and again here doubled
+                            # verification I/O on every final submission.
+                            for page_number in sorted(pages):
+                                for index, slot in enumerate(pages[page_number]):
+                                    item = per_slot[slot]
+                                    question = await self._read_quiz_question(
+                                        page, context, item, questions[slot],
+                                        reuse_current_page=index > 0,
+                                    )
+                                    if not await self._quiz_answer_matches(
+                                        page, item, question, artifacts[slot],
+                                        allow_named_attachment=True, require_verified_match=True,
+                                    ):
+                                        raise MoodleProtocolError(
+                                            "Moodle Quiz answer changed before finalization"
+                                        )
+                            trace("answers_verified")
+                            summary_url = (
+                                f"{self.settings.base_url}/mod/quiz/summary.php?"
+                                + urlencode(
+                                    {
+                                        "attempt": request.expected_attempt_id,
+                                        "cmid": request.cmid,
+                                    }
+                                )
+                            )
+                            markup = await self._goto(page, summary_url)
+                            await self._require_authenticated_page(context, markup)
+                            summary = parse_summary_page(
+                                markup,
+                                page.url,
+                                base_url=self.settings.base_url,
+                                course_id=request.course_id,
+                                cmid=request.cmid,
+                                attempt_id=request.expected_attempt_id,
+                            )
+                            self._quiz_answers_progress[request.idempotency_key] = (
+                                fingerprint,
+                                saved_slots,
+                                True,
+                            )
+                            await self._finalize_quiz_attempt(
+                                page, context, per_slot[first_slot], summary
+                            )
+                            trace("finalized")
+                    refreshed = await self._state(context)
+                    browser_succeeded = True
+                except MoodleAttemptFinalized:
+                    if not request.finalize:
+                        raise
+                    # A worker may restart after Moodle commits Finish but
+                    # before the core stores the receipt. Only an exact,
+                    # read-only comparison of the entire terminal attempt
+                    # can recover that success; an empty review cannot.
+                    await self._reconcile_final_quiz_answers(
+                        page,
+                        context,
+                        request,
+                        per_slot,
+                        artifacts,
+                    )
+                    refreshed = await self._state(context)
+                    browser_succeeded = True
+                except MoodleMarkupError as exc:
+                    self._raise_quiz_markup(exc)
+                    raise AssertionError("unreachable") from exc
+                except (PlaywrightTimeoutError, PlaywrightError) as exc:
+                    raise BrowserUnavailable(
+                        "Moodle Quiz answer synchronization was interrupted"
+                    ) from exc
+                finally:
+                    trace("browser_complete" if browser_succeeded else "interrupted")
+                    await context.close()
+            response = QuizAnswersSyncResponse.model_validate(
+                {
+                    "status": "FINALIZED" if request.finalize else "DRAFT_SAVED",
+                    "receipts": [
+                        {
+                            "course_id": request.course_id,
+                            "cmid": request.cmid,
+                            "attempt_id": request.expected_attempt_id,
+                            "question_slot": slot,
+                            "filename": item.artifact.filename,
+                            "sha256": item.artifact.sha256,
+                            "size_bytes": len(artifacts[slot]),
+                            "idempotency_key": request.idempotency_key,
+                        }
+                        for slot, item in sorted(per_slot.items(), key=lambda pair: int(pair[0]))
+                    ],
+                    "storage_state": refreshed,
+                }
+            )
+            self._quiz_answers_progress.pop(request.idempotency_key, None)
+            self._quiz_answers_cache[request.idempotency_key] = (fingerprint, response)
+            while len(self._quiz_answers_cache) > self.settings.idempotency_cache_entries:
+                self._quiz_answers_cache.popitem(last=False)
+            trace("delivered")
+            return response
+
+    async def _resume_quiz_answers_finalization(
+        self,
+        context: BrowserContext,
+        page: Page,
+        request: QuizAnswersSyncRequest,
+        per_slot: dict[str, QuizEssaySyncRequest],
+        artifacts: dict[str, bytes],
+    ) -> None:
+        """Reconfirm the entire immutable bundle before retrying Finish.
+
+        A local pending marker is not evidence that another browser left all
+        answers unchanged. This path never reuploads a partially changed
+        bundle. A terminal redirect is reconciled by the caller via review.
+        """
+        preparation = QuizEssayPrepareRequest.model_validate(
+            {
+                "schema_version": request.schema_version,
+                "base_url": request.base_url,
+                "course_id": request.course_id,
+                "cmid": request.cmid,
+                "expected_attempt_id": request.expected_attempt_id,
+                "expected_question_slot": min(per_slot, key=int),
+                "storage_state": request.storage_state,
+            }
+        )
+        root = await self._open_bound_quiz_attempt(page, context, preparation)
+        questions = {question.question_slot: question for question in root.questions or (root,)}
+        if set(questions) != set(per_slot):
+            raise MoodleProtocolError("Moodle Quiz final answer collection changed")
+        for slot, item in per_slot.items():
+            question = await self._read_quiz_question(page, context, item, questions[slot])
+            if item.answer_transport not in question.available_transports or not (
+                await self._quiz_answer_matches(
+                    page,
+                    item,
+                    question,
+                    artifacts[slot],
+                    allow_named_attachment=True,
+                    require_verified_match=True,
+                )
+            ):
+                raise MoodleProtocolError("Moodle Quiz answer changed before finalization retry")
+        summary_url = f"{self.settings.base_url}/mod/quiz/summary.php?" + urlencode(
+            {"attempt": request.expected_attempt_id, "cmid": request.cmid}
+        )
+        markup = await self._goto(page, summary_url)
+        await self._require_authenticated_page(context, markup)
+        summary = parse_summary_page(
+            markup,
+            page.url,
+            base_url=self.settings.base_url,
+            course_id=request.course_id,
+            cmid=request.cmid,
+            attempt_id=request.expected_attempt_id,
+        )
+        await self._finalize_quiz_attempt(page, context, per_slot[min(per_slot, key=int)], summary)
+
+    async def _reconcile_final_quiz_answers(
+        self,
+        page: Page,
+        context: BrowserContext,
+        request: QuizAnswersSyncRequest,
+        per_slot: dict[str, QuizEssaySyncRequest],
+        artifacts: dict[str, bytes],
+    ) -> None:
+        """Recover a lost final receipt only from exact, complete remote answers."""
+        try:
+            # Read the authenticated student's own profile, not a profile link
+            # for an arbitrary person that might appear in a review table.
+            profile = await self._goto(page, f"{self.settings.base_url}/user/profile.php")
+            await self._require_authenticated_page(context, profile)
+            identity = parse_identity(profile, self.settings.base_url)
+            actor_id = identity["external_subject"]
+            location = urlsplit(page.url)
+            if location.path.rstrip("/") != "/user/profile.php" or parse_qs(location.query).get(
+                "id"
+            ) not in (None, [actor_id]):
+                raise MoodleProtocolError("Moodle own-profile identity could not be confirmed")
+            url = f"{self.settings.base_url}/mod/quiz/review.php?" + urlencode(
+                {
+                    "attempt": request.expected_attempt_id,
+                    "cmid": request.cmid,
+                    "showall": 1,
+                }
+            )
+            markup = await self._goto(page, url)
+            await self._require_authenticated_page(context, markup)
+            validate_final_page(
+                markup,
+                page.url,
+                base_url=self.settings.base_url,
+                course_id=request.course_id,
+                cmid=request.cmid,
+                attempt_id=request.expected_attempt_id,
+            )
+            if urlsplit(page.url).path.rstrip("/") != "/mod/quiz/review.php":
+                raise MoodleProtocolError("Moodle does not expose the finalized attempt answers")
+            soup = BeautifulSoup(markup, "html.parser")
+            states: list[str] = []
+            for row in soup.select("table.quizreviewsummary tr"):
+                cells = row.select(":scope > th, :scope > td")
+                if len(cells) == 2 and cells[0].get_text(" ", strip=True).casefold() in {
+                    "state",
+                    "состояние",
+                }:
+                    states.append(cells[1].get_text(" ", strip=True).casefold())
+            if len(states) != 1 or states[0] not in {
+                "finished",
+                "completed",
+                "завершен",
+                "завершён",
+                "завершена",
+                "завершено",
+                "завершены",
+            }:
+                raise MoodleProtocolError("Moodle review does not confirm a finalized attempt")
+            detail = await self._historical_quiz_review_detail(
+                page,
+                context,
+                markup,
+                page.url,
+                course_id=request.course_id,
+                cmid=request.cmid,
+                attempt_id=request.expected_attempt_id,
+                user_id=actor_id,
+                require_complete_answers=True,
+            )
+            responses = detail.get("responses", [])
+            by_slot = {str(response.get("response_id", "")): response for response in responses}
+            if (
+                detail.get("responses_complete") is not True
+                or len(by_slot) != len(responses)
+                or set(by_slot) != set(per_slot)
+            ):
+                raise MoodleProtocolError("Moodle finalized answer collection is incomplete")
+            for slot, item in per_slot.items():
+                response = by_slot[slot]
+                if response.get("answer_complete") is not True:
+                    raise MoodleProtocolError("Moodle finalized answer is not readable")
+                if item.answer_transport == "ESSAY_ATTACHMENT":
+                    links = response.get("_artifact_links", [])
+                    matching = tuple(
+                        (str(link.get("filename", "")), str(link.get("url", "")))
+                        for link in links
+                        if link.get("filename") == item.artifact.filename
+                    )
+                    if not matching or not await self._verify_quiz_managed_file_if_exposed(
+                        page,
+                        filename=item.artifact.filename,
+                        expected_sha256=item.artifact.sha256,
+                        attachment_urls=matching,
+                    ):
+                        raise MoodleProtocolError("Moodle finalized attachment cannot be verified")
+                else:
+
+                    def normalize(value: str) -> str:
+                        value = (
+                            value.replace("\r\n", "\n").replace("\r", "\n").replace("\xa0", " ")
+                        )
+                        return _trim_empty_boundary_lines(value, maximum=max(len(value), 1))
+
+                    if normalize(str(response.get("answer_text", ""))) != normalize(
+                        artifacts[slot].decode("utf-8")
+                    ):
+                        raise MoodleProtocolError(
+                            "Moodle finalized answer differs from the submitted bundle"
+                        )
+        except (MoodleMarkupError, MoodleProtocolError) as exc:
+            raise MoodleProtocolError(
+                "Moodle attempt is finalized, but its complete answer bundle could not be "
+                "verified. Student review access is required; no answers were overwritten."
+            ) from exc
+
+    async def _quiz_answer_matches(
+        self,
+        page: Page,
+        request: QuizEssaySyncRequest,
+        question: QuizAttempt,
+        artifact: bytes,
+        *,
+        allow_named_attachment: bool = False,
+        require_verified_match: bool = False,
+    ) -> bool:
+        if request.answer_transport == "ESSAY_ONLINE_TEXT":
+            return await self._quiz_online_text_matches(
+                page,
+                question,
+                artifact.decode("utf-8"),
+                question_scoped=True,
+            )
+        if request.artifact.filename not in question.existing_filenames:
+            return False
+        urls = [
+            (name, url)
+            for name, url in question.attachment_urls
+            if name == request.artifact.filename
+        ]
+        if not urls:
+            target = await self._quiz_attachment_download_url(
+                page,
+                question_slot=question.question_slot,
+                filename=request.artifact.filename,
+            )
+            if target:
+                urls = [(request.artifact.filename, target)]
+        if urls:
+            try:
+                return await self._verify_quiz_managed_file_if_exposed(
+                    page,
+                    filename=request.artifact.filename,
+                    expected_sha256=request.artifact.sha256,
+                    attachment_urls=tuple(urls),
+                )
+            except MoodleProtocolError:
+                if require_verified_match:
+                    raise
+                return False
+        return allow_named_attachment and not require_verified_match
+
+    async def _quiz_attachment_download_url(
+        self,
+        page: Page,
+        *,
+        question_slot: str,
+        filename: str,
+    ) -> str | None:
+        """Read a lazy draft download target without changing or saving a file.
+
+        Moodle's loaded manager may expose only href="#". Its file details
+        Download button is then the only browser-visible source of the exact
+        draft URL. Contexts keep accept_downloads=False; only that URL is used
+        by the bounded same-origin hash verifier afterwards.
+        """
+        manager = page.locator(f"{essay_slot_selector(question_slot)} .filemanager")
+        label = manager.locator(".fp-filename:visible").filter(
+            has_text=re.compile(rf"^{re.escape(filename)}$")
+        )
+        if await label.count() == 0:
+            # Some themes expose filename metadata but no usable details UI.
+            return None
+        if await manager.count() != 1 or await label.count() != 1:
+            raise MoodleProtocolError("Moodle attachment details target is ambiguous")
+        dialogues = page.locator(".moodle-dialogue:visible")
+        if await dialogues.count() != 0:
+            raise MoodleProtocolError("Moodle already has an open file dialogue")
+        opened = False
+        download = None
+        try:
+            await label.click()
+            opened = True
+            dialogue = await self._wait_for_unique_locator(
+                dialogues,
+                detail="Moodle attachment details dialogue is ambiguous",
+                visible=True,
+            )
+            trigger = await self._wait_for_unique_locator(
+                dialogue.locator(".fp-file-download"),
+                detail="Moodle attachment download control is ambiguous",
+                visible=True,
+            )
+            async with page.expect_download(
+                timeout=self.settings.navigation_timeout_ms
+            ) as pending:
+                await trigger.click()
+            download = await pending.value
+            if download.suggested_filename != filename:
+                raise MoodleProtocolError("Moodle attachment download filename changed")
+            # Do not persist downloads or relax the context's download policy.
+            # The existing verifier validates origin/path/name before GET.
+            return download.url
+        except MoodleProtocolError:
+            raise
+        except (PlaywrightTimeoutError, PlaywrightError) as exc:
+            raise BrowserUnavailable("Moodle attachment download target is unavailable") from exc
+        finally:
+            if download is not None:
+                with suppress(PlaywrightError):
+                    await download.cancel()
+            if opened and await dialogues.count() == 1:
+                cancel = dialogues.locator(".fp-file-cancel")
+                if await cancel.count() == 1 and await cancel.is_visible():
+                    await cancel.click()
+                    await dialogues.wait_for(
+                        state="hidden", timeout=self.settings.navigation_timeout_ms
+                    )
+
+    async def _save_quiz_question_page(
+        self,
+        page: Page,
+        context: BrowserContext,
+        request: QuizEssaySyncRequest,
+        question: QuizAttempt,
+    ) -> None:
+        """Next saves this page; it may open another question, not only Summary."""
+        next_nav = await self._one_visible(page, NEXT_NAV_SELECTOR, "quiz page save")
+        await next_nav.click()
+        await self._wait_for_document(page)
+        markup = await page.content()
+        await self._require_authenticated_page(context, markup)
+        if self._quiz_attempt_is_finalized_page(markup, page.url, request, question.attempt_id):
+            raise MoodleAttemptFinalized(
+                "The bound Moodle Quiz attempt was finalized while saving"
+            )
+        target = urlsplit(page.url)
+        query = parse_qs(target.query)
+        if (
+            target.path.rstrip("/") not in {"/mod/quiz/attempt.php", "/mod/quiz/summary.php"}
+            or query.get("attempt") != [question.attempt_id]
+            or query.get("cmid") not in (None, [str(request.cmid)])
+        ):
+            raise MoodleProtocolError("Moodle Quiz page save changed attempt")
+
     async def prepare_quiz_essay(
         self,
         request: QuizEssayPrepareRequest,
@@ -2928,8 +3853,10 @@ class MoodleBrowserService:
 
         async with self._student_session_operation(input_state):
             # Starting/resuming the live attempt is user-facing foreground I/O.
-            async with self._operation(foreground=True) as browser:
-                context = await self._new_context(browser, storage_state=input_state)
+            async with self._operation(foreground=True, student=True, lightweight=True) as browser:
+                context = await self._new_context(
+                    browser, storage_state=input_state, html_only=True
+                )
                 try:
                     page = await context.new_page()
                     attempt = await self._open_real_quiz_attempt(
@@ -2937,7 +3864,8 @@ class MoodleBrowserService:
                         context,
                         request,
                     )
-                    if not attempt.question_text:
+                    questions = attempt.questions or (attempt,)
+                    if any(not question.question_text for question in questions):
                         raise MoodleProtocolError(
                             "Moodle Essay attempt did not expose the selected question text"
                         )
@@ -2965,6 +3893,21 @@ class MoodleBrowserService:
                         "answer_transport": selected,
                         "available_answer_transports": available,
                         "remaining_seconds": attempt.remaining_seconds,
+                        "questions": [
+                            {
+                                "question_slot": question.question_slot,
+                                "question_text": question.question_text,
+                                "answer_transport": (
+                                    "ESSAY_ATTACHMENT"
+                                    if "ESSAY_ATTACHMENT" in question.available_transports
+                                    else "ESSAY_ONLINE_TEXT"
+                                ),
+                                "available_answer_transports": list(question.available_transports),
+                                "page": question.page,
+                                "question_max_mark": question.question_max_mark,
+                            }
+                            for question in questions
+                        ],
                     },
                     "storage_state": state,
                 }
@@ -3197,14 +4140,7 @@ class MoodleBrowserService:
                     attachment_urls=attachment_urls,
                 )
             await add_buttons.click()
-            repository = page.get_by_text(re.compile(r"^(?:Upload a file|Загрузить файл)$", re.I))
-            await (
-                await self._wait_for_unique_locator(
-                    repository,
-                    detail="Moodle upload repository is ambiguous",
-                    visible=True,
-                )
-            ).click()
+            await self._select_upload_repository(page)
             inputs = page.locator(
                 ".file-picker:visible input[type='file'], "
                 ".filepicker:visible input[type='file'], "
@@ -3366,7 +4302,7 @@ class MoodleBrowserService:
             if await save.count() != 1:
                 raise MoodleProtocolError("Moodle assignment save trigger changed")
             await save.click()
-            await page.wait_for_load_state("domcontentloaded")
+            await self._wait_for_document(page)
             html = await page.content()
         except MoodleProtocolError:
             raise
@@ -3423,7 +4359,7 @@ class MoodleBrowserService:
             form = await self._assignment_action_form(page, "submit", request.cmid)
             trigger = await self._assignment_action_trigger(form)
             await trigger.click()
-            await page.wait_for_load_state("domcontentloaded")
+            await self._wait_for_document(page)
             html = await page.content()
             await self._require_authenticated_page(context, html)
             try:
@@ -3459,7 +4395,7 @@ class MoodleBrowserService:
                     await statements.check()
                 trigger = await self._assignment_action_trigger(form)
                 await trigger.click()
-                await page.wait_for_load_state("domcontentloaded")
+                await self._wait_for_document(page)
                 html = await page.content()
                 await self._require_authenticated_page(context, html)
             final = parse_assignment_view_page(
@@ -3529,15 +4465,6 @@ class MoodleBrowserService:
                 "Moodle essay response format no longer matches the imported activity"
             )
         if request.answer_transport == "ESSAY_ATTACHMENT":
-            if (
-                request.previous_managed_filename is not None
-                and request.previous_managed_filename != request.artifact.filename
-                and request.previous_managed_filename in attempt.existing_filenames
-            ):
-                raise MoodleProtocolError(
-                    "Moodle managed artifact filename changed and safe replacement "
-                    "requires manual removal of the previous attachment"
-                )
             await self._replace_quiz_attachment(
                 page,
                 request.artifact.filename,
@@ -3547,6 +4474,7 @@ class MoodleBrowserService:
                 attachment_urls=attempt.attachment_urls,
                 previous_managed_filename=request.previous_managed_filename,
                 previous_managed_sha256=request.previous_managed_sha256,
+                question_slot=attempt.question_slot,
             )
         else:
             await self._replace_quiz_online_text(page, attempt, artifact)
@@ -3762,6 +4690,40 @@ class MoodleBrowserService:
         ):
             raise MoodleSessionExpired("Moodle browser session expired")
 
+    async def _open_bound_quiz_attempt(
+        self,
+        page: Page,
+        context: BrowserContext,
+        request: QuizEssayPrepareRequest,
+    ) -> QuizAttempt:
+        """Read an already-bound attempt without starting/resuming it again.
+
+        Launch is only necessary during preparation. Replaying the start form
+        for every checkpoint adds two navigations (and may update Moodle's
+        current page). All writes here already carry the immutable attempt id;
+        the exact attempt page and its complete slot navigation are the proof.
+        """
+        if request.expected_attempt_id is None or request.expected_question_slot is None:
+            raise MoodleContractError("Moodle Quiz synchronization requires a bound attempt")
+        url = f"{self.settings.base_url}/mod/quiz/attempt.php?" + urlencode(
+            {"attempt": request.expected_attempt_id, "cmid": request.cmid, "page": 0}
+        )
+        markup = await self._goto(page, url)
+        await self._require_authenticated_page(context, markup)
+        if self._quiz_attempt_is_finalized_page(
+            markup, page.url, request, request.expected_attempt_id
+        ):
+            raise MoodleAttemptFinalized("The bound Moodle Quiz attempt is already finalized")
+        questions = await self._collect_quiz_attempt_questions(
+            page, context, request, markup, metadata_only=True
+        )
+        selected = next(
+            (q for q in questions if q.question_slot == request.expected_question_slot), None
+        )
+        if selected is None or selected.attempt_id != request.expected_attempt_id:
+            raise MoodleProtocolError("Moodle attempt question identity changed")
+        return replace(selected, questions=questions)
+
     async def _open_real_quiz_attempt(
         self,
         page: Page,
@@ -3795,16 +4757,11 @@ class MoodleBrowserService:
         except MoodleMarkupError as exc:
             self._raise_quiz_markup(exc)
             raise AssertionError("unreachable") from exc
+        # An ambiguous/missing DOM trigger is a protocol error, NOT proof
+        # that Moodle has finished/deleted the bound attempt.
+        await self._activate_quiz_launch(page, launch)
         try:
-            await self._activate_quiz_launch(page, launch)
-        except MoodleProtocolError as exc:
-            if request.expected_attempt_id is not None:
-                raise MoodleAttemptFinalized(
-                    "The bound Moodle Quiz attempt stopped being available before opening"
-                ) from exc
-            raise
-        try:
-            await page.wait_for_load_state("domcontentloaded")
+            await self._wait_for_document(page)
             await page.locator(ESSAY_SELECTOR).first.wait_for(
                 state="attached",
                 timeout=self.settings.navigation_timeout_ms,
@@ -3826,13 +4783,20 @@ class MoodleBrowserService:
             raise BrowserUnavailable("Moodle quiz attempt did not open") from exc
         await self._require_authenticated_page(context, attempt_html)
         try:
-            attempt = parse_attempt_page(
-                attempt_html,
-                page.url,
-                base_url=self.settings.base_url,
-                course_id=request.course_id,
-                cmid=request.cmid,
+            questions = await self._collect_quiz_attempt_questions(
+                page, context, request, attempt_html
             )
+            if isinstance(request, QuizEssaySyncRequest) and len(questions) != 1:
+                raise MoodleProtocolError("Multi-question Moodle Quiz requires batch answer sync")
+            selected = next(
+                (
+                    question
+                    for question in questions
+                    if question.question_slot == request.expected_question_slot
+                ),
+                questions[0],
+            )
+            attempt = replace(selected, questions=questions)
         except MoodleMarkupError as exc:
             self._raise_quiz_markup(exc)
             raise AssertionError("unreachable") from exc
@@ -3844,6 +4808,183 @@ class MoodleBrowserService:
                 "The bound Moodle Quiz attempt can no longer be edited safely"
             )
         return attempt
+
+    async def _collect_quiz_attempt_questions(
+        self,
+        page: Page,
+        context: BrowserContext,
+        request: QuizEssayPrepareRequest | QuizEssaySyncRequest,
+        initial_html: str,
+        *,
+        metadata_only: bool = False,
+    ) -> tuple[QuizAttempt, ...]:
+        initial_url = page.url
+        initial = parse_attempt_questions(
+            initial_html,
+            initial_url,
+            base_url=self.settings.base_url,
+            course_id=request.course_id,
+            cmid=request.cmid,
+        )
+        attempt_id = initial[0].attempt_id
+        if request.expected_attempt_id is not None and attempt_id != request.expected_attempt_id:
+            raise MoodleProtocolError("Moodle attempt identity changed")
+        navigation = quiz_attempt_navigation(
+            initial_html,
+            base_url=self.settings.base_url,
+            cmid=request.cmid,
+            attempt_id=attempt_id,
+            current_url=initial_url,
+        )
+        collected = {question.question_slot: question for question in initial}
+        initial_page = initial[0].page
+        for page_number in sorted(set(navigation.values()) - {initial_page}):
+            url = f"{self.settings.base_url}/mod/quiz/attempt.php?" + urlencode(
+                {"attempt": attempt_id, "cmid": request.cmid, "page": page_number}
+            )
+            if metadata_only:
+                # Other pages are needed here only to validate the complete
+                # slot/transport contract, not to initialize their editors.
+                # Read bounded same-origin HTML without discarding the first
+                # page or loading every page's JS/CSS/file manager twice.
+                markup = await self._read_quiz_metadata_page(page, url)
+                document_url = url
+            else:
+                markup = await self._goto(page, url)
+                document_url = page.url
+            await self._require_authenticated_page(context, markup)
+            questions = parse_attempt_questions(
+                markup,
+                document_url,
+                base_url=self.settings.base_url,
+                course_id=request.course_id,
+                cmid=request.cmid,
+            )
+            page_navigation = quiz_attempt_navigation(
+                markup,
+                base_url=self.settings.base_url,
+                cmid=request.cmid,
+                attempt_id=attempt_id,
+                current_url=document_url,
+            )
+            if page_navigation != navigation:
+                raise MoodleProtocolError("Moodle attempt question navigation changed")
+            for question in questions:
+                if (
+                    question.attempt_id != attempt_id
+                    or question.page != page_number
+                    or question.question_slot in collected
+                ):
+                    raise MoodleProtocolError("Moodle attempt question identity changed")
+                collected[question.question_slot] = question
+        if navigation and (
+            set(navigation) != set(collected)
+            or any(navigation[slot] != question.page for slot, question in collected.items())
+        ):
+            raise MoodleProtocolError("Moodle attempt question collection is incomplete")
+        if len(collected) > 32:
+            raise MoodleProtocolError("Moodle attempt has too many questions")
+        # Legacy one-question writes expect the original response page to remain active.
+        if page.url != initial_url:
+            await self._goto(page, initial_url)
+        return tuple(collected[slot] for slot in sorted(collected, key=int))
+
+    async def _read_quiz_metadata_page(self, page: Page, url: str) -> str:
+        """Read only a quiz's server-rendered question contract, never its files."""
+        maximum_bytes = 2 * 1024 * 1024
+        result = await page.evaluate(
+            _LOGIN_ROLE_FETCH_SCRIPT,
+            {"url": url, "timeoutMs": self.settings.navigation_timeout_ms,
+             "maxBytes": maximum_bytes},
+        )
+        if not isinstance(result, dict) or result.get("error"):
+            raise BrowserUnavailable("Moodle Quiz question metadata is unavailable")
+        status = result.get("status")
+        if isinstance(status, int) and status >= 500:
+            raise BrowserUnavailable("Moodle returned a server error")
+        if (
+            status != 200 or result.get("url") != url or result.get("tooLarge")
+            or not isinstance(result.get("html"), str)
+            or len(result["html"].encode("utf-8")) > maximum_bytes
+        ):
+            raise MoodleProtocolError("Moodle Quiz question metadata response changed")
+        return result["html"]
+
+    async def _read_quiz_question(
+        self,
+        page: Page,
+        context: BrowserContext,
+        request: QuizEssaySyncRequest,
+        question: QuizAttempt,
+        *,
+        reuse_current_page: bool = False,
+    ) -> QuizAttempt:
+        url = f"{self.settings.base_url}/mod/quiz/attempt.php?" + urlencode(
+            {"attempt": question.attempt_id, "cmid": request.cmid, "page": question.page}
+        )
+        current = urlsplit(page.url)
+        query = parse_qs(current.query, keep_blank_values=True)
+        same_page = (
+            f"{current.scheme}://{current.netloc}" == self.settings.base_url
+            and current.path == "/mod/quiz/attempt.php"
+            and query.get("attempt") == [question.attempt_id]
+            and query.get("cmid") in (None, [str(request.cmid)])
+            and query.get("page", ["0"]) == [str(question.page)]
+        )
+        markup = (
+            await page.content()
+            if reuse_current_page and same_page
+            else await self._goto(page, url)
+        )
+        await self._require_authenticated_page(context, markup)
+        if self._quiz_attempt_is_finalized_page(markup, page.url, request, question.attempt_id):
+            raise MoodleAttemptFinalized("The bound Moodle Quiz attempt is already finalized")
+        selector = essay_slot_selector(question.question_slot)
+        await page.locator(selector).wait_for(
+            state="attached",
+            timeout=self.settings.navigation_timeout_ms,
+        )
+        # Moodle populates the question's file list asynchronously. Inspect
+        # its ready DOM, not the initial empty file-manager shell.
+        native_upload = getattr(context, "_eduprog_quiz_native_upload", False) is True
+        if "ESSAY_ATTACHMENT" in question.available_transports and not native_upload:
+            await page.wait_for_function(
+                "selector => { const managers = document.querySelectorAll("
+                "selector + ' .filemanager'); if (managers.length !== 1) return false; "
+                "const classes = managers[0].classList; "
+                "return classes.contains('fm-loaded') && !classes.contains('fm-loading') "
+                "&& !classes.contains('fm-updating'); }",
+                arg=selector,
+                timeout=self.settings.navigation_timeout_ms,
+            )
+        markup = await page.content()
+        try:
+            result = parse_attempt_page(
+                markup,
+                page.url,
+                base_url=self.settings.base_url,
+                course_id=request.course_id,
+                cmid=request.cmid,
+                question_slot=question.question_slot,
+            )
+        except MoodleMarkupError as exc:
+            self._raise_quiz_markup(exc)
+            raise AssertionError("unreachable") from exc
+        if (
+            result.attempt_id != question.attempt_id
+            or result.page != question.page
+            or result.available_transports != question.available_transports
+        ):
+            raise MoodleProtocolError("Moodle question response identity changed")
+        if native_upload and "ESSAY_ATTACHMENT" in result.available_transports:
+            draft = parse_essay_draft(
+                markup, base_url=self.settings.base_url, cmid=request.cmid, question=result,
+            )
+            result = replace(
+                result, existing_filenames=tuple(name for name, _ in draft.files),
+                attachment_urls=draft.files,
+            )
+        return result
 
     async def _activate_quiz_launch(self, page: Page, launch: QuizLaunch) -> None:
         try:
@@ -3859,6 +5000,10 @@ class MoodleBrowserService:
                     raise MoodleProtocolError("Moodle quiz start trigger changed")
                 await triggers.click()
                 if launch.requires_preflight:
+                    # A native POST may commit before its HTML is fully parsed.
+                    # The preflight form can already exist while its submit
+                    # button has not arrived yet (especially on repeat attempts).
+                    await self._wait_for_document(page)
                     preflight = page.locator(QUIZ_PREFLIGHT_FORM_SELECTOR)
                     await preflight.wait_for(
                         state="visible",
@@ -3888,6 +5033,8 @@ class MoodleBrowserService:
         page: Page,
         attempt: QuizAttempt,
         artifact: bytes,
+        *,
+        question_scoped: bool = False,
     ) -> None:
         """Put source code into the one Essay response editor without reformatting it."""
 
@@ -3903,8 +5050,11 @@ class MoodleBrowserService:
         if not control_name:
             raise MoodleProtocolError("Moodle essay online-text control is missing")
         try:
-            essays = page.locator(ESSAY_SELECTOR)
-            textarea = page.locator(f"{ESSAY_SELECTOR} textarea[name='{control_name}']")
+            selector = (
+                essay_slot_selector(attempt.question_slot) if question_scoped else ESSAY_SELECTOR
+            )
+            essays = page.locator(selector)
+            textarea = page.locator(f"{selector} textarea[name='{control_name}']")
             if await essays.count() != 1 or await textarea.count() != 1:
                 raise MoodleProtocolError("Moodle essay online-text control changed")
 
@@ -3945,7 +5095,9 @@ class MoodleBrowserService:
                     {"html": html_source},
                 )
 
-            if not await self._quiz_online_text_matches(page, attempt, source):
+            if not await self._quiz_online_text_matches(
+                page, attempt, source, question_scoped=question_scoped
+            ):
                 raise MoodleProtocolError("Moodle did not accept the Essay source text")
         except (MoodleContractError, MoodleProtocolError):
             raise
@@ -3957,11 +5109,16 @@ class MoodleBrowserService:
         page: Page,
         attempt: QuizAttempt,
         expected: str,
+        *,
+        question_scoped: bool = False,
     ) -> bool:
         control_name = attempt.online_text_control_name
         if not control_name:
             return False
-        textarea = page.locator(f"{ESSAY_SELECTOR} textarea[name='{control_name}']")
+        selector = (
+            essay_slot_selector(attempt.question_slot) if question_scoped else ESSAY_SELECTOR
+        )
+        textarea = page.locator(f"{selector} textarea[name='{control_name}']")
         if await textarea.count() != 1:
             return False
         stored = await textarea.input_value()
@@ -3971,6 +5128,80 @@ class MoodleBrowserService:
             rendered = BeautifulSoup(stored, "html.parser").get_text()
             return rendered.replace("\r\n", "\n") == expected.replace("\r\n", "\n")
         return False
+
+    async def _upload_quiz_draft(
+        self, page: Page, *, filename: str, artifact: bytes, question_slot: str | None,
+        previous_managed_filename: str | None, previous_managed_sha256: str | None,
+    ) -> None:
+        """Upload through the exact Essay's native student draft-file endpoint.
+
+        The page is script-free: no AMD/Atto/YUI initialization, popup races or
+        30-second file-manager-ready waits. Save and Finish still use Moodle's
+        actual response forms, and the caller re-downloads every saved answer.
+        """
+        started = asyncio.get_running_loop().time()
+        stage = "draft_contract"
+        try:
+            binding = getattr(page, "_eduprog_quiz_binding", None)
+            if not isinstance(binding, tuple) or len(binding) != 3 or question_slot is None:
+                raise MoodleProtocolError("Moodle native upload has no bound attempt")
+            course_id, cmid, attempt_id = binding
+            markup = await page.content()
+            question = parse_attempt_page(
+                markup, page.url, base_url=self.settings.base_url,
+                course_id=course_id, cmid=cmid, question_slot=question_slot,
+            )
+            if question.attempt_id != attempt_id:
+                raise MoodleProtocolError("Moodle native upload attempt changed")
+            draft = parse_essay_draft(
+                markup, base_url=self.settings.base_url, cmid=cmid, question=question,
+            )
+            names = tuple(name for name, _ in draft.files)
+            overwrite = _managed_target_replace_existing(
+                names, filename, previous_managed_filename,
+            )
+            old_present = previous_managed_filename in names
+            stage = "verify_previous_draft"
+            if overwrite or old_present:
+                if not previous_managed_sha256 or not previous_managed_filename:
+                    raise MoodleProtocolError("Moodle previous artifact ownership is unproven")
+                await self._verify_quiz_managed_file_if_exposed(
+                    page, filename=previous_managed_filename,
+                    expected_sha256=previous_managed_sha256, attachment_urls=draft.files,
+                )
+            stage = "upload_draft"
+            result = await draft_request(
+                page.request, base_url=self.settings.base_url, draft=draft,
+                action="upload", filename=filename, artifact=artifact,
+                mime_type=self._artifact_mime_type(filename), overwrite=overwrite,
+                timeout_ms=self.settings.navigation_timeout_ms,
+            )
+            stage = "verify_uploaded_draft"
+            await self._verify_quiz_managed_file_if_exposed(
+                page, filename=filename, expected_sha256=hashlib.sha256(artifact).hexdigest(),
+                attachment_urls=((filename, result["url"]),),
+            )
+            if old_present and previous_managed_filename != filename:
+                # Only the proven old managed ROOT file, after the replacement
+                # is uploaded and verified. Never clear a whole draft area.
+                stage = "remove_previous_draft"
+                await draft_request(
+                    page.request, base_url=self.settings.base_url, draft=draft,
+                    action="delete", filename=previous_managed_filename,
+                    timeout_ms=self.settings.navigation_timeout_ms,
+                )
+        except DraftSessionExpired as exc:
+            raise MoodleSessionExpired(str(exc)) from exc
+        except MoodleMarkupError as exc:
+            raise MoodleProtocolError(str(exc)) from exc
+        except (DraftUnavailable, PlaywrightError, PlaywrightTimeoutError) as exc:
+            _LOGGER.warning(
+                "Moodle artifact upload interrupted transport=native "
+                "stage=%s slot=%s elapsed_ms=%d",
+                stage, question_slot,
+                round((asyncio.get_running_loop().time() - started) * 1_000),
+            )
+            raise BrowserUnavailable(f"Moodle artifact upload failed: stage={stage}") from exc
 
     async def _replace_quiz_attachment(
         self,
@@ -3983,11 +5214,26 @@ class MoodleBrowserService:
         attachment_urls: tuple[tuple[str, str], ...] = (),
         previous_managed_filename: str | None = None,
         previous_managed_sha256: str | None = None,
+        question_slot: str | None = None,
     ) -> None:
+        if getattr(getattr(page, "context", None), "_eduprog_quiz_native_upload", False) is True:
+            await self._upload_quiz_draft(
+                page, filename=filename, artifact=artifact, question_slot=question_slot,
+                previous_managed_filename=previous_managed_filename,
+                previous_managed_sha256=previous_managed_sha256,
+            )
+            return
+        started = asyncio.get_running_loop().time()
+        stage = "file_manager"
         try:
-            essays = page.locator(ESSAY_SELECTOR)
-            managers = page.locator(FILEMANAGER_SELECTOR)
-            add_buttons = page.locator(FILE_ADD_SELECTOR)
+            if not artifact:
+                raise MoodleProtocolError(
+                    "Moodle upload rejected: upload_error_invalid_file"
+                )
+            selector = essay_slot_selector(question_slot) if question_slot else ESSAY_SELECTOR
+            essays = page.locator(selector)
+            managers = page.locator(f"{selector} .filemanager")
+            add_buttons = page.locator(f"{selector} .filemanager .fp-btn-add")
             if (
                 await essays.count() != 1
                 or await managers.count() != 1
@@ -3995,26 +5241,22 @@ class MoodleBrowserService:
             ):
                 raise MoodleProtocolError("Moodle essay file manager changed")
             manager = managers.first
-            if (
+            remove_previous = (
                 previous_managed_filename is not None
                 and previous_managed_filename != filename
                 and (
                     await manager.get_by_text(
                         previous_managed_filename,
                         exact=True,
-                    ).count()
+                    ).filter(visible=True).count()
                     > 0
                     or await manager.locator(
-                        f'[data-filename="{previous_managed_filename}"], '
-                        f'[title="{previous_managed_filename}"]'
+                        f'[data-filename="{previous_managed_filename}"]:visible, '
+                        f'[title="{previous_managed_filename}"]:visible'
                     ).count()
                     > 0
                 )
-            ):
-                raise MoodleProtocolError(
-                    "Moodle managed artifact filename changed and safe replacement "
-                    "requires manual removal of the previous attachment"
-                )
+            )
             parsed_replace_existing = _managed_target_replace_existing(
                 existing_filenames,
                 filename,
@@ -4023,9 +5265,9 @@ class MoodleBrowserService:
             # Parsing the server-rendered file list and checking the live DOM
             # protect against a lazy file-manager rendering an existing stable
             # filename after the attempt page itself was parsed.
-            existing_text = manager.get_by_text(filename, exact=True)
+            existing_text = manager.get_by_text(filename, exact=True).filter(visible=True)
             existing_metadata = manager.locator(
-                f'[data-filename="{filename}"], [title="{filename}"]'
+                f'[data-filename="{filename}"]:visible, [title="{filename}"]:visible'
             )
             live_target = await existing_text.count() > 0 or await existing_metadata.count() > 0
             if live_target and previous_managed_filename != filename:
@@ -4042,22 +5284,37 @@ class MoodleBrowserService:
                     "Moodle artifact target already exists but connector ownership is unproven"
                 )
             if receipt_owns_target:
+                if question_slot is not None and not any(
+                    name == filename for name, _url in attachment_urls
+                ):
+                    lazy_target = await self._quiz_attachment_download_url(
+                        page,
+                        question_slot=question_slot,
+                        filename=filename,
+                    )
+                    if lazy_target:
+                        attachment_urls = (*attachment_urls, (filename, lazy_target))
                 remote_verified = await self._verify_quiz_managed_file_if_exposed(
                     page,
                     filename=filename,
                     expected_sha256=previous_managed_sha256,
                     attachment_urls=attachment_urls,
                 )
+            if remove_previous:
+                await self._remove_previous_quiz_attachment(
+                    page,
+                    manager,
+                    filename=previous_managed_filename,
+                    expected_sha256=previous_managed_sha256,
+                    attachment_urls=attachment_urls,
+                    question_slot=question_slot,
+                )
+            stage = "open_picker"
             await add_buttons.click()
+            stage = "select_repository"
+            await self._select_upload_repository(page)
 
-            repository = page.get_by_text(re.compile(r"^(?:Upload a file|Загрузить файл)$", re.I))
-            upload_repository = await self._wait_for_unique_locator(
-                repository,
-                detail="Moodle upload repository is ambiguous",
-                visible=True,
-            )
-            await upload_repository.click()
-
+            stage = "select_file"
             file_inputs = page.locator(
                 ".file-picker:visible input[type='file'], "
                 ".filepicker:visible input[type='file'], "
@@ -4094,31 +5351,20 @@ class MoodleBrowserService:
                 detail="Moodle upload button is ambiguous",
                 visible=True,
             )
-            await upload_button.click()
+            stage = "upload_response"
+            overwrite_required = await self._upload_repository_file(page, upload_button)
 
-            # Moodle asks for an explicit overwrite when the stable filename is
-            # already present. Check unconditionally: DOM text is not a reliable
-            # indicator when the file-manager renders icons lazily.
+            # Trust the completed upload response, not a 1.5-second guess:
+            # a slow upload may reveal an existing file only after that wait.
             overwrite = page.locator(f"{FILE_OVERWRITE_SELECTOR}:visible")
             overwrite_button: Locator | None = None
-            if replace_existing:
+            if overwrite_required:
+                stage = "overwrite_confirmation"
                 overwrite_button = await self._wait_for_unique_locator(
                     overwrite,
                     detail="Moodle overwrite confirmation is ambiguous",
                     visible=True,
                 )
-            else:
-                with suppress(MoodleProtocolError):
-                    overwrite_button = await self._wait_for_unique_locator(
-                        overwrite,
-                        detail="Moodle overwrite confirmation is ambiguous",
-                        visible=True,
-                        timeout_ms=(
-                            min(self.settings.navigation_timeout_ms, 5_000)
-                            if receipt_owns_target
-                            else 1_500
-                        ),
-                    )
             if overwrite_button is not None:
                 # Newer Moodle versions may render an empty file manager until
                 # upload time and reveal the existing stable filename only via
@@ -4142,7 +5388,8 @@ class MoodleBrowserService:
                     timeout=self.settings.navigation_timeout_ms,
                 )
 
-            file_label = manager.get_by_text(filename, exact=True)
+            stage = "file_visible"
+            file_label = manager.get_by_text(filename, exact=True).filter(visible=True)
             try:
                 await file_label.first.wait_for(
                     state="attached", timeout=self.settings.navigation_timeout_ms
@@ -4156,7 +5403,162 @@ class MoodleBrowserService:
         except MoodleProtocolError:
             raise
         except (PlaywrightTimeoutError, PlaywrightError) as exc:
-            raise BrowserUnavailable("Moodle artifact upload failed") from exc
+            # Fixed stage names only: Playwright's raw call log may contain
+            # student filenames, private URLs and session identifiers.
+            _LOGGER.warning(
+                "Moodle artifact upload interrupted slot=%s stage=%s elapsed_ms=%d",
+                question_slot, stage,
+                round((asyncio.get_running_loop().time() - started) * 1_000),
+            )
+            raise BrowserUnavailable(f"Moodle artifact upload failed: stage={stage}") from exc
+
+    async def _select_upload_repository(self, page: Page) -> None:
+        """Wait for the auto-selected repository before optionally switching it.
+
+        Moodle opens the most recently used repository when Add is clicked.
+        Clicking Upload immediately starts a *second* asynchronous list call.
+        Its response can recreate the form after set_input_files, clearing the
+        selected file. The following Upload click then sends nothing and our
+        response observer waits until timeout. This also affects Assignments.
+        """
+        repository = page.get_by_text(re.compile(r"^(?:Upload a file|Загрузить файл)$", re.I))
+        upload_repository = await self._wait_for_unique_locator(
+            repository, detail="Moodle upload repository is ambiguous", visible=True,
+        )
+        loading = page.locator(
+            ".file-picker:visible .fp-content-loading, "
+            ".filepicker:visible .fp-content-loading, "
+            ".moodle-dialogue:visible .fp-content-loading"
+        )
+        # Moodle initially hides the loading indicator. Waiting for 'hidden'
+        # can return early; only removal proves rendering finished.
+        await loading.first.wait_for(
+            state="detached", timeout=self.settings.navigation_timeout_ms,
+        )
+        selected = await upload_repository.evaluate("""element => {
+            const repository = element.closest('.fp-repo');
+            return !!repository && (repository.classList.contains('active') ||
+                repository.getAttribute('aria-selected') === 'true');
+        }""")
+        if not selected:
+            await upload_repository.click()
+            await loading.first.wait_for(
+                state="detached", timeout=self.settings.navigation_timeout_ms,
+            )
+
+    async def _upload_repository_file(self, page: Page, button: Locator) -> bool:
+        """Observe Moodle's actual upload response before waiting for its DOM.
+
+        Moodle returns repository failures (including empty files) with HTTP
+        200 and an error JSON body, sometimes with a text/html content type.
+        Waiting only for the filename hides that error for a full timeout and
+        repeats the same rejected upload on every delivery retry.
+        """
+        def is_upload(response: Any) -> bool:
+            target = urlsplit(response.url)
+            return (
+                f"{target.scheme}://{target.netloc}" == self.settings.base_url
+                and target.path == "/repository/repository_ajax.php"
+                and parse_qs(target.query).get("action") == ["upload"]
+                and response.request.method == "POST"
+            )
+
+        async with page.expect_response(
+            is_upload, timeout=self.settings.navigation_timeout_ms
+        ) as pending:
+            await button.click()
+        response = await pending.value
+        if not response.ok:
+            raise BrowserUnavailable(f"Moodle upload HTTP status {response.status}")
+        try:
+            result = await response.json()
+        except (ValueError, PlaywrightError) as exc:
+            raise MoodleProtocolError("Moodle upload returned invalid JSON") from exc
+        if not isinstance(result, dict):
+            raise MoodleProtocolError("Moodle upload returned invalid JSON")
+        if result.get("error") or result.get("errorcode"):
+            # Never include the raw Moodle error HTML, URLs or debug trace.
+            code = result.get("errorcode")
+            if code not in {
+                "upload_error_invalid_file", "invalidfiletype", "maxbytesfile",
+                "maxareabytes", "nofile", "uploadproblem", "invalidsesskey",
+            }:
+                code = "repository_error"
+            raise MoodleProtocolError(f"Moodle upload rejected: {code}")
+        return result.get("event") == "fileexists"
+
+    async def _remove_previous_quiz_attachment(
+        self,
+        page: Page,
+        manager: Locator,
+        *,
+        filename: str,
+        expected_sha256: str | None,
+        attachment_urls: tuple[tuple[str, str], ...],
+        question_slot: str | None,
+    ) -> None:
+        """Replace only a hash-verified managed file when its packaging changes.
+
+        Empty source is packaged as ZIP; editing it later can change the
+        managed filename back to main.cpp. Other student attachments must
+        survive that transition. The immutable source remains in the core
+        even if a later upload fails before the question is saved.
+        """
+        if expected_sha256 is None or question_slot is None:
+            raise MoodleProtocolError("Moodle previous artifact ownership is unproven")
+        if not any(name == filename for name, _url in attachment_urls):
+            target = await self._quiz_attachment_download_url(
+                page, question_slot=question_slot, filename=filename
+            )
+            if target:
+                attachment_urls = (*attachment_urls, (filename, target))
+        if not await self._verify_quiz_managed_file_if_exposed(
+            page, filename=filename, expected_sha256=expected_sha256,
+            attachment_urls=attachment_urls,
+        ):
+            raise MoodleProtocolError("Moodle previous artifact bytes could not be verified")
+        label = manager.locator(".fp-filename:visible").filter(
+            has_text=re.compile(rf"^{re.escape(filename)}$")
+        )
+        if await label.count() != 1:
+            raise MoodleProtocolError("Moodle previous artifact target is ambiguous")
+        await label.click()
+        dialogue = await self._wait_for_unique_locator(
+            page.locator(".moodle-dialogue:visible"),
+            detail="Moodle previous artifact dialogue is ambiguous", visible=True,
+        )
+        name_control = dialogue.locator(".fp-saveas input")
+        path_control = dialogue.locator(".fp-path select")
+        if (
+            await name_control.count() != 1
+            or await path_control.count() != 1
+            or await name_control.input_value() != filename
+            or await path_control.input_value() != "/"
+        ):
+            raise MoodleProtocolError("Moodle previous artifact is not the managed root file")
+        delete = await self._wait_for_unique_locator(
+            dialogue.locator(".fp-file-delete"),
+            detail="Moodle previous artifact delete control is ambiguous", visible=True,
+        )
+        await delete.click()
+        confirm = await self._wait_for_unique_locator(
+            page.locator(
+                "[role='dialog']:visible [data-action='save'], "
+                ".moodle-dialogue:visible .fp-dlg-butconfirm"
+            ),
+            detail="Moodle previous artifact delete confirmation is ambiguous", visible=True,
+        )
+        await confirm.click()
+        # Moodle retains hidden file-view DOM nodes after a refresh; detachment
+        # is not the deletion acknowledgement. Wait for the visible listing.
+        await label.wait_for(state="hidden", timeout=self.settings.navigation_timeout_ms)
+        await page.wait_for_function(
+            "selector => { const e = document.querySelector(selector); return e && "
+            "e.classList.contains('fm-loaded') && !e.classList.contains('fm-loading') "
+            "&& !e.classList.contains('fm-updating'); }",
+            arg=f"{essay_slot_selector(question_slot)} .filemanager",
+            timeout=self.settings.navigation_timeout_ms,
+        )
 
     async def _verify_quiz_managed_file_if_exposed(
         self,
@@ -4238,7 +5640,7 @@ class MoodleBrowserService:
             if await next_nav.count() != 1:
                 raise MoodleProtocolError("Moodle quiz save navigation is ambiguous")
             await next_nav.click()
-            await page.wait_for_load_state("domcontentloaded")
+            await self._wait_for_document(page)
             html = await page.content()
         except MoodleProtocolError:
             raise

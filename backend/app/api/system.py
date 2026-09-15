@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response,
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.auth.context import AuthContext, CurrentAuth, require_capability
 from app.core.config import Settings
@@ -31,6 +32,7 @@ from app.models.identity import (
 )
 from app.models.integration import AuditEntry, SyncOutbox, SystemSetting
 from app.models.review import ReviewDecision
+from app.models.tasks import Assessment
 from app.schemas.system import (
     ServiceHealthRead,
     SyncOutboxRead,
@@ -90,9 +92,7 @@ async def _settings_read(db: AsyncSession, settings: Settings) -> SystemSettings
     values = _default_values(settings)
     if row is not None:
         values.update(row.value)
-    ai_configured = settings.ai_mock_enabled or (
-        settings.ai_enabled and bool(settings.ai_api_key.get_secret_value())
-    )
+    ai_configured = settings.ai_provider_configured
     runner_configured = settings.runner_mock_enabled or bool(settings.runner_url)
     ai_enabled = ai_configured and bool(values["ai_enabled"])
     student_ai_enabled = ai_enabled and bool(values["student_ai_enabled"])
@@ -736,7 +736,7 @@ async def _require_outbox_access(
             )
 
 
-def _outbox_read(row: SyncOutbox) -> SyncOutboxRead:
+def _outbox_read(row: SyncOutbox, *, aggregate_title: str | None = None) -> SyncOutboxRead:
     return SyncOutboxRead(
         id=row.id,
         connection_id=row.connection_id,
@@ -745,6 +745,7 @@ def _outbox_read(row: SyncOutbox) -> SyncOutboxRead:
         event_type=row.event_type,
         aggregate_type=row.aggregate_type,
         aggregate_id=row.aggregate_id,
+        aggregate_title=aggregate_title,
         state=row.state,
         attempts=row.attempts,
         next_attempt_at=row.next_attempt_at,
@@ -768,6 +769,8 @@ async def list_sync_outbox(
     state: Annotated[SyncOutboxState | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
+    event_type: Annotated[str | None, Query(max_length=100)] = None,
+    latest_per_activity: Annotated[bool, Query()] = False,
 ) -> list[SyncOutboxRead]:
     statement = select(SyncOutbox)
     if not auth.has_capability("SYSTEM_SETTINGS"):
@@ -808,16 +811,37 @@ async def list_sync_outbox(
         )
     elif course_id is not None:
         statement = statement.where(SyncOutbox.course_id == course_id)
+    if event_type is not None:
+        statement = statement.where(SyncOutbox.event_type == event_type)
+    entity = SyncOutbox
+    if latest_per_activity and event_type == "moodle.history.import":
+        # Apply access filters BEFORE ranking. An old failed page completing
+        # late must not replace a newer import just because updated_at changed.
+        ranked = statement.add_columns(
+            func.row_number().over(
+                partition_by=(
+                    SyncOutbox.aggregate_id,
+                    SyncOutbox.payload["actor_external_subject"].as_string(),
+                ),
+                order_by=(SyncOutbox.created_at.desc(), SyncOutbox.id.desc()),
+            ).label("activity_rank")
+        ).subquery()
+        entity = aliased(SyncOutbox, ranked)
+        statement = select(entity).where(ranked.c.activity_rank == 1)
     if state is not None:
-        statement = statement.where(SyncOutbox.state == state.value)
+        statement = statement.where(entity.state == state.value)
     rows = list(
         (
             await db.scalars(
-                statement.order_by(SyncOutbox.created_at.desc()).limit(limit).offset(offset)
+                statement.order_by(entity.created_at.desc()).limit(limit).offset(offset)
             )
         ).all()
     )
-    return [_outbox_read(row) for row in rows]
+    assessment_ids = {row.aggregate_id for row in rows if row.aggregate_type == "Assessment"}
+    titles = dict((await db.execute(select(Assessment.id, Assessment.title).where(
+        Assessment.id.in_(assessment_ids),
+    ))).all()) if assessment_ids else {}
+    return [_outbox_read(row, aggregate_title=titles.get(row.aggregate_id)) for row in rows]
 
 
 @router.get("/integrations/lms/outbox/{event_id}", response_model=SyncOutboxRead)

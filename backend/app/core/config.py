@@ -107,10 +107,15 @@ class Settings(BaseSettings):
     evidence_rate_limit_reports: int = Field(default=5, ge=1, le=100)
     evidence_rate_limit_window_seconds: int = Field(default=300, ge=1, le=3_600)
     evidence_running_stale_seconds: int = Field(default=120, ge=60, le=3_600)
+    # Legacy fields retain their defaults. New LLM_* values override them below.
     ai_base_url: str = "https://api.openai.com/v1"
     ai_api_key: SecretStr = SecretStr("")
     ai_model: str = "gpt-5-mini"
-    ai_api_style: Literal["responses", "chat_completions"] = "responses"
+    llm_api_address: str | None = Field(default=None, validation_alias="LLM_API_ADDRESS")
+    llm_api_key: SecretStr | None = Field(default=None, validation_alias="LLM_API_KEY")
+    llm_model: str | None = Field(default=None, validation_alias="LLM_MODEL")
+    ai_api_style: Literal["auto", "responses", "chat_completions", "ollama"] = "responses"
+    llm_thinking: bool | None = None
     ai_timeout_seconds: float = Field(default=45, gt=0, le=600)
     ai_max_context_bytes: int = Field(default=256 * 1024, ge=1024)
     ai_max_response_bytes: int = Field(default=1024 * 1024, ge=1024)
@@ -126,6 +131,9 @@ class Settings(BaseSettings):
     moodle_launch_shared_secret: SecretStr = SecretStr("")
     moodle_credential_encryption_key: SecretStr = SecretStr("")
     moodle_http_timeout_seconds: float = Field(default=15, gt=0, le=300)
+    # Student editing ends this many seconds before the live Moodle Quiz timer.
+    # This is a submission reserve, not an HTTP request timeout.
+    moodle_sync_timeout: int = Field(default=300, ge=0, le=86_400)
     moodle_max_response_bytes: int = Field(default=4 * 1024 * 1024, ge=1024)
     moodle_browser_service_url: str = ""
     moodle_browser_shared_secret: SecretStr = SecretStr("")
@@ -169,6 +177,12 @@ class Settings(BaseSettings):
         ge=1,
         le=8,
         validation_alias="LMS_SYNC_WORKER_CONCURRENCY",
+    )
+    sync_terminal_concurrency: int = Field(
+        default=2,
+        ge=0,
+        le=8,
+        validation_alias="LMS_SYNC_TERMINAL_CONCURRENCY",
     )
     # The dedicated sync-worker remains the primary outbox consumer.  The web
     # process also keeps one narrow, terminal-checkpoint-only lane so a missing
@@ -240,6 +254,41 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_same_site(cls, value: object) -> object:
         return value.lower() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def resolve_llm_configuration(self) -> Settings:
+        if self.llm_api_address is not None:
+            self.ai_base_url = self.llm_api_address.strip()
+            if "ai_api_style" not in self.model_fields_set:
+                self.ai_api_style = "auto"
+        if self.llm_api_key is not None:
+            # Explicitly empty LLM_API_KEY disables legacy key inheritance.
+            self.ai_api_key = self.llm_api_key
+        if self.llm_model is not None:
+            self.ai_model = self.llm_model.strip()
+        return self
+
+    @field_validator("llm_thinking", mode="before")
+    @classmethod
+    def normalize_llm_thinking(cls, value: object) -> object:
+        return None if value == "" else value
+
+    @property
+    def ai_provider_configured(self) -> bool:
+        if self.ai_mock_enabled:
+            return True
+        if not self.ai_enabled or not self.ai_base_url.strip() or not self.ai_model.strip():
+            return False
+        # Local/self-hosted servers may deliberately run without API-key auth.
+        # Known hosted providers still require their key.
+        try:
+            host = urlsplit(self.ai_base_url).hostname
+        except ValueError:
+            return False
+        return bool(host) and (
+            host not in {"api.openai.com", "openrouter.ai"}
+            or bool(self.ai_api_key.get_secret_value())
+        )
 
     @field_validator("moodle_browser_service_url", mode="before")
     @classmethod

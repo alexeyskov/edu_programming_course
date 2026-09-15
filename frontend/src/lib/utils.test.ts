@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { findWorkspacePasteSource, formatGreetingName, formatRemaining, formatSessionElapsed, isReceiptUsable, languageForPath, unwrapList, validateWorkspacePath, workspaceIdentifiers } from './utils';
+import { findWorkspacePasteSource, formatGreetingName, formatRemaining, formatSessionElapsed, languageForPath, unwrapList, validateWorkspacePath, workspaceIdentifiers } from './utils';
 
 describe('workspace utilities', () => {
   it('accepts only safe C/C++ workspace paths', () => {
@@ -17,15 +17,7 @@ describe('workspace utilities', () => {
     expect(validateWorkspacePath('run.sh')).toMatch(/C\/C\+\+ и текстовые/);
   });
 
-  it('keeps an internal clipboard receipt inside one attempt and TTL', () => {
-    const receipt = { attemptId: 'a1', sourceFileId: 'f1', text: 'value', createdAt: 1_000 };
-    expect(isReceiptUsable(receipt, 'a1', 'value', 2_000, 5_000)).toBe(true);
-    expect(isReceiptUsable(receipt, 'a2', 'value', 2_000, 5_000)).toBe(false);
-    expect(isReceiptUsable(receipt, 'a1', 'other', 2_000, 5_000)).toBe(false);
-    expect(isReceiptUsable(receipt, 'a1', 'value', 7_000, 5_000)).toBe(false);
-  });
-
-  it('allows paste only when the exact fragment is already in the workspace', () => {
+  it('locates a source file when renewing an already verified internal copy', () => {
     const files = [
       { id: 'main', path: 'main.cpp', content: 'int main() { return helper(); }' },
       { id: 'header', path: 'helper.hpp', content: 'int helper();\n' },

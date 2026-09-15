@@ -17,6 +17,23 @@ const views: Array<{ id: SubmissionView; label: string }> = [
   { id: 'reviewed', label: 'Проверенные' },
 ];
 
+function historyFailureMessage(event: MoodleHistoryImportEvent): string {
+  if (/^INVALID_RESPONSE: (ASSIGN|QUIZ)_TABLE_NOT_FOUND:/.test(event.lastError ?? '')) {
+    return 'Не распознана таблица сдач Moodle. Требуется проверка совместимости коннектора; это не означает отсутствие работ.';
+  }
+  const code = (event.lastError ?? '').split(':')[0];
+  if (['LMS_REAUTH_REQUIRED', 'CREDENTIAL_EXPIRED', 'MISSING_CREDENTIAL'].includes(code)) {
+    return 'Истекла сессия преподавателя в Moodle. Войдите повторно и повторите загрузку.';
+  }
+  if (code === 'TIMEOUT') return 'Moodle не ответил вовремя. Повторите загрузку.';
+  if (code === 'UNAVAILABLE') return 'Соединение с Moodle недоступно. Повторите загрузку позже.';
+  if (code === 'BROWSER_BUSY') return 'Браузерная сессия занята. Повторите загрузку через несколько секунд.';
+  if (['INVALID_RESPONSE', 'RESPONSE_TOO_LARGE'].includes(code)) {
+    return 'Не удалось прочитать ответ Moodle для этой работы. Повторите загрузку; если ошибка повторится, сообщите администратору.';
+  }
+  return 'Импорт этой работы завершился с ошибкой. Повторите загрузку; если ошибка повторится, сообщите администратору.';
+}
+
 export function SubmissionsPage() {
   const [items, setItems] = useState<Submission[]>([]);
   const [historyImports, setHistoryImports] = useState<MoodleHistoryImportEvent[]>([]);
@@ -56,7 +73,7 @@ export function SubmissionsPage() {
     const result = new Map<string, MoodleHistoryImportEvent>();
     [...historyImports]
       .sort((left, right) => (
-        Date.parse(right.updatedAt || right.createdAt) - Date.parse(left.updatedAt || left.createdAt)
+        Date.parse(right.createdAt || right.updatedAt) - Date.parse(left.createdAt || left.updatedAt)
       ))
       .forEach((item) => {
       const key = item.aggregateId ? `${item.aggregateId}:${item.actorKey ?? 'legacy'}` : item.id;
@@ -154,14 +171,14 @@ export function SubmissionsPage() {
 
     {historyStatusError && <div className="history-import-status history-import-status--error" role="alert"><AlertTriangle size={17} /><span><strong>Не удалось проверить синхронизацию Moodle</strong><small>Статус импорта недоступен. Уже загруженные работы можно просматривать.</small></span><Button size="sm" variant="secondary" loading={refreshing} onClick={() => void load(true)}>Проверить статус</Button></div>}
     {!historyStatusError && historyImportActive && <div className="history-import-status history-import-status--active" role="status"><RotateCcw className="spin" size={17} /><span><strong>Загружаем прошлые сдачи из Moodle</strong><small>Код, файлы, оценки и комментарии появляются постранично. Список обновится автоматически.</small></span></div>}
-    {!historyStatusError && historyImportFailed && <div className="history-import-status history-import-status--error" role="alert"><AlertTriangle size={17} /><span><strong>Часть прошлых сдач не загрузилась</strong><small>Проверьте вход в Moodle и повторите загрузку. Подробный статус доступен в настройках LMS.</small></span><Button size="sm" variant="secondary" loading={refreshing} onClick={() => void retryFailedHistoryImports()}>Повторить загрузку</Button></div>}
+    {!historyStatusError && historyImportFailed && <div className="history-import-status history-import-status--error" role="alert"><AlertTriangle size={17} /><span><strong>Часть прошлых сдач не загрузилась</strong>{failedHistoryImports.slice(0, 5).map((item) => <small key={item.id}>{item.assessmentTitle && <b>{item.assessmentTitle}: </b>}{historyFailureMessage(item)}</small>)}{failedHistoryImports.length > 5 && <small>Ещё работ с ошибками: {failedHistoryImports.length - 5}.</small>}{historyImportActive && <small>Другие работы продолжают загружаться. Уже загруженные сдачи доступны для проверки.</small>}</span><Button size="sm" variant="secondary" loading={refreshing} onClick={() => void retryFailedHistoryImports()}>Повторить загрузку</Button></div>}
 
     <div className="filter-bar"><div className="search-input"><Search size={17} /><input value={query} onChange={(event) => setParam('q', event.target.value)} placeholder="Студент, группа, курс или работа" aria-label="Поиск по работам" /></div></div>
     {filtered.length ? <Card className="submission-table"><div className="submission-table__head"><span>Студент</span><span>Работа</span><span>Проверки</span><span>Статус</span><span>Действия</span></div>{filtered.map((item) => <div className="submission-row" key={item.id}>
       <span className="student-cell"><span className="student-avatar">{item.studentName.split(' ').map((part) => part[0]).join('').slice(0, 2)}</span><span><strong>{item.studentName}</strong><small>{item.studentGroup !== '—' ? `Группа ${item.studentGroup} · ` : ''}{formatDate(item.submittedAt)}</small></span></span>
       <span><strong>{item.assessmentTitle}</strong><small>{item.reviewGroup ? `${taskCountLabel(item.reviewGroup.items.length)} · ` : ''}{item.courseTitle ? `${item.courseTitle} · ` : ''}{item.testsTotal > 0 ? `${item.testsPassed}/${item.testsTotal} тестов по данным API` : 'Результаты тестов не предоставлены'}</small></span>
       <span className="evidence-cell"><Badge tone={item.risk === 'HIGH' ? 'danger' : item.risk === 'MEDIUM' ? 'warning' : item.risk === 'LOW' ? 'success' : 'neutral'}>{item.risk === 'HIGH' ? <AlertTriangle size={12} /> : <ShieldQuestion size={12} />} {riskLabel(item.risk)}</Badge></span>
-      <span>{item.reviewRequired === false ? <Badge>Проверка не требуется</Badge> : item.status === 'CLAIMED' && item.claim ? <span className="claim-owner"><LockKeyhole size={14} /><span><strong>{item.claim.mine ? 'Вы проверяете' : item.claim.ownerName}</strong><small>до {formatDate(item.claim.expiresAt, { hour: '2-digit', minute: '2-digit' })}</small></span></span> : item.status === 'GRADED' ? <Badge tone="success"><CheckCircle2 size={12} /> {item.score}/{item.maxScore}</Badge> : item.status === 'CONFLICT' ? <Badge tone="danger">Конфликт LMS</Badge> : <Badge>Свободна</Badge>}</span>
+      <span>{item.reviewRequired === false ? <Badge>Проверка не требуется</Badge> : item.status === 'CLAIMED' && item.claim ? <span className="claim-owner"><LockKeyhole size={14} /><span><strong>{item.claim.mine ? 'Вы проверяете' : item.claim.ownerName}</strong><small>до {formatDate(item.claim.expiresAt, { hour: '2-digit', minute: '2-digit' })}</small></span></span> : item.status === 'GRADED' ? <Badge tone="success"><CheckCircle2 size={12} /> {item.score}/{item.maxScore}</Badge> : item.status === 'CONFLICT' ? <Badge tone="danger">Конфликт LMS</Badge> : <Badge>Не проверено</Badge>}</span>
       <span className="submission-actions">{item.status === 'UNGRADED' && item.canReview !== false ? <Button size="sm" loading={claiming === item.id} onClick={() => void claimAndOpen(item)}><UserCheck size={14} /> Открыть</Button> : item.status === 'CLAIMED' ? <Button size="sm" variant={item.claim?.mine ? 'primary' : 'secondary'} onClick={() => navigate(reviewUrl(item))}><ArrowRight size={14} /> {item.claim?.mine ? 'Продолжить' : 'Открыть'}</Button> : item.status === 'GRADED' ? <><Button size="sm" variant="secondary" onClick={() => navigate(reviewUrl(item))}><ArrowRight size={14} /> Открыть результат</Button>{item.canReview !== false && <Button size="sm" variant="ghost" loading={claiming === item.id} onClick={() => void claimAndOpen(item, true)}><RotateCcw size={14} /> Перепроверить</Button>}</> : <Button size="sm" variant="secondary" onClick={() => navigate(reviewUrl(item))}><ArrowRight size={14} /> Открыть</Button>}</span>
     </div>)}</Card> : <Card className="submission-empty"><EmptyState icon={<Inbox />} title={viewItems.length ? 'По запросу ничего не найдено' : emptyState.title} text={viewItems.length ? 'Измените поисковый запрос.' : emptyState.text} action={!viewItems.length && !items.length ? <Button variant="secondary" loading={refreshing} onClick={() => { autoRefreshAttempts.current = 0; void load(true); }}><RotateCcw size={15} /> Обновить список</Button> : undefined} /></Card>}
     <div className="table-footer"><span>Показано {filtered.length} из {viewItems.length}</span></div>

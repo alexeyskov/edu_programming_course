@@ -195,6 +195,7 @@ class ActivitySnapshot(StrictModel):
     random_question_count: int = Field(default=0, ge=0, le=10_000)
     random_essay_confirmed: bool = False
     statement_deferred: bool = False
+    quiz_questions_confirmed: bool = False
     import_supported: bool = False
     title_confirmed: bool = False
     settings_confirmed: bool = False
@@ -369,6 +370,19 @@ class QuizEssayPrepareRequest(StrictModel):
         return self
 
 
+class QuizEssayQuestionPreparation(StrictModel):
+    question_slot: PositiveId
+    question_text: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=50_000)
+    ]
+    answer_transport: Literal["ESSAY_ONLINE_TEXT", "ESSAY_ATTACHMENT"]
+    available_answer_transports: list[Literal["ESSAY_ONLINE_TEXT", "ESSAY_ATTACHMENT"]] = Field(
+        min_length=1, max_length=2
+    )
+    page: int = Field(default=0, ge=0, le=31)
+    question_max_mark: float | None = Field(default=None, gt=0, le=1_000_000, allow_inf_nan=False)
+
+
 class QuizEssayPreparation(StrictModel):
     course_id: PositiveId
     cmid: int = Field(gt=0)
@@ -383,6 +397,7 @@ class QuizEssayPreparation(StrictModel):
         min_length=1, max_length=2
     )
     remaining_seconds: int | None = Field(default=None, ge=0, le=315_360_000)
+    questions: list[QuizEssayQuestionPreparation] = Field(default_factory=list, max_length=32)
 
 
 class QuizEssayPrepareResponse(StrictModel):
@@ -405,6 +420,49 @@ class QuizEssayReceipt(StrictModel):
 class QuizEssaySyncResponse(StrictModel):
     status: Literal["DRAFT_SAVED", "FINALIZED"]
     receipt: QuizEssayReceipt
+    storage_state: BrowserStorageState
+
+
+class QuizAnswer(StrictModel):
+    question_slot: PositiveId
+    answer_transport: Literal["ESSAY_ONLINE_TEXT", "ESSAY_ATTACHMENT"]
+    artifact: QuizArtifact
+    previous_managed_filename: ManagedSubmissionFilename | None = None
+    previous_managed_sha256: (
+        Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")] | None
+    ) = None
+
+    @model_validator(mode="after")
+    def receipt_is_complete(self) -> QuizAnswer:
+        if (self.previous_managed_filename is None) != (self.previous_managed_sha256 is None):
+            raise ValueError("previous managed artifact receipt is incomplete")
+        return self
+
+
+class QuizAnswersSyncRequest(StrictModel):
+    schema_version: Literal["1.0"]
+    base_url: Annotated[str, StringConstraints(min_length=8, max_length=2_048)]
+    course_id: PositiveId
+    cmid: int = Field(gt=0, le=2**63 - 1)
+    expected_attempt_id: PositiveId
+    answers: list[QuizAnswer] = Field(min_length=1, max_length=32)
+    finalize: bool = False
+    idempotency_key: Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9._:-]{8,200}$")]
+    storage_state: BrowserStorageState
+
+    @model_validator(mode="after")
+    def unique_slots(self) -> QuizAnswersSyncRequest:
+        if len({answer.question_slot for answer in self.answers}) != len(self.answers):
+            raise ValueError("Moodle Quiz answer slots must be unique")
+        # A batch remains within the existing connector request/response budget.
+        if sum(len(answer.artifact.content_base64) for answer in self.answers) > 5_592_416:
+            raise ValueError("Moodle Quiz answer bundle exceeds 4 MiB")
+        return self
+
+
+class QuizAnswersSyncResponse(StrictModel):
+    status: Literal["DRAFT_SAVED", "FINALIZED"]
+    receipts: list[QuizEssayReceipt] = Field(min_length=1, max_length=32)
     storage_state: BrowserStorageState
 
 

@@ -1356,6 +1356,31 @@ def parse_quiz_question_summary(
         unique_references = list(dict.fromkeys(references))
         if len(unique_references) == 1:
             result["_random_qbank_url"] = unique_references[0]
+    if 1 < len(unique) <= 32 and base_url:
+        questions: list[dict[str, Any]] = []
+        for slot in unique.values():
+            slot_id = str(slot.get("data-slot", "")).strip()
+            if not slot_id:
+                match = re.fullmatch(r"slot-([0-9]+)", str(slot.get("id", "")))
+                slot_id = match.group(1) if match else ""
+            if not _POSITIVE_ID.fullmatch(slot_id):
+                break
+            # Reuse the same origin-bound Essay/random reference validation
+            # per slot; synthetic context uses identifiers proven above.
+            child = parse_quiz_question_summary(
+                f'<body class="course-{course_id}"><input name="cmid" value="{cmid}">'
+                f'<ul class="slots">{slot}</ul></body>',
+                course_id=course_id,
+                cmid=cmid,
+                base_url=base_url,
+            )
+            if not child.get("_essay_edit_url") and not child.get("_random_qbank_url"):
+                break
+            questions.append({"question_slot": slot_id, **child})
+        if len(questions) == len(unique) and len({q["question_slot"] for q in questions}) == len(
+            unique
+        ):
+            result["_questions"] = questions
     return result
 
 

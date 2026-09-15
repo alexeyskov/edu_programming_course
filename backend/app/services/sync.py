@@ -91,7 +91,7 @@ from app.services.moodle_quiz_runtime import (
     resolve_moodle_quiz_context,
 )
 from app.services.moodle_source import (
-    moodle_quiz_uses_latest_attempt_grade,
+    confirmed_moodle_quiz_grading_method,
     moodle_source_confirmation_from_activity,
     moodle_source_is_confirmed,
 )
@@ -419,11 +419,16 @@ async def maintain_attempts(
     """
 
     now = _as_utc(now or utcnow())
+    from app.models.attempts import MoodleQuizQuestion
+
+    sibling_ids = select(MoodleQuizQuestion.attempt_id).where(
+        MoodleQuizQuestion.attempt_id != MoodleQuizQuestion.root_attempt_id
+    )
     attempt_ids = list(
         (
             await db.scalars(
                 select(Attempt.id)
-                .where(Attempt.state == AttemptState.ACTIVE.value)
+                .where(Attempt.state == AttemptState.ACTIVE.value, Attempt.id.not_in(sibling_ids))
                 .order_by(Attempt.deadline_at.asc().nulls_last(), Attempt.started_at, Attempt.id)
             )
         ).all()
@@ -472,8 +477,21 @@ async def maintain_attempts(
             .order_by(SyncOutbox.created_at.desc())
         )
         interval = checkpoint_interval_seconds(attempt, assessment, now=now)
+        # Prepared Moodle Quiz attempts already exist remotely. They retain a
+        # local starter snapshot without queuing an immediate template upload;
+        # wait the normal interval, then back up the current (not starter) code.
+        checkpoint_since = (
+            last_event.created_at if last_event is not None else attempt.started_at
+        )
+        policy = attempt.integrity_policy or {}
+        prepared_quiz = (
+            policy.get("moodle_runtime_prepared") is True
+            and bool(policy.get("moodle_attempt_id"))
+            and policy.get("moodle_answer_transport") in {"ESSAY_ATTACHMENT", "ESSAY_ONLINE_TEXT"}
+        )
         is_due = (
-            last_event is None or (now - _as_utc(last_event.created_at)).total_seconds() >= interval
+            (last_event is None and not prepared_quiz)
+            or (now - _as_utc(checkpoint_since)).total_seconds() >= interval
         )
         checkpoint_payloads = list(
             (
@@ -495,19 +513,19 @@ async def maintain_attempts(
         heartbeat_generation = (
             None if reason == "FINAL_MINUTE" else (int(now.timestamp()) // interval) * interval
         )
-        generation = reason if reason == "FINAL_MINUTE" else f"P{heartbeat_generation:x}"
-        idempotency_key = f"checkpoint:{attempt.id}:{snapshot.id}:{generation}"[:100]
-        before = await db.scalar(
-            select(SyncOutbox.id).where(SyncOutbox.idempotency_key == idempotency_key)
+        before_ids = set(
+            (
+                await db.scalars(select(SyncOutbox.id).where(SyncOutbox.attempt_id == attempt.id))
+            ).all()
         )
-        await enqueue_checkpoint(
+        event = await enqueue_checkpoint(
             db,
             attempt=attempt,
             snapshot=snapshot,
             reason=reason,
             heartbeat_generation=heartbeat_generation,
         )
-        if before is None:
+        if event.id not in before_ids:
             checkpoints += 1
     return SchedulerResult(checkpoints_enqueued=checkpoints, attempts_submitted=submitted)
 
@@ -661,9 +679,7 @@ async def claim_next_outbox_event(
     async with session_factory() as db, db.begin():
         due = or_(
             and_(
-                SyncOutbox.state.in_(
-                    [SyncOutboxState.PENDING.value, SyncOutboxState.RETRY.value]
-                ),
+                SyncOutbox.state.in_([SyncOutboxState.PENDING.value, SyncOutboxState.RETRY.value]),
                 SyncOutbox.next_attempt_at <= now,
             ),
             and_(
@@ -1008,6 +1024,46 @@ class _MoodleBrowserAdapter:
     ) -> _BrowserDeliveryResult:
         from app.integrations.moodle_browser import MoodleBrowserQuizEssayArtifact
 
+        if "answers" in payload:
+            from app.integrations.moodle_browser import MoodleBrowserQuizAnswer
+
+            answers = []
+            for value in payload["answers"]:
+                content = value.get("artifact_bytes")
+                if (
+                    not isinstance(content, bytes)
+                    or len(content) != value.get("artifact_size")
+                    or hashlib.sha256(content).hexdigest() != value.get("artifact_sha256")
+                ):
+                    raise IntegrationProtocolError("Moodle answer bundle artifact is inconsistent")
+                answers.append(
+                    MoodleBrowserQuizAnswer(
+                        question_slot=value["question_slot"],
+                        artifact=MoodleBrowserQuizEssayArtifact(
+                            value["artifact_filename"], content
+                        ),
+                        answer_transport=value["answer_transport"],
+                        previous_managed_filename=value.get("previous_managed_filename"),
+                        previous_managed_sha256=value.get("previous_managed_sha256"),
+                    )
+                )
+            result = await self.browser.sync_quiz_answers(
+                str(payload["course_id"]),
+                payload["cmid"],
+                tuple(answers),
+                expected_attempt_id=payload["expected_attempt_id"],
+                finalize=payload["finalize"],
+                idempotency_key=idempotency_key,
+            )
+            return _BrowserDeliveryResult(
+                value={
+                    "status": result.status,
+                    "module": "quiz",
+                    "receipts": [asdict(receipt) for receipt in result.receipts],
+                },
+                storage_state=result.storage_state,
+            )
+
         filename = payload.get("artifact_filename")
         content = payload.get("artifact_bytes")
         digest = payload.get("artifact_sha256")
@@ -1257,6 +1313,24 @@ async def _prepare_checkpoint(
         or canonical_hash(snapshot.files) != snapshot.manifest_hash
     ):
         raise _BlockedDelivery("CHECKPOINT_SNAPSHOT_MISMATCH", "Local snapshot hash is invalid")
+    from app.models.attempts import MoodleQuizQuestion
+
+    quiz_question = await db.scalar(
+        select(MoodleQuizQuestion).where(MoodleQuizQuestion.attempt_id == attempt.id)
+    )
+    if quiz_question is not None:
+        return await _prepare_quiz_answers_checkpoint(
+            db,
+            settings,
+            claim,
+            connection,
+            attempt=attempt,
+            assessment=assessment,
+            course=course,
+            principal=principal,
+        )
+    if "quiz_questions" in payload:
+        raise _BlockedDelivery("CHECKPOINT_CONTEXT_MISMATCH", "Quiz session is not bound")
     if connection.mode == "PLUGINLESS":
         if connection.transport != "PLAYWRIGHT":
             raise _BlockedDelivery(
@@ -1376,27 +1450,6 @@ async def _prepare_checkpoint(
                     "MOODLE_ASSIGNMENT_FILE_CONSTRAINTS_UNCONFIRMED",
                     "Moodle Assignment file limits and accepted types must be confirmed",
                 )
-            single_suffix = (
-                PurePosixPath(str(files[0].get("path", ""))).suffix.lower()
-                if len(files) == 1
-                else ""
-            )
-            natural_suffix = (
-                ".c"
-                if single_suffix == ".c"
-                else ".cpp"
-                if single_suffix in {".cc", ".cpp", ".cxx"}
-                else ".zip"
-            )
-            accepted_file_types = activity.get("accepted_file_types", "")
-            if not moodle_file_type_allowed(
-                accepted_file_types,
-                natural_suffix,
-            ):
-                raise _BlockedDelivery(
-                    "MOODLE_ASSIGNMENT_FILE_TYPE_FORBIDDEN",
-                    "Moodle Assignment does not accept the generated artifact type",
-                )
         try:
             artifact = (
                 build_moodle_online_text_artifact(files)
@@ -1410,6 +1463,18 @@ async def _prepare_checkpoint(
                     str(exc),
                 ) from exc
             raise
+        if (
+            module == "assign"
+            and answer_transport == "ASSIGN_FILE"
+            and not moodle_file_type_allowed(
+                activity.get("accepted_file_types", ""),
+                PurePosixPath(artifact.filename).suffix.lower(),
+            )
+        ):
+            raise _BlockedDelivery(
+                "MOODLE_ASSIGNMENT_FILE_TYPE_FORBIDDEN",
+                "Moodle Assignment does not accept the generated artifact type",
+            )
         max_submission_bytes = activity.get("max_submission_bytes")
         if (
             module == "assign"
@@ -1521,6 +1586,205 @@ async def _prepare_checkpoint(
         )
         return _CheckpointDelivery(connection=connection, payload=browser_payload)
     return _CheckpointDelivery(connection=connection, payload=payload)
+
+
+async def _prepare_quiz_answers_checkpoint(
+    db: AsyncSession,
+    settings: Settings,
+    claim: ClaimedOutboxEvent,
+    connection: ConnectionTarget,
+    *,
+    attempt: Attempt,
+    assessment: Assessment,
+    course: Course,
+    principal: ExternalPrincipal,
+) -> _CheckpointDelivery:
+    """Build a complete immutable answer bundle from server-owned session relations."""
+    from app.models.attempts import MoodleQuizQuestion
+
+    if connection.mode != "PLUGINLESS" or connection.transport != "PLAYWRIGHT":
+        raise _BlockedDelivery("QUIZ_BUNDLE_UNSUPPORTED", "Quiz sessions require browser transport")
+    questions = list(
+        (
+            await db.scalars(
+                select(MoodleQuizQuestion)
+                .where(MoodleQuizQuestion.root_attempt_id == attempt.id)
+                .order_by(MoodleQuizQuestion.position)
+            )
+        ).all()
+    )
+    raw_questions = claim.payload.get("quiz_questions")
+    if (
+        not 2 <= len(questions) <= 32
+        or not isinstance(raw_questions, list)
+        or len(raw_questions) != len(questions)
+    ):
+        raise _BlockedDelivery("QUIZ_BUNDLE_INCOMPLETE", "Every Quiz response must be snapshotted")
+    expected = {str(question.attempt_id): question for question in questions}
+    if any(not isinstance(value, dict) for value in raw_questions):
+        raise _BlockedDelivery("QUIZ_BUNDLE_INCOMPLETE", "Quiz response references are invalid")
+    given = {str(value.get("attempt_id")): value for value in raw_questions}
+    if len(given) != len(raw_questions) or set(given) != set(expected):
+        raise _BlockedDelivery("QUIZ_BUNDLE_INCOMPLETE", "Quiz response set has changed")
+    reason = claim.payload["reason"]
+    terminal = reason in {"SUBMISSION", "DEADLINE"}
+    generation = claim.payload.get("quiz_session_revision")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+        raise _BlockedDelivery("QUIZ_BUNDLE_INCOMPLETE", "Quiz session revision is invalid")
+    if not terminal:
+        if attempt.state != AttemptState.ACTIVE.value:
+            raise _BlockedDelivery("SUPERSEDED", "Quiz session has already been submitted")
+        later = list(
+            (
+                await db.scalars(
+                    select(SyncOutbox.payload).where(
+                        SyncOutbox.attempt_id == attempt.id,
+                        SyncOutbox.event_type == "attempt.checkpoint",
+                        SyncOutbox.id != claim.id,
+                    )
+                )
+            ).all()
+        )
+        for value in later:
+            if not isinstance(value, dict):
+                continue
+            other_revision = value.get("quiz_session_revision")
+            if (
+                isinstance(other_revision, int)
+                and not isinstance(other_revision, bool)
+                and (
+                    other_revision > generation
+                    or (
+                        other_revision >= generation
+                        and value.get("reason") in {"SUBMISSION", "DEADLINE"}
+                    )
+                )
+            ):
+                raise _BlockedDelivery("SUPERSEDED", "A newer complete Quiz snapshot exists")
+    runtime = await resolve_moodle_quiz_context(db, assessment.id)
+    if runtime is None or runtime.course.id != course.id:
+        raise _BlockedDelivery(
+            "MOODLE_SUBMISSION_MAPPING_REQUIRED", "Quiz parent mapping is missing"
+        )
+    root_binding = pinned_moodle_quiz_binding(
+        attempt.integrity_policy,
+        course_external_id=course.external_id,
+        cmid=runtime.cmid,
+    )
+    if root_binding is None:
+        raise _BlockedDelivery("MOODLE_ATTEMPT_BINDING_CONFLICT", "Quiz parent binding is missing")
+    answers = []
+    revision_sum = 0
+    for question in questions:
+        raw = given[str(question.attempt_id)]
+        child = await db.get(Attempt, question.attempt_id)
+        child_assessment = await db.get(Assessment, child.assessment_id) if child else None
+        workspace = await db.scalar(
+            select(Workspace).where(Workspace.attempt_id == question.attempt_id)
+        )
+        try:
+            snapshot_id = uuid.UUID(str(raw.get("snapshot_id")))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise _BlockedDelivery("QUIZ_BUNDLE_INCOMPLETE", "Quiz snapshot id is invalid") from exc
+        snapshot = await db.get(Snapshot, snapshot_id)
+        if (
+            child is None
+            or child.principal_id != principal.id
+            or child_assessment is None
+            or child_assessment.course_id != course.id
+            or workspace is None
+            or snapshot is None
+            or snapshot.workspace_id != workspace.id
+            or str(raw.get("question_slot")) != str(question.question_slot)
+            or (child.id == attempt.id and snapshot.id != claim.aggregate_id)
+        ):
+            raise _BlockedDelivery(
+                "CHECKPOINT_CONTEXT_MISMATCH", "Quiz response ownership is invalid"
+            )
+        binding = pinned_moodle_quiz_binding(
+            child.integrity_policy,
+            course_external_id=course.external_id,
+            cmid=runtime.cmid,
+        )
+        if binding is None or binding[:2] != (root_binding[0], str(question.question_slot)):
+            raise _BlockedDelivery(
+                "MOODLE_ATTEMPT_BINDING_CONFLICT", "Quiz response binding changed"
+            )
+        if terminal:
+            submission = await db.scalar(
+                select(Submission).where(
+                    Submission.attempt_id == child.id,
+                    Submission.snapshot_id == snapshot.id,
+                )
+            )
+            if submission is None or child.state not in {
+                AttemptState.SUBMITTED.value,
+                AttemptState.AUTO_SUBMITTED.value,
+            }:
+                raise _BlockedDelivery(
+                    "QUIZ_BUNDLE_INCOMPLETE", "Every Quiz response must be submitted"
+                )
+        if canonical_hash(snapshot.files) != snapshot.manifest_hash:
+            raise _BlockedDelivery(
+                "CHECKPOINT_SNAPSHOT_MISMATCH", "Quiz response snapshot hash changed"
+            )
+        files = validate_checkpoint_manifest(
+            json.dumps(snapshot.files, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            snapshot.manifest_hash,
+            max_bytes=int(settings.sync_checkpoint_max_bytes),
+            max_files=int(settings.sync_checkpoint_max_files),
+        )
+        artifact = (
+            build_moodle_online_text_artifact(files)
+            if binding[2] == "ESSAY_ONLINE_TEXT"
+            else build_moodle_submission_artifact(files)
+        )
+        previous = await db.scalar(
+            select(LMSSubmissionFingerprint)
+            .where(
+                LMSSubmissionFingerprint.attempt_id == child.id,
+                LMSSubmissionFingerprint.external_attempt_id == root_binding[0],
+                LMSSubmissionFingerprint.external_question_slot == str(question.question_slot),
+                LMSSubmissionFingerprint.answer_transport == binding[2],
+            )
+            .order_by(
+                LMSSubmissionFingerprint.delivered_at.desc(), LMSSubmissionFingerprint.id.desc()
+            )
+        )
+        answers.append(
+            {
+                "question_slot": str(question.question_slot),
+                "attempt_ref": str(child.id),
+                "snapshot_ref": str(snapshot.id),
+                "snapshot_sha256": snapshot.manifest_hash,
+                "answer_transport": binding[2],
+                "artifact_filename": artifact.filename,
+                "artifact_bytes": artifact.raw_bytes,
+                "artifact_sha256": artifact.sha256,
+                "artifact_size": artifact.size,
+                "previous_managed_filename": previous.artifact_filename if previous else None,
+                "previous_managed_sha256": previous.artifact_sha256 if previous else None,
+            }
+        )
+        revision_sum += snapshot.revision
+    if revision_sum != generation:
+        raise _BlockedDelivery(
+            "CHECKPOINT_CONTEXT_MISMATCH", "Quiz bundle revision is inconsistent"
+        )
+    connection = await _principal_credential_target(db, settings, connection, principal.id)
+    return _CheckpointDelivery(
+        connection=connection,
+        payload={
+            "module": "quiz",
+            "course_id": int(course.external_id),
+            "cmid": runtime.cmid,
+            "expected_attempt_id": root_binding[0],
+            "answers": answers,
+            "reason": reason,
+            "finalize": terminal,
+            "snapshot_ref": str(claim.aggregate_id),
+        },
+    )
 
 
 async def _prepare_task_version(
@@ -1657,6 +1921,15 @@ async def _prepare_grade(
         )
     )
     receipt = submission.external_receipt if isinstance(submission.external_receipt, dict) else {}
+    from app.services.moodle_quiz_session import quiz_question_for_attempt
+
+    quiz_question = await quiz_question_for_attempt(db, attempt.id)
+    parent_assessment_id = assessment.id
+    if quiz_question is not None:
+        root_attempt = await db.get(Attempt, quiz_question.root_attempt_id)
+        if root_attempt is None or root_attempt.principal_id != principal.id:
+            raise _BlockedDelivery("GRADE_CONTEXT_MISMATCH", "Quiz session ownership is invalid")
+        parent_assessment_id = root_attempt.assessment_id
     historical_metadata = (
         historical_mapping.metadata_json
         if historical_mapping is not None and isinstance(historical_mapping.metadata_json, dict)
@@ -1666,7 +1939,7 @@ async def _prepare_grade(
     historical_receipt = (
         submission.source == "MOODLE_IMPORT"
         or str(receipt.get("source", "")).upper() == "MOODLE_HISTORY"
-        or bool(receipt.get("moodle_parent_attempt_id"))
+        or (quiz_question is None and bool(receipt.get("moodle_parent_attempt_id")))
     )
     if historical_receipt and historical_mapping is None:
         raise _BlockedDelivery(
@@ -1708,7 +1981,7 @@ async def _prepare_grade(
                 await db.scalars(
                     select(ExternalMapping).where(
                         ExternalMapping.connection_id == course.connection_id,
-                        ExternalMapping.local_id == assessment.id,
+                        ExternalMapping.local_id == parent_assessment_id,
                         ExternalMapping.local_type.in_(["Assessment", "core.assessment"]),
                     )
                 )
@@ -1778,7 +2051,9 @@ async def _prepare_grade(
                     "its grade can be exported"
                 ),
             )
-        grade_scale_max = positive_decimal(assessment.max_score)
+        from app.services.review import response_max_score
+
+        grade_scale_max = positive_decimal(await response_max_score(db, attempt, assessment))
         if grade_scale_max is None or decision.grade > grade_scale_max:
             raise _BlockedDelivery(
                 "QUIZ_GRADE_SCALE_UNCONFIRMED",
@@ -1804,14 +2079,14 @@ async def _prepare_grade(
                 "QUIZ_GRADE_SCALE_UNCONFIRMED",
                 "The Moodle Quiz overall grade scale is not confirmed",
             )
-        if not moodle_quiz_uses_latest_attempt_grade(quiz_activity):
+        if confirmed_moodle_quiz_grading_method(quiz_activity) is None:
             raise _BlockedDelivery(
-                "MOODLE_LAST_ATTEMPT_GRADING_REQUIRED",
-                (
-                    "Moodle Quiz must use the 'Last attempt' grading method before "
-                    "the latest attempt grade can be exported"
-                ),
+                "MOODLE_QUIZ_GRADING_METHOD_UNCONFIRMED",
+                "Synchronize the Moodle course to confirm the Quiz grading method",
             )
+        # The exported mark belongs to this exact latest submitted response.
+        # Moodle aggregates the quiz grade itself using its configured method;
+        # publishing that mark must not require changing the LMS settings.
         payload = {
             "module": "quiz",
             "courseid": _positive_integer(course.external_id, "Moodle course id"),
@@ -1938,13 +2213,10 @@ async def _prepare_grade(
                 "MAPPING_NOT_CONFIRMED",
                 "Moodle Quiz activity mapping does not match the graded attempt",
             )
-        if not moodle_quiz_uses_latest_attempt_grade(quiz_metadata.get("activity")):
+        if confirmed_moodle_quiz_grading_method(quiz_metadata.get("activity")) is None:
             raise _BlockedDelivery(
-                "MOODLE_LAST_ATTEMPT_GRADING_REQUIRED",
-                (
-                    "Moodle Quiz must use the 'Last attempt' grading method before "
-                    "the latest attempt grade can be exported"
-                ),
+                "MOODLE_QUIZ_GRADING_METHOD_UNCONFIRMED",
+                "Synchronize the Moodle course to confirm the Quiz grading method",
             )
         payload = {
             "module": "quiz",
@@ -2304,6 +2576,7 @@ async def _mark_moodle_attempt_finalized(
     attempt: Attempt,
     finalized_at: datetime,
     delivered_event_id: uuid.UUID | None = None,
+    _include_session: bool = True,
 ) -> None:
     """Make an externally terminal Moodle attempt locally read-only.
 
@@ -2312,6 +2585,33 @@ async def _mark_moodle_attempt_finalized(
     periodic revision from being retried after the terminal state is known.
     """
 
+    if _include_session:
+        from app.services.moodle_quiz_session import (
+            quiz_question_for_attempt,
+            quiz_session_questions,
+        )
+
+        relation = await quiz_question_for_attempt(db, attempt.id)
+        if relation is not None:
+            members = await quiz_session_questions(db, relation.root_attempt_id)
+            for member in members:
+                sibling = await db.scalar(
+                    select(Attempt)
+                    .where(
+                        Attempt.id == member.attempt_id,
+                    )
+                    .with_for_update()
+                )
+                if sibling is None or sibling.principal_id != attempt.principal_id:
+                    raise IntegrationProtocolError("Quiz session ownership is invalid")
+                await _mark_moodle_attempt_finalized(
+                    db,
+                    attempt=sibling,
+                    finalized_at=finalized_at,
+                    delivered_event_id=delivered_event_id,
+                    _include_session=False,
+                )
+            return
     attempt.state = AttemptState.LOCKED.value
     attempt.submission_source = "MOODLE_FINALIZED"
     if attempt.submitted_at is None:
@@ -2653,6 +2953,35 @@ async def _record_lms_submission_fingerprint(
     """
 
     payload = context.payload
+    if "answers" in payload:
+        raw_receipts = result.get("receipts")
+        if not isinstance(raw_receipts, list) or len(raw_receipts) != len(payload["answers"]):
+            raise IntegrationProtocolError("Quiz bundle receipts are incomplete")
+        receipts = {
+            str(value.get("question_slot")): value
+            for value in raw_receipts
+            if isinstance(value, dict)
+        }
+        if len(receipts) != len(raw_receipts) or set(receipts) != {
+            answer["question_slot"] for answer in payload["answers"]
+        }:
+            raise IntegrationProtocolError("Quiz bundle receipt slots do not match")
+        for answer in payload["answers"]:
+            await _record_lms_submission_fingerprint(
+                db,
+                row=row,
+                context=replace(
+                    context,
+                    payload={
+                        "module": "quiz",
+                        "cmid": payload["cmid"],
+                        "reason": payload["reason"],
+                        **answer,
+                    },
+                ),
+                result={"receipt": receipts[answer["question_slot"]]},
+            )
+        return
     reason = str(payload.get("reason", ""))
     if reason not in {
         "ATTEMPT_STARTED",
@@ -2665,12 +2994,22 @@ async def _record_lms_submission_fingerprint(
     artifact = payload.get("artifact_bytes")
     if not isinstance(artifact, bytes) or row.attempt_id is None or row.course_id is None:
         return
+    remote_receipt = result.get("receipt")
+    remote_receipt = remote_receipt if isinstance(remote_receipt, dict) else {}
     existing = await db.scalar(
-        select(LMSSubmissionFingerprint.id).where(LMSSubmissionFingerprint.outbox_id == row.id)
+        select(LMSSubmissionFingerprint.id).where(
+            LMSSubmissionFingerprint.outbox_id == row.id,
+            LMSSubmissionFingerprint.external_question_slot
+            == str(remote_receipt.get("question_slot", "")),
+        )
     )
     if existing is not None:
         return
-    attempt = await db.get(Attempt, row.attempt_id)
+    try:
+        attempt_id = uuid.UUID(str(payload.get("attempt_ref", row.attempt_id)))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise IntegrationProtocolError("Delivered answer attempt reference is invalid") from exc
+    attempt = await db.get(Attempt, attempt_id)
     if attempt is None:
         raise IntegrationProtocolError("Delivered answer attempt is missing")
     snapshot_id = payload.get("snapshot_ref")
@@ -2820,9 +3159,7 @@ async def _finish_failure(
                 # retries, so keep this recovery window short instead of using
                 # the hour-scale backoff intended for background imports.
                 delay_seconds = min(delay_seconds, 5)
-            row.next_attempt_at = now + timedelta(
-                seconds=delay_seconds
-            )
+            row.next_attempt_at = now + timedelta(seconds=delay_seconds)
         if row.event_type == "review.decision":
             decision = await db.get(ReviewDecision, row.aggregate_id)
             if decision is not None:
@@ -3068,6 +3405,7 @@ def _project_lms_activity(
             projected[field] = value
     projected["import_supported"] = bool(raw.get("import_supported", False))
     projected["random_essay_confirmed"] = raw.get("random_essay_confirmed") is True
+    projected["quiz_questions_confirmed"] = raw.get("quiz_questions_confirmed") is True
     projected["statement_deferred"] = raw.get("statement_deferred") is True
     projected["attempt_limit_unlimited"] = raw.get("attempt_limit_unlimited") is True
     grading_method = str(raw.get("quiz_grading_method", "")).upper()
@@ -3423,6 +3761,9 @@ async def _apply_activity_deadlines(
             ).all()
         )
         for attempt in attempts:
+            if "moodle_sync_timeout_seconds" in (attempt.integrity_policy or {}):
+                # Preserve the live per-user timer and its upload reserve.
+                continue
             assessment_policy = assessment.policy if isinstance(assessment.policy, dict) else {}
             if assessment_policy.get("moodle_metadata_read_only") is True:
                 # A course-wide date cannot represent a user override.  The
