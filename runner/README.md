@@ -206,7 +206,7 @@ HTTP errors:
 - `409` replayed nonce;
 - `413` declared or parsed body too large;
 - `422` invalid schema, path, manifest or unapproved profile;
-- `429` all local execution slots are busy;
+- `429` all local execution slots are busy, or an interactive program's bounded input queue is full;
 - `503` selected compiler or executor is unavailable.
 
 ## Resource limits
@@ -273,6 +273,14 @@ above.
 `RUNNER_INTERACTIVE_TERMINAL_TTL_SECONDS` (по умолчанию 300), после чего сеанс
 удаляется из памяти. Запуск, ввод, чтение состояния и остановка подписываются
 тем же HMAC-контрактом; обычный синхронный `/v1/jobs` сохранён без изменений.
+
+Интерактивный ввод помещается в ограниченную очередь (до 1 МиБ на сеанс) и
+передаётся программе без блокировки HTTP-запросов. Если программа не читает
+stdin и очередь заполнена, новая строка целиком отклоняется с HTTP `429`;
+ранее принятые строки не теряются и сохраняют порядок. EOF доставляется после
+всех принятых строк. Это не меняет лимит одновременных процессов: занятые
+слоты компиляции и выполнения по-прежнему возвращают `429` сразу после
+короткого `RUNNER_QUEUE_WAIT_SECONDS`, не задерживая сохранение и сдачу работ.
 
 ## Docker
 

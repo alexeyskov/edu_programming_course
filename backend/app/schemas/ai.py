@@ -39,6 +39,8 @@ class ChatThreadRead(ReadModel):
 
 class ChatMessageCreateRequest(MutationModel):
     content: Annotated[str, StringConstraints(min_length=1, max_length=20_000)]
+    revision: Revision | None = None
+    teacher_comment: Annotated[str, StringConstraints(max_length=20_000)] | None = None
 
     @field_validator("content")
     @classmethod

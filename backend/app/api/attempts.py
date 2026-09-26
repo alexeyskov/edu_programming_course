@@ -79,6 +79,7 @@ from app.services.common import DomainError, sha256_text
 from app.services.moodle_quiz_runtime import (
     PreparedMoodleAssignment,
     PreparedMoodleQuizAttempt,
+    ensure_moodle_activity_not_missing,
     pinned_moodle_quiz_binding,
     prepared_moodle_assignment,
     prepared_moodle_quiz_attempt,
@@ -171,6 +172,7 @@ async def _prepare_moodle_quiz_attempt(
         role="STUDENT",
     )
     await ensure_assessment_available(db, context.assessment, membership)
+    await ensure_moodle_activity_not_missing(db, context.assessment.id)
     existing = list(
         (
             await db.scalars(
@@ -335,6 +337,7 @@ async def _prepare_moodle_assignment(
         role="STUDENT",
     )
     await ensure_assessment_available(db, context.assessment, membership)
+    await ensure_moodle_activity_not_missing(db, context.assessment.id)
     await resolve_assigned_task_version(db, context.assessment, membership)
 
     from app.api.courses import (
@@ -453,10 +456,12 @@ async def _owned_attempt(
     lock: bool = False,
 ) -> tuple[Attempt, Assessment, Workspace]:
     if lock:
+        await db.flush()
         relation = await quiz_question_for_attempt(db, attempt_id)
         if relation is not None:
             root = await db.scalar(
                 select(Attempt).where(Attempt.id == relation.root_attempt_id).with_for_update()
+                .execution_options(populate_existing=True)
             )
             if root is None or root.principal_id != principal_id:
                 raise DomainError(404, "ATTEMPT_NOT_FOUND", "Attempt was not found")
@@ -465,7 +470,7 @@ async def _owned_attempt(
         Attempt.principal_id == principal_id,
     )
     if lock:
-        statement = statement.with_for_update()
+        statement = statement.with_for_update().execution_options(populate_existing=True)
     attempt = await db.scalar(statement)
     if attempt is None:
         raise DomainError(404, "ATTEMPT_NOT_FOUND", "Attempt was not found")
@@ -480,7 +485,9 @@ async def _owned_attempt(
     )
     workspace_statement = select(Workspace).where(Workspace.attempt_id == attempt.id)
     if lock:
-        workspace_statement = workspace_statement.with_for_update()
+        workspace_statement = workspace_statement.with_for_update().execution_options(
+            populate_existing=True
+        )
     workspace = await db.scalar(workspace_statement)
     if workspace is None:
         raise DomainError(500, "WORKSPACE_MISSING", "Attempt workspace is missing")
@@ -731,7 +738,11 @@ async def _attempt_read(
         last_checkpoint_at=checkpoint_at,
         checkpoint_status=checkpoint_status,
         closure_reason=(
-            "LMS_ATTEMPT_FINALIZED" if root.submission_source == "MOODLE_FINALIZED" else None
+            "LMS_ATTEMPT_DELETED"
+            if root.submission_source == "MOODLE_DELETED"
+            else "LMS_ATTEMPT_FINALIZED"
+            if root.submission_source == "MOODLE_FINALIZED"
+            else None
         ),
         requires_live_lms_preparation=bool(
             attempt.state == AttemptState.ACTIVE.value
@@ -1174,12 +1185,15 @@ async def finish_attempt(
         expected_revision=payload.revision,
         client_context=client_context_from_request(request),
     )
+    snapshot = await db.get(Snapshot, submission.snapshot_id)
+    if snapshot is None:
+        raise DomainError(409, "SUBMISSION_SNAPSHOT_MISSING", "Submission snapshot was not found")
     await db.commit()
     return AttemptSubmitRead(
         submission_id=submission.id,
         receipt_id=f"submission:{submission.id}",
         submitted_at=submission.submitted_at,
-        revision=payload.revision,
+        revision=snapshot.revision,
     )
 
 
@@ -1720,6 +1734,10 @@ async def _student_interactive_command(
         raise DomainError(404, "INTERACTIVE_SESSION_NOT_FOUND", "Interactive session was not found")
     if action in {"input", "eof"} and run.status != RunStatus.RUNNING.value:
         raise DomainError(409, "INTERACTIVE_SESSION_FINISHED", "Interactive program is not running")
+    # Even a read-only transaction checks out a pool connection. Terminal
+    # polling/input can wait on a busy runner; release it before network I/O so
+    # a whole classroom's terminal requests cannot starve autosave/submission.
+    await db.commit()
     try:
         async with httpx.AsyncClient() as client:
             adapter = RunnerAdapter(settings, client)

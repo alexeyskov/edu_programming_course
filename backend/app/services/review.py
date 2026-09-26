@@ -68,12 +68,24 @@ async def _submission_context(
     allow_system_settings_read: bool = False,
 ) -> tuple[Submission, Attempt, Assessment]:
     statement = select(Submission).where(Submission.id == submission_id)
-    if lock:
-        statement = statement.with_for_update()
     submission = await db.scalar(statement)
     if submission is None:
         raise DomainError(404, "SUBMISSION_NOT_FOUND", "Submission was not found")
-    attempt = await db.get(Attempt, submission.attempt_id)
+    if lock:
+        # Exact Moodle deletion acquires Attempt before export/submission rows.
+        # Refresh after the lock: expire_on_commit=False can otherwise leave a
+        # cached SUBMITTED object reviewable after another transaction VOIDed it.
+        attempt = await db.scalar(
+            select(Attempt)
+            .where(Attempt.id == submission.attempt_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        submission = await db.scalar(
+            statement.with_for_update().execution_options(populate_existing=True)
+        )
+    else:
+        attempt = await db.get(Attempt, submission.attempt_id)
     if attempt is None:
         raise DomainError(500, "ATTEMPT_MISSING", "Submission attempt is missing")
     assessment = await db.get(Assessment, attempt.assessment_id)
@@ -550,6 +562,21 @@ async def finalize_review(
     )
     if not allow_system_settings_read:
         require_review_required(assessment_hint)
+    # Acquire the attempt fence before outbox rows (and then Submission). This
+    # keeps finalization atomic with a remote-deletion tombstone and avoids the
+    # inverse lock order of a deletion waiting for this export row.
+    await db.scalar(
+        select(Attempt)
+        .where(Attempt.id == submission_hint.attempt_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    await require_submission_review_access(
+        db,
+        principal_id=teacher_id,
+        submission_id=submission_id,
+        allow_system_settings_read=allow_system_settings_read,
+    )
     outbox_idempotency_key = ""
     if idempotency_key:
         outbox_idempotency_key = (

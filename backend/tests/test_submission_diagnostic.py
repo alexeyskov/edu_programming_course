@@ -191,7 +191,8 @@ async def test_metadata_finds_root_from_second_question_and_never_reads_answers_
     assert not db.dirty and not db.new and not db.deleted
 
 
-def test_launcher_runs_script_in_existing_worker_without_env_creation_or_restart(tmp_path):
+@pytest.mark.parametrize("kind", ["submission", "history"])
+def test_launcher_runs_script_in_existing_worker_without_env_creation_or_restart(tmp_path, kind):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     capture = tmp_path / "commands"
@@ -206,8 +207,9 @@ exit 1
     docker.chmod(docker.stat().st_mode | stat.S_IXUSR)
     runtime = tmp_path / "absent-runtime.env"
     attempt_id = str(uuid.uuid4())
+    arguments = [attempt_id] if kind == "submission" else [attempt_id, "4376"]
     result = subprocess.run(
-        ["bash", str(ROOT / "run_eduprog.sh"), "diagnose-moodle-submission", attempt_id],
+        ["bash", str(ROOT / "run_eduprog.sh"), f"diagnose-moodle-{kind}", *arguments],
         env={
             **os.environ,
             "PATH": str(fake_bin) + ":" + os.environ["PATH"],
@@ -223,7 +225,7 @@ exit 1
     assert capture.read_text().splitlines() == [
         "ps -q --filter label=com.docker.compose.project=eduprog "
         "--filter label=com.docker.compose.service=sync-worker",
-        "exec -i 123456abcdef python - " + attempt_id,
+        "exec -i 123456abcdef python - " + " ".join(arguments),
     ]
-    assert captured_script.read_text() == SCRIPT.read_text()
+    assert captured_script.read_text() == (ROOT / f"scripts/diagnose_moodle_{kind}.py").read_text()
     assert not runtime.exists()

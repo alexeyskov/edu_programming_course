@@ -45,7 +45,7 @@ const explanations: Record<string, { title: string; text: string }> = {
 function diagnosticExplanation(diagnostic?: LmsSyncDiagnostic) {
   if (!diagnostic) return {
     title: 'Последняя синхронизация завершилась с ошибкой',
-    text: 'Сервер предыдущей версии не сохранил подробности. Повторите синхронизацию — новый результат будет записан с точной причиной.',
+    text: 'Подробности ошибки недоступны. Повторите ручную синхронизацию курса; если ошибка сохранится, обратитесь к администратору.',
   };
   return explanations[diagnostic.code.toUpperCase()] ?? {
     title: 'Синхронизация Moodle не завершена',
@@ -60,6 +60,7 @@ export function LmsSyncErrorDialog({
   courseTitle,
   diagnostic,
   retrying,
+  retryDisabled = false,
   onClose,
   onRetry,
 }: {
@@ -67,6 +68,7 @@ export function LmsSyncErrorDialog({
   courseTitle: string;
   diagnostic?: LmsSyncDiagnostic;
   retrying: boolean;
+  retryDisabled?: boolean;
   onClose(): void;
   onRetry(): void;
 }) {
@@ -78,7 +80,7 @@ export function LmsSyncErrorDialog({
     onClose={onClose}
     footer={<>
       <Button variant="ghost" onClick={onClose}>Закрыть</Button>
-      <Button loading={retrying} onClick={onRetry}><RefreshCcw size={16} /> Повторить синхронизацию</Button>
+      <Button loading={retrying} disabled={retryDisabled} onClick={onRetry}><RefreshCcw size={16} /> Повторить синхронизацию</Button>
     </>}
   >
     <div className="lms-sync-error">

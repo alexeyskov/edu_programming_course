@@ -82,6 +82,38 @@ class CourseSyncRequest(EmptyMutation):
     pass
 
 
+class HistoryImportWarningRead(ReadModel):
+    id: str
+    code: str
+    message: str
+    student_name: str | None = None
+    attempt_id: str | None = None
+    response_label: str | None = None
+    submission_id: UUID | None = None
+    moodle_url: AnyHttpUrl | None = None
+
+
+class HistoryWarningsDismissRequest(MutationModel):
+    warning_ids: list[Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]] = Field(
+        min_length=1, max_length=1000,
+    )
+
+
+class HistoryWarningsDismissRead(ReadModel):
+    dismissed_warning_ids: list[str]
+
+
+class AssessmentSyncRead(ReadModel):
+    assessment_id: UUID
+    assessment_title: str
+    status: Literal["IDLE", "SYNCING", "COMPLETED", "PARTIAL", "FAILED"]
+    last_error: str | None = None
+    error_code: str | None = None
+    updated_at: datetime | None = None
+    warnings: list[HistoryImportWarningRead] = Field(default_factory=list)
+    warnings_dismissed: bool = False
+
+
 class CourseSyncRead(ReadModel):
     course_id: UUID
     status: Literal["PENDING", "RUNNING", "COMPLETED", "FAILED"]
@@ -112,6 +144,10 @@ class CourseImportRead(ReadModel):
 
 
 __all__ = [
+    "AssessmentSyncRead",
+    "HistoryImportWarningRead",
+    "HistoryWarningsDismissRead",
+    "HistoryWarningsDismissRequest",
     "CourseCatalogRead",
     "CourseGroupRead",
     "CourseImportConfirmRequest",

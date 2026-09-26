@@ -427,6 +427,22 @@ diagnose_moodle_submission() {
     < "$PROJECT_DIR/scripts/diagnose_moodle_submission.py"
 }
 
+diagnose_moodle_history() {
+  [[ $# -eq 2 ]] || die "usage: diagnose-moodle-history <assessment-uuid> <teacher-moodle-id>"
+  [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+    || die "assessment id must be a UUID"
+  [[ "$2" =~ ^[1-9][0-9]{0,19}$ ]] || die "teacher Moodle id must be numeric"
+  local diagnostic_container
+  diagnostic_container="$(docker ps -q \
+    --filter label=com.docker.compose.project=eduprog \
+    --filter label=com.docker.compose.service=sync-worker)"
+  [[ "$diagnostic_container" =~ ^[0-9a-f]{12,64}$ ]] \
+    || die "exactly one running eduprog sync-worker is required"
+  log "read-only history diagnostic; only counts and access checks, no Moodle requests"
+  docker exec -i "$diagnostic_container" python - "$1" "$2" \
+    < "$PROJECT_DIR/scripts/diagnose_moodle_history.py"
+}
+
 prepare_stack() {
   compose config --quiet
   if [[ "${EDUPROG_SKIP_BUILD:-${CONTOUR_SKIP_BUILD:-false}}" != "true" ]]; then
@@ -499,6 +515,8 @@ Commands:
              Diagnose Moodle mobile login using a hidden password prompt
   diagnose-moodle-submission <attempt-uuid>
              Read submission queue and probe the saved student session; no retry or restart
+  diagnose-moodle-history <assessment-uuid> <teacher-moodle-id>
+             Read imported answer counts and teacher visibility; no Moodle requests or changes
   diagnose-runner
              Print runner readiness and effective container limits
   diagnose-ai
@@ -534,6 +552,12 @@ if [[ "$command_name" == "diagnose-moodle-submission" ]]; then
   require_command docker
   shift
   diagnose_moodle_submission "$@"
+  exit 0
+fi
+if [[ "$command_name" == "diagnose-moodle-history" ]]; then
+  require_command docker
+  shift
+  diagnose_moodle_history "$@"
   exit 0
 fi
 [[ -f "$COMPOSE_FILE" ]] || die "Compose file does not exist: $COMPOSE_FILE"

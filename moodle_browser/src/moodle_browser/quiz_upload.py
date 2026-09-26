@@ -13,7 +13,7 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlencode, urlsplit
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 from playwright.async_api import APIRequestContext
@@ -122,6 +122,54 @@ def parse_essay_draft(
     if len(attachments) != 1 or len(essay.select(".filemanager")) != 1:
         raise MoodleMarkupError("Moodle draft attachment control is ambiguous")
     itemid = _positive(attachments[0].get("value"))
+    return _parse_draft_options(soup, base_url=base_url, cmid=cmid, itemid=itemid, sesskey=sesskey)
+
+
+def parse_assignment_draft(markup: str, *, base_url: str, cmid: int) -> EssayDraft:
+    """Bind native draft uploads to the one validated Assignment save form.
+
+    The caller separately validates course, page and submission status. No
+    hidden ID or bootstrap option can select a different activity/draft here.
+    """
+    if len(markup.encode("utf-8")) > 2 * 1024 * 1024:
+        raise MoodleMarkupError("Moodle draft form is too large")
+    soup = BeautifulSoup(markup, "html.parser")
+    controls = soup.select('form.mform input[type="hidden"][name="files_filemanager"]')
+    if len(controls) != 1:
+        raise MoodleMarkupError("Moodle Assignment draft control is ambiguous")
+    form = controls[0].find_parent("form")
+    if form is None or str(form.get("method", "")).lower() != "post":
+        raise MoodleMarkupError("Moodle Assignment draft form is missing")
+    target = urlsplit(urljoin(base_url + "/", str(form.get("action", ""))))
+    if (
+        f"{target.scheme}://{target.netloc}" != base_url
+        or target.path != "/mod/assign/view.php"
+        or target.username or target.password or target.fragment
+        or parse_qs(target.query).get("id") not in (None, [str(cmid)])
+        or len(form.select(".filemanager")) != 1
+    ):
+        raise MoodleMarkupError("Moodle Assignment draft form target changed")
+
+    def field(name: str) -> str:
+        matches = form.select(f'input[type="hidden"][name="{name}"]')
+        if len(matches) != 1:
+            raise MoodleMarkupError("Moodle Assignment draft field is ambiguous")
+        return str(matches[0].get("value", ""))
+
+    if field("id") != str(cmid) or field("action") != "savesubmission":
+        raise MoodleMarkupError("Moodle Assignment draft identifiers changed")
+    sesskey = field("sesskey")
+    if not re.fullmatch(r"[A-Za-z0-9]{1,128}", sesskey):
+        raise MoodleMarkupError("Moodle draft session key is invalid")
+    return _parse_draft_options(
+        soup, base_url=base_url, cmid=cmid,
+        itemid=_positive(controls[0].get("value")), sesskey=sesskey,
+    )
+
+
+def _parse_draft_options(
+    soup: BeautifulSoup, *, base_url: str, cmid: int, itemid: str, sesskey: str,
+) -> EssayDraft:
     options = []
     for script in soup.select("script"):
         source = script.string or ""

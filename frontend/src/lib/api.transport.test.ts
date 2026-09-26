@@ -19,6 +19,170 @@ afterEach(() => {
 });
 
 describe('API transport security contract', () => {
+  it('maps scoped warning details and posts only the explicitly acknowledged identities', async () => {
+    const warningId = 'a'.repeat(64);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse([{ id: 'course-1', role: 'TEACHER' }]))
+      .mockResolvedValueOnce(jsonResponse([{
+        assessment_id: 'assessment-1', status: 'PARTIAL', warnings_dismissed: false,
+        warnings: [{
+          id: warningId, code: 'ARTIFACT_OMITTED', message: 'Файл не загружен',
+          student_name: 'Иван Иванов', attempt_id: '123', response_label: 'Задание 2',
+          submission_id: 'submission-1', moodle_url: 'https://moodle.test/mod/quiz/review.php?attempt=123',
+        }],
+      }]))
+      .mockResolvedValueOnce(jsonResponse({ csrf_token: 'c'.repeat(32) }))
+      .mockResolvedValueOnce(jsonResponse({ dismissed_warning_ids: [warningId] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    await expect(api.getMoodleHistoryImportEvents()).resolves.toMatchObject([{
+      state: 'PARTIAL', warningsDismissed: false,
+      warnings: [{ id: warningId, studentName: 'Иван Иванов', attemptId: '123', submissionId: 'submission-1', responseLabel: 'Задание 2' }],
+    }]);
+    expect(fetchMock.mock.calls[1][0]).toContain('include_warnings=true');
+    await expect(api.dismissMoodleHistoryWarnings('assessment-1', [warningId])).resolves.toEqual([warningId]);
+    expect(fetchMock.mock.calls[3][0]).toMatch(/assessments\/assessment-1\/sync-warnings\/dismiss$/);
+    expect(fetchMock.mock.calls[3][1]).toMatchObject({
+      method: 'POST', credentials: 'include', body: JSON.stringify({ warning_ids: [warningId] }),
+    });
+  });
+
+  it('preserves server dismissal and rejects unsafe external warning links', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(jsonResponse([{
+      assessment_id: 'assessment-1', status: 'PARTIAL', warnings_dismissed: true,
+      warnings: [{ id: 'id', code: 'CODE', message: 'message', moodle_url: 'javascript:alert(1)' }],
+    }])));
+    const { api } = await freshApi();
+    const [status] = await api.getAssessmentSyncStatuses('course-1');
+    expect(status.warningsDismissed).toBe(true);
+    expect(status.warnings![0].moodleUrl).toBeUndefined();
+  });
+
+  it('reads manual synchronization status and explicitly starts only the chosen task', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse([{ assessment_id: 'assessment-1', status: 'FAILED', last_error: 'TIMEOUT', updated_at: '2026-09-24T10:00:00Z' }]))
+      .mockResolvedValueOnce(jsonResponse({ csrf_token: 'a'.repeat(32) }))
+      .mockResolvedValueOnce(jsonResponse({ assessment_id: 'assessment-1', status: 'SYNCING', last_error: null }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    await expect(api.getAssessmentSyncStatuses('course-1')).resolves.toEqual([{
+      assessmentId: 'assessment-1', status: 'FAILED', lastError: 'TIMEOUT', updatedAt: '2026-09-24T10:00:00Z',
+    }]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toMatch(/courses\/course-1\/assessment-sync-status$/);
+    await expect(api.syncAssessment('assessment-1')).resolves.toMatchObject({ assessmentId: 'assessment-1', status: 'SYNCING' });
+    expect(fetchMock.mock.calls[2][0]).toMatch(/assessments\/assessment-1\/sync$/);
+    expect(fetchMock.mock.calls[2][1]).toMatchObject({ method: 'POST', body: '{}' });
+  });
+
+  it('bounds a stalled status response body and releases its timeout', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockImplementation(async (_url, init) => ({
+      ok: true, status: 200, headers: new Headers(),
+      json: () => new Promise((_resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+      }),
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    const rejected = expect(api.getAttemptStatus('attempt-1')).rejects.toMatchObject({ code: 'REQUEST_TIMEOUT' });
+    await vi.advanceTimersByTimeAsync(30_000);
+    await rejected;
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0][1].signal.aborted).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('times out a stalled CSRF request and permits a later fresh preparation', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn()
+      .mockImplementationOnce((_url, init) => new Promise((_resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+      }))
+      .mockResolvedValueOnce(jsonResponse({ csrf_token: 'a'.repeat(32) }))
+      .mockResolvedValueOnce(jsonResponse({ receipt_id: 'accepted' }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    const rejected = expect(api.submitAttempt('attempt-1', 0)).rejects.toMatchObject({ code: 'REQUEST_TIMEOUT' });
+    await vi.advanceTimersByTimeAsync(30_000);
+    await rejected;
+    expect(fetchMock).toHaveBeenCalledOnce();
+    await expect(api.submitAttempt('attempt-1', 0)).resolves.toMatchObject({ receipt_id: 'accepted' });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('does not replay a timed-out submission whose server result is unknown', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ csrf_token: 'a'.repeat(32) }))
+      .mockImplementationOnce((_url, init) => new Promise((_resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    const rejected = expect(api.submitAttempt('attempt-1', 0)).rejects.toMatchObject({ code: 'REQUEST_TIMEOUT' });
+    await vi.advanceTimersByTimeAsync(30_000);
+    await rejected;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('cancels a caller waiting for shared CSRF without interrupting another caller', async () => {
+    vi.useFakeTimers();
+    let csrfReady!: (value: Response) => void;
+    const fetchMock = vi.fn()
+      .mockReturnValueOnce(new Promise((resolve) => { csrfReady = resolve; }))
+      .mockResolvedValueOnce(jsonResponse({ receipt_id: 'accepted' }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    const controller = new AbortController();
+    const rejected = expect(api.startAttempt('assessment-1', controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
+    const second = api.submitAttempt('attempt-1', 0);
+    controller.abort();
+    await rejected;
+    csrfReady(jsonResponse({ csrf_token: 'a'.repeat(32) }));
+    await expect(second).resolves.toMatchObject({ receipt_id: 'accepted' });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][0]).toContain('/attempt-1/submit');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('keeps a longer bounded budget for live Moodle preparation', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ csrf_token: 'a'.repeat(32) }))
+      .mockImplementationOnce((_url, init) => new Promise((_resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    const rejected = expect(api.startAttempt('assessment-1')).rejects.toMatchObject({ code: 'REQUEST_TIMEOUT' });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fetchMock.mock.calls[1][1].signal.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(300_000);
+    await rejected;
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([
+    [{ revision: 7 }, { content: 'Вопрос', revision: 7 }],
+    [{ teacherComment: 'Замечание' }, { content: 'Вопрос', teacher_comment: 'Замечание' }],
+    [{ teacherComment: '' }, { content: 'Вопрос', teacher_comment: '' }],
+    [{}, { content: 'Вопрос' }],
+  ])('sends only optional revision/comment, never client-provided source context (%j)', async (context, expected) => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ csrf_token: 'a'.repeat(32) }))
+      .mockResolvedValueOnce(jsonResponse({ id: 'reply', content: 'Объяснение', citations: [] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    await api.sendAiMessage('thread-1', 'Вопрос', context);
+    const [url, init] = fetchMock.mock.calls[1];
+    expect(url).toContain('/ai/threads/thread-1/messages');
+    expect(JSON.parse(init.body)).toEqual(expected);
+  });
+
   it('waits for a busy student session with the same start idempotency key', async () => {
     vi.useFakeTimers();
     const fetchMock = vi.fn()
@@ -97,23 +261,29 @@ describe('API transport security contract', () => {
     expect(fetchMock.mock.calls[0][1]).toMatchObject({ credentials: 'include' });
   });
 
-  it('retries a failed Moodle history import through the outbox mutation', async () => {
+  it('uses shared manual runs for the review list without consulting or retrying outbox jobs', async () => {
     const fetchMock = vi.fn()
-      .mockResolvedValueOnce(jsonResponse({ csrf_token: 'a'.repeat(32) }))
-      .mockResolvedValueOnce(jsonResponse({
-        id: 'event-1', event_type: 'moodle.history.import', aggregate_id: 'assessment-1',
-        state: 'RETRY', created_at: '2026-09-03T01:00:00Z', updated_at: '2026-09-03T02:00:00Z',
-        payload: { actor_external_subject: 'teacher-1' }, receipt: {},
-      }));
+      .mockResolvedValueOnce(jsonResponse([{ id: 'course-1', role: 'TEACHER' }, { id: 'student-course', role: 'STUDENT' }]))
+      .mockResolvedValueOnce(jsonResponse([
+        { assessment_id: 'assessment-1', assessment_title: 'Работа 1', status: 'SYNCING', updated_at: '2026-09-24T10:00:00Z' },
+        { assessment_id: 'assessment-2', assessment_title: 'Работа 2', status: 'COMPLETED' },
+        { assessment_id: 'assessment-3', assessment_title: 'Работа 3', status: 'IDLE' },
+        { assessment_id: 'assessment-4', assessment_title: 'Работа 4', status: 'FAILED', last_error: 'TIMEOUT' },
+        { assessment_id: 'assessment-5', assessment_title: 'Работа 5', status: 'PARTIAL', last_error: 'Не загружены файлы', error_code: 'ARTIFACT_OMITTED' },
+      ]));
     vi.stubGlobal('fetch', fetchMock);
     const { api } = await freshApi();
 
-    await expect(api.retryMoodleHistoryImport('event-1')).resolves.toMatchObject({
-      id: 'event-1', aggregateId: 'assessment-1', actorKey: 'teacher-1', state: 'RETRY',
-    });
+    await expect(api.getMoodleHistoryImportEvents()).resolves.toMatchObject([
+      { id: 'assessment-1', aggregateId: 'assessment-1', assessmentTitle: 'Работа 1', state: 'PROCESSING' },
+      { id: 'assessment-2', state: 'DELIVERED' },
+      { id: 'assessment-4', state: 'FAILED', lastError: 'TIMEOUT' },
+      { id: 'assessment-5', state: 'PARTIAL', lastError: 'Не загружены файлы', errorCode: 'ARTIFACT_OMITTED' },
+    ]);
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock.mock.calls[1][0]).toContain('/integrations/lms/outbox/event-1/retry');
-    expect(fetchMock.mock.calls[1][1]).toMatchObject({ method: 'POST', credentials: 'include' });
+    expect(fetchMock.mock.calls[1][0]).toContain('/courses/course-1/assessment-sync-status');
+    expect(fetchMock.mock.calls[1][1]).toMatchObject({ credentials: 'include' });
+    expect(fetchMock.mock.calls.every(([, init]) => !init.method || init.method === 'GET')).toBe(true);
   });
 
   it('retries a mutation only when the backend identifies a CSRF failure', async () => {
@@ -181,6 +351,7 @@ describe('API transport security contract', () => {
     ['UNAVAILABLE', 'Внешний сервис временно недоступен. Повторите попытку позже.'],
     ['INVALID_RESPONSE', 'Внешний сервис вернул неожиданный ответ.'],
     ['RESPONSE_TOO_LARGE', 'Ответ внешнего сервиса слишком большой.'],
+    ['AI_CONTEXT_TOO_LARGE', 'Условие и код целиком не помещаются в лимит контекста ИИ. Обратитесь к администратору для увеличения лимита.'],
     ['LMS_IMPORT_REQUIRES_CONFIGURATION', 'Импортированная работа ещё не готова. Синхронизируйте курс с Moodle.'],
     ['MOODLE_SOURCE_UNCONFIRMED', 'Moodle не подтвердил все параметры работы. Повторите синхронизацию курса.'],
     ['LMS_DELIVERY_PROFILE_UNRESOLVED', 'Moodle ещё не подтвердил формат ответа. Синхронизируйте курс и повторите запуск попытки.'],

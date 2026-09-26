@@ -54,23 +54,33 @@ from app.models.enums import (
     CourseImportState,
     CourseRole,
     LMSProvider,
-    SyncOutboxState,
 )
 from app.models.identity import ExternalPrincipal, LMSConnection, MoodleCredential
-from app.models.integration import AuditEntry, ExternalMapping, SyncOutbox, SystemSetting
+from app.models.integration import AuditEntry, ExternalMapping, SystemSetting
 from app.models.tasks import Assessment
 from app.schemas.courses import (
+    AssessmentSyncRead,
     CourseCatalogRead,
     CourseGroupRead,
     CourseImportCreateRequest,
     CourseImportRead,
     CourseSectionRead,
     CourseSyncRequest,
+    HistoryWarningsDismissRead,
+    HistoryWarningsDismissRequest,
 )
 from app.services.common import DomainError, positive_decimal
-from app.services.course_sync_state import course_sync_stale_before
-from app.services.moodle_history import enqueue_historical_submission_imports
-from app.services.moodle_materialization import materialize_moodle_activity_drafts
+from app.services.manual_sync import (
+    assessment_sync_statuses,
+    queue_manual_assessment_sync,
+    queue_manual_course_sync,
+    require_idle_course_for_import,
+)
+from app.services.moodle_history_warnings import save_warning_dismissals
+from app.services.moodle_materialization import (
+    materialize_moodle_activity_drafts,
+    merge_moodle_course_index,
+)
 from app.services.moodle_source import (
     moodle_source_confirmation_from_activity,
     moodle_source_is_confirmed,
@@ -109,10 +119,10 @@ class _BrowserCredentialLease:
 
 @dataclass(frozen=True, slots=True)
 class _BrowserCredentialSnapshot:
-    """Read-only browser state used by an explicit foreground refresh.
+    """Read-only browser state used by an explicit course import/refresh.
 
     Background imports keep the exclusive lease while they may update Moodle.
-    Course discovery itself is read-only, so a user-triggered refresh may use a
+    Course discovery itself is read-only, so a user-triggered import/refresh may use a
     detached snapshot concurrently.  Persisting its refreshed cookies remains
     optimistic: a newer exclusively leased state always wins.
     """
@@ -1231,6 +1241,7 @@ async def _project_course(
     for external_section_id, section in existing_sections.items():
         if external_section_id not in seen_sections:
             section.visible = False
+    activities = await merge_moodle_course_index(db, course=course, activities=activities)
     policies = dict(course.policies) if isinstance(course.policies, dict) else {}
     policies["lms_activities"] = [_activity_policy_projection(row) for row in activities]
     policies["lms_activity_revision"] = course.external_revision
@@ -1403,13 +1414,8 @@ async def _project_course(
     connection.capabilities = capabilities
     course.sync_status = "CURRENT"
     _clear_sync_error(course)
-    # Queue actor-scoped history crawls only after the fresh teacher roster is
-    # projected, otherwise a newly added course would miss its first import.
-    await enqueue_historical_submission_imports(
-        db,
-        course=course,
-        actor_external_subject=actor_external_subject,
-    )
+    # Course synchronization updates metadata and the roster only. Historical
+    # answers are imported exclusively by the selected assessment's button.
     await db.flush()
     return course
 
@@ -1677,7 +1683,6 @@ async def sync_course(
     course_id: uuid.UUID,
     _: CourseSyncRequest,
     context: CurrentAuth,
-    request: Request,
     db: DBSession,
 ) -> dict[str, Any]:
     membership = await _membership(db, context, course_id, CourseRole.TEACHER)
@@ -1685,160 +1690,79 @@ async def sync_course(
     connection = await db.get(LMSConnection, course.connection_id)
     if connection is None or not connection.enabled:
         raise _error(409, "CONNECTION_DISABLED", "Course LMS connection is disabled")
-    external_id = course.external_id
-    actor_subject = membership.principal.external_subject
-    connection_id = connection.id
-    now = utcnow()
-    # Acquire a durable course-level foreground lease with one conditional
-    # UPDATE.  Concurrent button presses therefore coalesce instead of issuing
-    # multiple browser crawls.  A stale marker is reclaimable by either this
-    # endpoint or the scheduler.
-    acquired = await db.execute(
-        update(Course)
-        .where(
-            Course.id == course.id,
-            or_(
-                Course.sync_status != "SYNCING",
-                Course.updated_at <= course_sync_stale_before(_settings(request), now),
-            ),
-        )
-        .values(sync_status="SYNCING", updated_at=now)
-        .execution_options(synchronize_session=False)
-    )
-    await db.commit()
-    await db.refresh(course)
-    if acquired.rowcount != 1:  # type: ignore[attr-defined]
-        return await _course_payload(
+    try:
+        await queue_manual_course_sync(
             db,
-            membership.membership,
-            course,
-            teacher=True,
+            course=course,
+            actor_external_subject=membership.principal.external_subject,
         )
+    except DomainError as exc:
+        raise _domain_error(exc) from exc
+    await db.commit()
+    return await _course_payload(db, membership.membership, course, teacher=True)
 
-    # A scheduler transaction may have queued the course immediately before
-    # the foreground lease became visible.  Reuse that durable request instead
-    # of racing it through the same Moodle browser session.  Explicit clicks
-    # bring delayed retries forward and the UI polls the SYNCING marker.
-    outstanding = await db.scalar(
-        select(SyncOutbox.id).where(
-            SyncOutbox.course_id == course.id,
-            SyncOutbox.event_type == "course.sync",
-            SyncOutbox.state.in_(
-                [
-                    SyncOutboxState.PENDING.value,
-                    SyncOutboxState.PROCESSING.value,
-                    SyncOutboxState.RETRY.value,
-                ]
-            ),
-        )
+
+@router.get("/courses/{course_id}/assessment-sync-status", response_model=list[AssessmentSyncRead])
+async def course_assessment_sync_status(
+    course_id: uuid.UUID, context: CurrentAuth, db: DBSession,
+    include_warnings: bool = False,
+) -> list[dict[str, Any]]:
+    await _membership(db, context, course_id, CourseRole.TEACHER)
+    return await assessment_sync_statuses(
+        db, course_id=course_id,
+        principal_id=context.principal_id if include_warnings else None,
+        allow_system_settings_read=context.has_capability("SYSTEM_SETTINGS"),
     )
-    if outstanding is not None:
-        await db.execute(
-            update(SyncOutbox)
-            .where(
-                SyncOutbox.course_id == course.id,
-                SyncOutbox.event_type == "course.sync",
-                SyncOutbox.state.in_([SyncOutboxState.PENDING.value, SyncOutboxState.RETRY.value]),
-            )
-            .values(next_attempt_at=now)
-            .execution_options(synchronize_session=False)
-        )
-        await db.commit()
-        return await _course_payload(
-            db,
-            membership.membership,
-            course,
-            teacher=True,
-        )
-    try:
-        discovery = await _discover(
-            request,
-            db,
-            connection=connection,
-            external_id=external_id,
-            actor_external_subject=actor_subject,
-            actor_principal_id=membership.principal.id,
-            foreground=True,
-        )
-    except IntegrationError as exc:
-        row = await db.get(Course, course_id)
-        if row is not None:
-            _record_sync_error(
-                row,
-                code=exc.code,
-                message=str(exc),
-                retryable=exc.retryable,
-            )
-            await db.commit()
-        raise _error(502, exc.code, "LMS synchronization failed") from exc
-    connection = await db.get(LMSConnection, connection_id)
-    if connection is None:
-        row = await db.get(Course, course_id)
-        if row is not None:
-            _record_sync_error(
-                row,
-                code="CONNECTION_DISABLED",
-                message="Course LMS connection is unavailable",
-                retryable=False,
-            )
-            await db.commit()
-        raise _error(409, "CONNECTION_DISABLED", "Course LMS connection is unavailable")
-    try:
-        projected = await _project_course(
-            db,
-            connection=connection,
-            preview=discovery.preview,
-            capabilities=discovery.capabilities,
-            created_by_id=context.principal_id,
-            actor_external_subject=actor_subject,
-        )
-        delivered_at = utcnow()
-        # Make a successful foreground discovery visible to the periodic
-        # scheduler.  Without this durable receipt, the next scheduler tick
-        # sees no recent course.sync delivery and immediately queues the same
-        # crawl again, often racing the history imports just created above.
-        db.add(
-            SyncOutbox(
-                connection_id=connection_id,
-                course_id=projected.id,
-                event_type="course.sync",
-                aggregate_type="Course",
-                aggregate_id=projected.id,
-                idempotency_key=(f"course-sync-manual:{projected.id.hex}:{uuid.uuid4().hex[:12]}"),
-                payload={"course_id": projected.external_id, "foreground": True},
-                state=SyncOutboxState.DELIVERED.value,
-                receipt={
-                    "status": "DELIVERED",
-                    "foreground": True,
-                    "external_revision": projected.external_revision,
-                },
-                delivered_at=delivered_at,
-            )
-        )
-    except Exception:
-        await db.rollback()
-        row = await db.get(Course, course_id)
-        if row is not None:
-            _record_sync_error(
-                row,
-                code="COURSE_PROJECTION_FAILED",
-                message="The synchronized Moodle data could not be applied",
-                retryable=False,
-            )
-            await db.commit()
-        raise
+
+
+@router.post(
+    "/assessments/{assessment_id}/sync-warnings/dismiss", response_model=HistoryWarningsDismissRead,
+)
+async def dismiss_assessment_sync_warnings(
+    assessment_id: uuid.UUID, payload: HistoryWarningsDismissRequest,
+    context: CurrentAuth, db: DBSession,
+) -> dict[str, Any]:
+    assessment = await db.get(Assessment, assessment_id)
+    if assessment is None:
+        raise _error(404, "ASSESSMENT_NOT_FOUND", "Работа не найдена.")
+    await _membership(db, context, assessment.course_id, CourseRole.TEACHER)
+    statuses = await assessment_sync_statuses(
+        db, course_id=assessment.course_id, assessment_id=assessment_id,
+        principal_id=context.principal_id,
+        allow_system_settings_read=context.has_capability("SYSTEM_SETTINGS"),
+    )
+    # Only acknowledge the exact details the caller saw. New warnings arriving
+    # between the read and this click must remain visible.
+    visible_ids = {item["id"] for status in statuses for item in status.get("warnings", [])}
+    dismissed = await save_warning_dismissals(
+        db, principal_id=context.principal_id, assessment_id=assessment_id,
+        requested_ids=payload.warning_ids, visible_ids=visible_ids,
+    )
     await db.commit()
-    membership_row = await db.scalar(
-        select(CourseMembership).where(
-            CourseMembership.course_id == projected.id,
-            CourseMembership.principal_id == context.principal_id,
-            CourseMembership.role == CourseRole.TEACHER.value,
-            CourseMembership.active.is_(True),
+    return {"dismissed_warning_ids": dismissed}
+
+
+@router.post("/assessments/{assessment_id}/sync", response_model=AssessmentSyncRead)
+async def sync_assessment(
+    assessment_id: uuid.UUID, _: CourseSyncRequest, context: CurrentAuth, db: DBSession,
+) -> dict[str, Any]:
+    assessment = await db.get(Assessment, assessment_id)
+    if assessment is None:
+        raise _error(404, "ASSESSMENT_NOT_FOUND", "Работа не найдена.")
+    membership = await _membership(db, context, assessment.course_id, CourseRole.TEACHER)
+    course = membership.course
+    connection = await db.get(LMSConnection, course.connection_id)
+    if connection is None or not connection.enabled:
+        raise _error(409, "CONNECTION_DISABLED", "Course LMS connection is disabled")
+    try:
+        result = await queue_manual_assessment_sync(
+            db, course=course, assessment=assessment,
+            actor_external_subject=membership.principal.external_subject,
         )
-    )
-    if membership_row is None:
-        raise _error(403, "COURSE_MEMBERSHIP_REQUIRED", "Teacher membership was removed by LMS")
-    return await _course_payload(db, membership_row, projected, teacher=True)
+    except DomainError as exc:
+        raise _domain_error(exc) from exc
+    await db.commit()
+    return result
 
 
 @router.get("/courses/{course_id}/sync-status")
@@ -1937,6 +1861,10 @@ async def create_course_import(
             external_id=external_id,
             actor_external_subject=principal.external_subject,
             actor_principal_id=principal.id,
+            # Discovering a new course only reads Moodle, just like a manual
+            # refresh. Do not take the exclusive credential lease held by an
+            # unrelated course/history worker; use the reserved foreground lane.
+            foreground=True,
         )
     except IntegrationError as exc:
         job = await db.get(CourseImportJob, job_id)
@@ -1998,7 +1926,12 @@ async def confirm_course_import(
         return _job_read(job)
     if job.state != CourseImportState.DISCOVERED.value or not job.preview:
         raise _error(409, "COURSE_IMPORT_NOT_CONFIRMABLE", "Course import cannot be confirmed")
-    connection = await db.get(LMSConnection, job.connection_id)
+    # Match _project_course's Connection -> Course lock order, including the
+    # first import when no course row exists yet. The duplicate check must run
+    # after this lock or a second confirmation could apply its stale preview.
+    connection = await db.scalar(select(LMSConnection).where(
+        LMSConnection.id == job.connection_id,
+    ).with_for_update().execution_options(populate_existing=True))
     if connection is None or not connection.enabled:
         raise _error(409, "CONNECTION_DISABLED", "Course LMS connection is disabled")
     discovery_actor = await db.get(ExternalPrincipal, job.requested_by_id)
@@ -2012,6 +1945,23 @@ async def confirm_course_import(
             "COURSE_IMPORT_ACTOR_UNAVAILABLE",
             "The Moodle account used for course discovery is no longer available",
         )
+    existing = await db.scalar(select(Course).where(
+        Course.connection_id == connection.id,
+        Course.external_id == job.external_course_id,
+    ).with_for_update().execution_options(populate_existing=True))
+    if existing is not None:
+        if existing.catalog_enabled and existing.archived_at is None:
+            # Re-adding an admitted course is idempotent. A stored discovery
+            # preview can be older than its current tasks/roster, and applying
+            # it here would bypass the course/task synchronization lock.
+            job.confirmed_course_id = existing.id
+            job.state = CourseImportState.CONFIRMED.value
+            await db.commit()
+            return _job_read(job)
+        try:
+            await require_idle_course_for_import(db, course=existing)
+        except DomainError as exc:
+            raise _domain_error(exc) from exc
     course = await _project_course(
         db,
         connection=connection,

@@ -13,6 +13,7 @@ from app.auth.context import CurrentAuth
 from app.core.config import Settings
 from app.db.base import utcnow
 from app.db.session import get_db
+from app.integrations._http import canonical_json
 from app.integrations.ai import AIAnswer, AIProvider
 from app.integrations.errors import (
     IntegrationConfigurationError,
@@ -24,8 +25,8 @@ from app.models.courses import Course, CourseMembership
 from app.models.enums import AttemptState, ChatMode, CourseRole
 from app.models.identity import ExternalPrincipal
 from app.models.integration import SystemSetting
-from app.models.review import ChatMessage, ChatThread
-from app.models.tasks import Assessment
+from app.models.review import ChatMessage, ChatThread, ReviewDecision, ReviewDraft
+from app.models.tasks import Assessment, TaskVersion
 from app.schemas.ai import (
     ChatMessageCreateRequest,
     ChatMessageRead,
@@ -247,6 +248,26 @@ async def _require_thread_mutation_access(
     )
 
 
+async def _task_context(
+    db: AsyncSession, attempt: Attempt, assessment: Assessment,
+) -> dict[str, Any]:
+    # Use the immutable variant assigned to this exact question workspace,
+    # never the current task-bank version or a sibling question's statement.
+    version = (
+        await db.get(TaskVersion, attempt.assigned_task_version_id)
+        if attempt.assigned_task_version_id else None
+    )
+    return {
+        "id": str(version.id) if version else None,
+        "title": version.title if version else assessment.title,
+        "statement": (
+            version.statement if version and version.statement.strip() else assessment.instructions
+        ),
+        "language": version.language if version else "CPP",
+        "language_standard": version.language_standard if version else "",
+    }
+
+
 async def _student_context(
     db: AsyncSession,
     *,
@@ -297,7 +318,11 @@ async def _student_context(
     globally_enabled, student_enabled = await _effective_ai_flags(db, settings)
     if not globally_enabled or not student_enabled or not policy_assessment.student_ai_enabled:
         raise DomainError(403, "STUDENT_AI_DISABLED", "Student AI help is disabled")
-    workspace = await db.scalar(select(Workspace).where(Workspace.attempt_id == attempt.id))
+    # Keep the revision and all files consistent while constructing context;
+    # the transaction is released before calling the external model.
+    workspace = await db.scalar(
+        select(Workspace).where(Workspace.attempt_id == attempt.id).with_for_update()
+    )
     if workspace is None:
         raise DomainError(500, "WORKSPACE_MISSING", "Attempt workspace is missing")
     if expected_revision is not None and workspace.current_revision != expected_revision:
@@ -325,8 +350,9 @@ async def _student_context(
         "assessment": {
             "id": str(assessment.id),
             "title": assessment.title,
-            "instructions": assessment.instructions,
+            "instructions": policy_assessment.instructions,
         },
+        "task": await _task_context(db, attempt, assessment),
         "attempt": {
             "id": str(attempt.id),
             "revision": workspace.current_revision,
@@ -352,6 +378,7 @@ async def _teacher_context(
     expected_course_id: uuid.UUID | None,
     settings: Settings,
     allow_system_settings_read: bool = False,
+    teacher_comment: str | None = None,
 ) -> dict[str, Any]:
     submission = await db.get(Submission, submission_id)
     attempt = await db.get(Attempt, submission.attempt_id) if submission is not None else None
@@ -373,13 +400,46 @@ async def _teacher_context(
     snapshot = await db.get(Snapshot, submission.snapshot_id)
     if snapshot is None:
         raise DomainError(500, "SNAPSHOT_MISSING", "Submission snapshot is missing")
+    # A child question has its own statement, but shares the work's general
+    # instructions, just like the text displayed in the student's IDE.
+    context_assessment = assessment
+    relation = await quiz_question_for_attempt(db, attempt.id)
+    if relation is not None:
+        root = await db.get(Attempt, relation.root_attempt_id)
+        parent = await db.get(Assessment, root.assessment_id) if root is not None else None
+        if parent is None or parent.course_id != assessment.course_id:
+            raise DomainError(500, "ASSESSMENT_MISSING", "Quiz assessment is missing")
+        context_assessment = parent
+    comment_context = None
+    if teacher_comment is not None:
+        # A comment currently entered in the review form is only context;
+        # chatting must never save a draft or change a grade.
+        if teacher_comment.strip():
+            comment_context = {"content": teacher_comment, "source": "current_review_form"}
+    else:
+        decision = await db.scalar(
+            select(ReviewDecision).where(
+                ReviewDecision.submission_id == submission.id,
+                ReviewDecision.status == "APPLIED",
+            ).order_by(ReviewDecision.revision.desc()).limit(1)
+        )
+        draft = await db.scalar(select(ReviewDraft).where(
+            ReviewDraft.submission_id == submission.id,
+            ReviewDraft.owner_id == principal_id,
+        ))
+        if draft is not None and (
+            decision is None or _aware(draft.updated_at) > _aware(decision.created_at)
+        ):
+            comment_context = {"content": draft.comment, "source": "saved_review_draft"}
+        elif decision is not None:
+            comment_context = {"content": decision.comment, "source": "applied_review"}
     return {
         "mode": ChatMode.TEACHER.value,
         "course_id": str(assessment.course_id),
         "assessment": {
             "id": str(assessment.id),
             "title": assessment.title,
-            "instructions": assessment.instructions,
+            "instructions": context_assessment.instructions,
         },
         "submission": {
             "id": str(submission.id),
@@ -387,6 +447,8 @@ async def _teacher_context(
             "submitted_at": submission.submitted_at.isoformat(),
             "manifest_hash": snapshot.manifest_hash,
         },
+        "task": await _task_context(db, attempt, assessment),
+        "teacher_comment": comment_context,
         "files": [
             {
                 "path": str(item.get("path", "")),
@@ -406,14 +468,21 @@ async def _thread_context(
     principal_id: uuid.UUID,
     settings: Settings,
     allow_system_settings_read: bool = False,
+    expected_revision: int | None = None,
+    teacher_comment: str | None = None,
 ) -> dict[str, Any]:
     if thread.mode == ChatMode.STUDENT.value and thread.attempt_id is not None:
+        if teacher_comment is not None:
+            raise DomainError(
+                422, "AI_CONTEXT_NOT_ALLOWED", "Student context cannot set a teacher comment",
+            )
         return await _student_context(
             db,
             principal_id=principal_id,
             attempt_id=thread.attempt_id,
             expected_course_id=thread.course_id,
             settings=settings,
+            expected_revision=expected_revision,
         )
     if thread.mode == ChatMode.TEACHER.value and thread.submission_id is not None:
         return await _teacher_context(
@@ -423,6 +492,7 @@ async def _thread_context(
             expected_course_id=thread.course_id,
             settings=settings,
             allow_system_settings_read=allow_system_settings_read,
+            teacher_comment=teacher_comment,
         )
     raise DomainError(500, "AI_THREAD_CONTEXT_MISSING", "AI thread context is incomplete")
 
@@ -559,7 +629,7 @@ async def create_student_thread(
                 course_id=body.course,
                 attempt_id=body.attempt,
                 title=body.title,
-                policy_version="student-v1",
+                policy_version="student-no-code-v2",
             )
             db.add(thread)
             await db.flush()
@@ -596,7 +666,7 @@ async def create_teacher_thread(
                 course_id=body.course,
                 submission_id=body.submission,
                 title=body.title,
-                policy_version="teacher-v1",
+                policy_version="teacher-task-context-v2",
             )
             db.add(thread)
             await db.flush()
@@ -731,7 +801,14 @@ async def create_message(
                 principal_id=auth.principal_id,
                 settings=settings,
                 allow_system_settings_read=auth.has_capability("SYSTEM_SETTINGS"),
+                expected_revision=body.revision,
+                teacher_comment=body.teacher_comment,
             )
+            if len(canonical_json(context)) > settings.ai_max_context_bytes:
+                raise DomainError(
+                    413, "AI_CONTEXT_TOO_LARGE",
+                    "The full task and source exceed the configured AI context limit",
+                )
             history = await _stored_history(db, thread_id=thread.id, settings=settings)
             user_message = ChatMessage(
                 thread_id=thread.id,

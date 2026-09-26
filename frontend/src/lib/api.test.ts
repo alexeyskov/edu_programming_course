@@ -12,6 +12,19 @@ describe('backend DTO normalization', () => {
     expect(error.message).toBe('Сеанс работы завершён через Moodle.');
   });
 
+  it('localizes a deleted Moodle attempt and never prepares or edits its tombstone', () => {
+    const error = new ApiError(409, 'LMS_ATTEMPT_DELETED', 'Attempt deleted in Moodle');
+    expect(error.message).toBe('Попытка удалена в Moodle. Вернитесь к списку работ, чтобы открыть доступную попытку.');
+    const deleted = apiNormalizers.mapAttempt({
+      id: 'a1', state: 'VOID', closure_reason: 'LMS_ATTEMPT_DELETED',
+      ai_enabled: true, requires_live_lms_preparation: true,
+    });
+    expect(deleted).toMatchObject({
+      status: 'LOCKED', closureReason: 'LMS_ATTEMPT_DELETED',
+      aiEnabled: false, requiresLiveLmsPreparation: false,
+    });
+  });
+
   it.each([
     {
       code: 'MOODLE_QUIZ_GRADING_METHOD_UNCONFIRMED',

@@ -194,6 +194,8 @@ def create_app(
             )
         except (InteractiveSessionNotFoundError, InteractiveSessionStateError) as exc:
             raise interactive_error(exc) from exc
+        except RunnerBusyError as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
 
     @application.post(
         "/v1/interactive-sessions/{session_id}/eof",

@@ -18,6 +18,7 @@ from app.models.enums import LMSProvider, TaskVersionStatus
 from app.models.identity import LMSConnection
 from app.models.integration import ExternalMapping
 from app.models.tasks import Assessment, TaskBankItem, TaskVersion
+from app.services.assessment_mappings import assessment_activity_mappings
 from app.services.build_profile import effective_workspace_build_profile
 from app.services.common import DomainError, canonical_hash, sha256_text
 from app.services.moodle_source import moodle_statement_is_deferred
@@ -305,6 +306,36 @@ def _mapping_module(mapping: ExternalMapping, metadata: dict[str, Any]) -> str:
     return module.removeprefix("mod_")
 
 
+async def ensure_moodle_activity_not_missing(
+    db: AsyncSession,
+    assessment_id: uuid.UUID,
+) -> None:
+    """Reject new admission/publication after an explicit course removal scan.
+
+    A stale/error snapshot is not proof of removal. Existing delivery contexts
+    remain resolvable so saved student submissions are not cancelled by this
+    local admission guard.
+    """
+    missing = await db.scalar(
+        select(ExternalMapping.id)
+        .join(Assessment, Assessment.id == ExternalMapping.local_id)
+        .join(Course, Course.id == Assessment.course_id)
+        .where(
+            Assessment.id == assessment_id,
+            ExternalMapping.connection_id == Course.connection_id,
+            ExternalMapping.local_type.in_(["Assessment", "core.assessment"]),
+            ExternalMapping.metadata_json["sync_state"].as_string() == "MISSING_IN_MOODLE",
+        )
+        .limit(1)
+    )
+    if missing is not None:
+        raise DomainError(
+            409,
+            "MOODLE_ASSESSMENT_UNAVAILABLE",
+            "The work was removed from Moodle. Refresh the course manually before reopening it",
+        )
+
+
 async def _resolve_moodle_activity_context(
     db: AsyncSession,
     assessment_id: uuid.UUID,
@@ -322,16 +353,8 @@ async def _resolve_moodle_activity_context(
     assessment, course, connection = row
     assessment_policy = assessment.policy if isinstance(assessment.policy, dict) else {}
     managed_by_moodle = assessment_policy.get("moodle_metadata_read_only") is True
-    mappings = list(
-        (
-            await db.scalars(
-                select(ExternalMapping).where(
-                    ExternalMapping.connection_id == course.connection_id,
-                    ExternalMapping.local_id == assessment.id,
-                    ExternalMapping.local_type.in_(["Assessment", "core.assessment"]),
-                )
-            )
-        ).all()
+    mappings = await assessment_activity_mappings(
+        db, connection_id=course.connection_id, assessment_id=assessment.id,
     )
     if len(mappings) != 1:
         if managed_by_moodle:

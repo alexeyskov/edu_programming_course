@@ -76,6 +76,7 @@ from app.services.common import (
     positive_decimal,
     sha256_text,
 )
+from app.services.moodle_quiz_runtime import ensure_moodle_activity_not_missing
 from app.services.moodle_source import (
     confirmed_moodle_quiz_grading_method,
     missing_moodle_source_confirmations,
@@ -514,6 +515,12 @@ def _managed_moodle_mapping_issue(
     if external_module not in {"assign", "quiz"}:
         return invalid
     metadata = mapping.metadata_json if isinstance(mapping.metadata_json, dict) else {}
+    if metadata.get("sync_state") == "MISSING_IN_MOODLE":
+        return ValidationIssue(
+            field="policy.lms_activity_mapping",
+            code="MOODLE_ASSESSMENT_UNAVAILABLE",
+            message="The work was removed from Moodle. Refresh the course manually",
+        )
     metadata_module = str(metadata.get("module", external_module)).lower().replace("-", "_")
     metadata_module = metadata_module.removeprefix("mod_")
     if metadata_module != external_module:
@@ -1140,6 +1147,7 @@ async def _student_available(
     if assessment.status != AssessmentStatus.PUBLISHED.value:
         return False
     try:
+        await ensure_moodle_activity_not_missing(db, assessment.id)
         await ensure_assessment_available(db, assessment, membership)
     except DomainError:
         return False
@@ -1274,7 +1282,18 @@ async def list_course_assessments(
         (
             await db.scalars(
                 select(Assessment)
-                .where(Assessment.course_id == course_id)
+                .where(
+                    Assessment.course_id == course_id,
+                    ~select(ExternalMapping.id)
+                    .where(
+                        ExternalMapping.connection_id == membership.course.connection_id,
+                        ExternalMapping.local_id == Assessment.id,
+                        ExternalMapping.local_type.in_(["Assessment", "core.assessment"]),
+                        ExternalMapping.metadata_json["sync_state"].as_string()
+                        == "MISSING_IN_MOODLE",
+                    )
+                    .exists(),
+                )
                 .order_by(Assessment.opens_at, Assessment.created_at)
             )
         ).all()
@@ -1405,7 +1424,8 @@ async def update_assessment(
         if name == "type" and value is not None:
             value = value.value
         setattr(assessment, name, value)
-    await _sync_assessment_mapping(db, assessment)
+    if managed_mapping is None:
+        await _sync_assessment_mapping(db, assessment)
     await db.commit()
     return await _assessment_teacher_read(db, assessment)
 
@@ -1820,6 +1840,7 @@ async def assessment_publication_targets(
     db: DBSession,
 ) -> AssessmentPublicationTargetsRead:
     assessment, _ = await _assessment_access(db, context, assessment_id, teacher=True)
+    await ensure_moodle_activity_not_missing(db, assessment.id)
     mapping = await _managed_moodle_mapping(db, assessment.id)
     if mapping is None:
         raise _error(
@@ -1841,10 +1862,17 @@ async def _replace_managed_publication_rules(
     assessment: Assessment,
     groups: list[CourseGroup],
     authored_by_id: uuid.UUID,
+    editable_group_external_ids: set[str] | None,
 ) -> None:
-    await db.execute(
-        delete(AvailabilityRule).where(AvailabilityRule.assessment_id == assessment.id)
-    )
+    query = delete(AvailabilityRule).where(AvailabilityRule.assessment_id == assessment.id)
+    if editable_group_external_ids is not None:
+        # The editor shows only this teacher's groups. Unchecked/absent groups
+        # belonging to colleagues must not be removed by this scoped save.
+        query = query.where(
+            AvailabilityRule.target_type == AvailabilityTarget.GROUP.value,
+            AvailabilityRule.target_external_id.in_(editable_group_external_ids),
+        )
+    await db.execute(query)
     for group in groups:
         db.add(
             AvailabilityRule(
@@ -1888,6 +1916,7 @@ async def publish_assessment(
         teacher=True,
         lock=True,
     )
+    await ensure_moodle_activity_not_missing(db, assessment.id)
     managed_mapping = await _managed_moodle_mapping(db, assessment.id)
     policy = assessment.policy if isinstance(assessment.policy, dict) else {}
     if policy.get("moodle_metadata_read_only") is True or managed_mapping is not None:
@@ -1904,6 +1933,7 @@ async def publish_assessment(
                 errors=[mapping_issue.model_dump(mode="json")],
             )
     groups: list[CourseGroup] = []
+    editable_group_external_ids: set[str] | None = None
     if managed_mapping is not None:
         requested_group_ids = set(payload.group_ids or [])
         requested_principal_ids = set(payload.principal_ids or [])
@@ -1916,7 +1946,9 @@ async def publish_assessment(
                     "availability is checked directly in Moodle when a student starts"
                 ),
             )
-        if not requested_group_ids:
+        if payload.group_ids is None or (
+            not requested_group_ids and assessment.status != AssessmentStatus.PUBLISHED.value
+        ):
             raise _error(
                 422,
                 "MOODLE_PUBLICATION_TARGETS_REQUIRED",
@@ -1952,7 +1984,16 @@ async def publish_assessment(
                     "GROUP_SCOPE_REQUIRED",
                     "A teacher may enable work only for Moodle groups assigned to them",
                 )
-        _require_confirmed_quiz_grading_for_publication(managed_mapping)
+            editable_group_external_ids = set(await db.scalars(
+                select(CourseGroup.external_id).where(
+                    CourseGroup.course_id == assessment.course_id,
+                    CourseGroup.id.in_(allowed_group_ids),
+                    CourseGroup.active.is_(True),
+                )
+            ))
+        # Revoking access must not depend on Moodle confirming grading settings.
+        if requested_group_ids:
+            _require_confirmed_quiz_grading_for_publication(managed_mapping)
     if assessment.status == AssessmentStatus.PUBLISHED.value:
         if managed_mapping is not None:
             await _replace_managed_publication_rules(
@@ -1960,6 +2001,7 @@ async def publish_assessment(
                 assessment=assessment,
                 groups=groups,
                 authored_by_id=context.principal_id,
+                editable_group_external_ids=editable_group_external_ids,
             )
         if payload.student_ai_enabled is not None:
             assessment.student_ai_enabled = payload.student_ai_enabled
@@ -1987,6 +2029,7 @@ async def publish_assessment(
             assessment=assessment,
             groups=groups,
             authored_by_id=context.principal_id,
+            editable_group_external_ids=editable_group_external_ids,
         )
     versions = list(
         (
@@ -2011,7 +2054,10 @@ async def publish_assessment(
     assessment.published_at = utcnow()
     if payload.student_ai_enabled is not None:
         assessment.student_ai_enabled = payload.student_ai_enabled
-    await _sync_assessment_mapping(db, assessment)
+    # Enabling imported work changes only local publication rules. Its Moodle
+    # metadata belongs to the explicit sync workflow, not to publication.
+    if managed_mapping is None:
+        await _sync_assessment_mapping(db, assessment)
     mirror_rows = list(
         (
             await db.execute(

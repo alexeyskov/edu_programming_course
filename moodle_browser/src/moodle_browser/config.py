@@ -51,6 +51,11 @@ class Settings:
     # still keeping the N150 deployment bounded.
     max_concurrent_operations: int = 3
     queue_wait_seconds: float = 2.0
+    # Explicit course reads use script-free contexts, separate from historical
+    # imports/logins. Two reads let a manual refresh and an addition coexist.
+    max_concurrent_course_reads: int = 2
+    course_queue_wait_seconds: float = 60.0
+    course_operation_timeout_seconds: float = 240.0
     # Student requests wait in a bounded FIFO instead of failing after the
     # short background-import admission window. Waiting needs no Chromium tab.
     student_queue_wait_seconds: float = 180.0
@@ -58,6 +63,9 @@ class Settings:
     # Script-free student forms have a separate, small pool. A teacher crawl
     # cannot exhaust it; these contexts do not load Moodle's editors/assets.
     max_concurrent_student_operations: int = 4
+    # Includes session/slot admission and all navigation/upload/verification.
+    # Stay below the backend's default 300-second RPC and credential lease.
+    student_operation_timeout_seconds: float = 240.0
     navigation_timeout_ms: int = 30_000
     max_login_course_role_pages: int = 64
     login_course_role_budget_seconds: float = 15.0
@@ -69,6 +77,9 @@ class Settings:
     max_course_section_pages: int = 128
     storage_state_max_bytes: int = 256 * 1024
     artifact_max_bytes: int = 4 * 1024 * 1024
+    # Teacher history imports may contain IDE/build archives; this does not
+    # increase the size of student uploads or authenticated request bodies.
+    history_artifact_max_bytes: int = 100 * 1024 * 1024
     request_body_max_bytes: int = 6 * 1024 * 1024
     idempotency_cache_entries: int = 1_000
     signature_clock_skew_seconds: int = 60
@@ -82,6 +93,18 @@ class Settings:
             raise ValueError("MOODLE_BROWSER_MAX_CONCURRENT_OPERATIONS must be between 1 and 8")
         if not 0.05 <= self.queue_wait_seconds <= 60:
             raise ValueError("MOODLE_BROWSER_QUEUE_WAIT_SECONDS is outside the supported range")
+        if not 1 <= self.max_concurrent_course_reads <= 4:
+            raise ValueError("MOODLE_BROWSER_MAX_CONCURRENT_COURSE_READS must be between 1 and 4")
+        if not 0.05 <= self.course_queue_wait_seconds <= 120:
+            raise ValueError(
+                "MOODLE_BROWSER_COURSE_QUEUE_WAIT_SECONDS is outside the supported range"
+            )
+        if not 10 <= self.course_operation_timeout_seconds <= 240:
+            raise ValueError(
+                "MOODLE_BROWSER_COURSE_OPERATION_TIMEOUT_SECONDS is outside the supported range"
+            )
+        if self.course_queue_wait_seconds >= self.course_operation_timeout_seconds:
+            raise ValueError("Course queue wait must be shorter than the course operation timeout")
         if not 0.05 <= self.student_queue_wait_seconds <= 240:
             raise ValueError(
                 "MOODLE_BROWSER_STUDENT_QUEUE_WAIT_SECONDS is outside the supported range"
@@ -93,6 +116,10 @@ class Settings:
         if not 1 <= self.max_concurrent_student_operations <= 8:
             raise ValueError(
                 "MOODLE_BROWSER_MAX_CONCURRENT_STUDENT_OPERATIONS must be between 1 and 8"
+            )
+        if not 10 <= self.student_operation_timeout_seconds <= 240:
+            raise ValueError(
+                "MOODLE_BROWSER_STUDENT_OPERATION_TIMEOUT_SECONDS is outside the supported range"
             )
         if not 1_000 <= self.navigation_timeout_ms <= 120_000:
             raise ValueError("MOODLE_BROWSER_NAVIGATION_TIMEOUT_MS is outside the supported range")
@@ -128,6 +155,10 @@ class Settings:
             )
         if not 1 <= self.artifact_max_bytes <= 4 * 1024 * 1024:
             raise ValueError("MOODLE_BROWSER_ARTIFACT_MAX_BYTES is outside the supported range")
+        if not 1 <= self.history_artifact_max_bytes <= 100 * 1024 * 1024:
+            raise ValueError(
+                "MOODLE_BROWSER_HISTORY_ARTIFACT_MAX_BYTES is outside the supported range"
+            )
         minimum_request_size = max(
             self.storage_state_max_bytes,
             ((self.artifact_max_bytes + 2) // 3) * 4 + 64 * 1024,
@@ -172,6 +203,15 @@ class Settings:
                 os.environ.get("MOODLE_BROWSER_MAX_CONCURRENT_OPERATIONS", "3")
             ),
             queue_wait_seconds=float(os.environ.get("MOODLE_BROWSER_QUEUE_WAIT_SECONDS", "8")),
+            max_concurrent_course_reads=int(
+                os.environ.get("MOODLE_BROWSER_MAX_CONCURRENT_COURSE_READS", "2")
+            ),
+            course_queue_wait_seconds=float(
+                os.environ.get("MOODLE_BROWSER_COURSE_QUEUE_WAIT_SECONDS", "60")
+            ),
+            course_operation_timeout_seconds=float(
+                os.environ.get("MOODLE_BROWSER_COURSE_OPERATION_TIMEOUT_SECONDS", "240")
+            ),
             student_queue_wait_seconds=float(
                 os.environ.get("MOODLE_BROWSER_STUDENT_QUEUE_WAIT_SECONDS", "180")
             ),
@@ -180,6 +220,9 @@ class Settings:
             ),
             max_concurrent_student_operations=int(
                 os.environ.get("MOODLE_BROWSER_MAX_CONCURRENT_STUDENT_OPERATIONS", "4")
+            ),
+            student_operation_timeout_seconds=float(
+                os.environ.get("MOODLE_BROWSER_STUDENT_OPERATION_TIMEOUT_SECONDS", "240")
             ),
             navigation_timeout_ms=int(
                 os.environ.get("MOODLE_BROWSER_NAVIGATION_TIMEOUT_MS", "30000")
@@ -211,6 +254,9 @@ class Settings:
             ),
             artifact_max_bytes=int(
                 os.environ.get("MOODLE_BROWSER_ARTIFACT_MAX_BYTES", str(4 * 1024 * 1024))
+            ),
+            history_artifact_max_bytes=int(
+                os.environ.get("MOODLE_BROWSER_HISTORY_ARTIFACT_MAX_BYTES", str(100 * 1024 * 1024))
             ),
             request_body_max_bytes=int(
                 os.environ.get("MOODLE_BROWSER_REQUEST_BODY_MAX_BYTES", str(6 * 1024 * 1024))

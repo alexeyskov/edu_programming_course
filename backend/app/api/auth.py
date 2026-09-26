@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
-from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -207,22 +207,7 @@ async def _resume_outbox_after_moodle_reauthentication(
     """
 
     now = utcnow()
-    principal = await db.get(ExternalPrincipal, principal_id)
-    actor_external_subject = principal.external_subject if principal is not None else ""
     attempt_ids = select(Attempt.id).where(Attempt.principal_id == principal_id)
-    teacher_course_ids = (
-        select(CourseMembership.course_id)
-        .join(Course, Course.id == CourseMembership.course_id)
-        .where(
-            CourseMembership.principal_id == principal_id,
-            CourseMembership.role == CourseRole.TEACHER.value,
-            CourseMembership.active.is_(True),
-            Course.catalog_enabled.is_(True),
-            Course.archived_at.is_(None),
-        )
-    )
-    if not await teacher_membership_is_authorized(db, principal_id):
-        teacher_course_ids = select(CourseMembership.course_id).where(CourseMembership.id.is_(None))
     resumable_error = or_(
         SyncOutbox.last_error.startswith("LMS_REAUTH_REQUIRED:"),
         SyncOutbox.last_error.startswith("MOODLE_AUTHENTICATION_FAILED:"),
@@ -233,22 +218,10 @@ async def _resume_outbox_after_moodle_reauthentication(
             SyncOutbox.connection_id == connection_id,
             SyncOutbox.state.in_([SyncOutboxState.BLOCKED.value, SyncOutboxState.FAILED.value]),
             resumable_error,
-            or_(
-                and_(
-                    SyncOutbox.event_type == "attempt.checkpoint",
-                    SyncOutbox.attempt_id.in_(attempt_ids),
-                ),
-                and_(
-                    SyncOutbox.event_type == "course.sync",
-                    SyncOutbox.course_id.in_(teacher_course_ids),
-                ),
-                and_(
-                    SyncOutbox.event_type == "moodle.history.import",
-                    SyncOutbox.course_id.in_(teacher_course_ids),
-                    SyncOutbox.payload["actor_external_subject"].as_string()
-                    == actor_external_subject,
-                ),
-            ),
+            # Logging in must not restart catalog/answer imports. Teachers
+            # explicitly choose which course or assessment to refresh.
+            SyncOutbox.event_type == "attempt.checkpoint",
+            SyncOutbox.attempt_id.in_(attempt_ids),
         )
         .values(
             state=SyncOutboxState.PENDING.value,
@@ -945,6 +918,22 @@ async def _project_pluginless_identity(
             )
         ).all()
     }
+    # Authentication proves this principal's live access, but no longer
+    # imports the course roster. Only explicit course synchronization may add
+    # or reactivate membership. Preserve the known active scope before live
+    # revocation below; changing a bound teacher token can still change the
+    # effective role of an already imported member.
+    imported_course_ids = set((await db.scalars(
+        select(CourseMembership.course_id).where(
+            CourseMembership.principal_id == principal.id,
+            CourseMembership.course_id.in_([course.id for course in catalog_courses.values()]),
+            CourseMembership.active.is_(True),
+            or_(
+                CourseMembership.valid_until.is_(None),
+                CourseMembership.valid_until > now,
+            ),
+        ).with_for_update()
+    )).all())
     if authoritative_roles:
         connection_course_ids = select(Course.id).where(Course.connection_id == connection.id)
         await db.execute(
@@ -965,7 +954,7 @@ async def _project_pluginless_identity(
         if not external_id:
             continue
         course = catalog_courses.get(external_id)
-        if course is None:
+        if course is None or course.id not in imported_course_ids:
             continue
         # Role evidence is authoritative only for this admitted course. Keep
         # the historical row, but deactivate a conflicting active role before
@@ -1632,6 +1621,25 @@ async def _upsert_launch_identity(
         )
     )
     if course is None:
+        return principal
+    # A signed Moodle launch authenticates the caller; it does not replace
+    # explicit roster synchronization. It may switch the effective role of
+    # an imported participant but cannot enroll or reactivate one.
+    imported_membership = await db.scalar(
+        select(CourseMembership)
+        .where(
+            CourseMembership.course_id == course.id,
+            CourseMembership.principal_id == principal.id,
+            CourseMembership.active.is_(True),
+            or_(
+                CourseMembership.valid_until.is_(None),
+                CourseMembership.valid_until > utcnow(),
+            ),
+        )
+        .limit(1)
+        .with_for_update()
+    )
+    if imported_membership is None:
         return principal
     await db.execute(
         update(CourseMembership)

@@ -155,8 +155,9 @@ async def test_playwright_login_projects_identity_and_only_persists_encrypted_br
 
     assert first.status_code == 201, first.text
     assert second.status_code == 201, second.text
-    assert first.json()["roles"] == ["STUDENT"]
-    assert second.json()["roles"] == ["STUDENT"]
+    # Login stores identity/credentials but must not import a new roster member.
+    assert first.json()["roles"] == second.json()["roles"] == []
+    assert first.json()["memberships"] == second.json()["memberships"] == []
     assert password not in first.text + second.text
 
     async with session_factory() as db:
@@ -459,7 +460,7 @@ async def test_playwright_relogin_resumes_only_checkpoint_events_blocked_by_expi
         assert untouched.last_error.startswith("QUIZ_ESSAY_MAPPING_REQUIRED:")
 
 
-async def test_playwright_relogin_resumes_teacher_history_import_for_the_same_course(
+async def test_playwright_relogin_does_not_resume_manual_teacher_history_imports(
     app_bundle, monkeypatch
 ) -> None:
     _, session_factory, _ = app_bundle
@@ -531,11 +532,11 @@ async def test_playwright_relogin_resumes_teacher_history_import_for_the_same_co
         stored = await db.get(SyncOutbox, event_id)
         other_stored = await db.get(SyncOutbox, other_actor_id)
 
-    assert resumed == 1
+    assert resumed == 0
     assert stored is not None
-    assert stored.state == SyncOutboxState.PENDING.value
-    assert stored.attempts == 0
-    assert stored.last_error == ""
+    assert stored.state == SyncOutboxState.BLOCKED.value
+    assert stored.attempts == 8
+    assert stored.last_error == "LMS_REAUTH_REQUIRED: Moodle browser session expired"
     assert other_stored is not None
     assert other_stored.state == SyncOutboxState.BLOCKED.value
     assert other_stored.attempts == 8

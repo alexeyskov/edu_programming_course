@@ -4,6 +4,7 @@ import base64
 import copy
 import hashlib
 import io
+import threading
 import uuid
 import zipfile
 from datetime import UTC, datetime, timedelta
@@ -342,6 +343,81 @@ def test_historical_source_files_safely_converts_inline_zip_and_omissions() -> N
     assert whitespace[0]["content"] == "\tint main() {\n\t    int value{};  \n\t}\n"
 
 
+@pytest.mark.parametrize("with_digest", [False, True])
+def test_quiz_response_revision_hashes_attachment_identity_not_base64_body(
+    monkeypatch, with_digest: bool
+) -> None:
+    item = _multi_essay_item()
+    response = item["responses"][0]
+    changed = copy.deepcopy(response)
+    changed["artifacts"] = [_encoded_artifact("time.cpp", b"int changed_answer = 2;\n")]
+    if not with_digest:
+        response["artifacts"][0].pop("sha256")
+        changed["artifacts"][0].pop("sha256")
+    original_hash = moodle_history_service.canonical_hash
+    projections: list[dict[str, Any]] = []
+
+    def recording_hash(value):
+        projections.append(value)
+        return original_hash(value)
+
+    monkeypatch.setattr(moodle_history_service, "canonical_hash", recording_hash)
+    first = moodle_history_service._quiz_response_submission(item, response, position=1)
+    second = moodle_history_service._quiz_response_submission(item, changed, position=1)
+
+    assert first["external_revision"] != second["external_revision"]
+    assert len(projections) == 2
+    for projection in projections:
+        artifact = projection["response"]["artifacts"][0]
+        assert "content_base64" not in artifact
+        assert len(artifact["sha256" if with_digest else "content_base64_sha256"]) == 64
+    # Only the hash projection loses the bytes; the materializer still receives
+    # the intact payload for checksum validation and source extraction.
+    assert "content_base64" in first["responses"][0]["artifacts"][0]
+
+
+@pytest.mark.parametrize("maximum_bytes", [6, 7, 8])
+def test_historical_artifact_byte_boundary_is_checked_before_base64_decode(
+    monkeypatch,
+    maximum_bytes: int,
+) -> None:
+    """Exercise all padding cases without allocating 100 MiB test strings."""
+
+    assert moodle_history_service._MAX_ARCHIVE_BYTES == 100 * 1024 * 1024
+    monkeypatch.setattr(moodle_history_service, "_MAX_ARCHIVE_BYTES", maximum_bytes)
+    accepted = _encoded_artifact("project.zip", b"x" * maximum_bytes)
+    assert moodle_history_service._decode_artifact(accepted) == b"x" * maximum_bytes
+    rejected = _encoded_artifact("project.zip", b"x" * (maximum_bytes + 1))
+    rejected.pop("size_bytes")  # The base64 size guard must work independently.
+
+    def unexpected_decode(*_args, **_kwargs):
+        pytest.fail("An oversized attachment must be rejected before allocating decoded bytes")
+
+    monkeypatch.setattr(moodle_history_service.base64, "b64decode", unexpected_decode)
+    assert moodle_history_service._decode_artifact(rejected) is None
+
+
+def test_historical_source_files_extracts_source_from_zip_larger_than_four_mib() -> None:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("build/student-program.exe", b"x" * (4 * 1024 * 1024 + 1))
+        archive.writestr("src/main.cpp", "int main() { return 0; }\n")
+        archive.writestr(
+            "generated/oversized.cpp", b"x" * (moodle_history_service._MAX_FILE_BYTES + 1)
+        )
+    assert len(buffer.getvalue()) > 4 * 1024 * 1024
+
+    files = historical_source_files(
+        {"responses": [{"artifacts": [_encoded_artifact("project.zip", buffer.getvalue())]}]}
+    )
+
+    # The larger compressed limit must neither import binaries nor raise the
+    # existing bound on a single extracted source file.
+    assert [(row["path"], row["content"]) for row in files] == [
+        ("src/main.cpp", "int main() { return 0; }\n")
+    ]
+
+
 def test_historical_source_files_extracts_bounded_7z_project(monkeypatch) -> None:
     members = {
         "src/main.cpp": b"int main() { return 0; }\n",
@@ -353,8 +429,9 @@ def test_historical_source_files_extracts_bounded_7z_project(monkeypatch) -> Non
     }
 
     class FakeSevenZipFile:
-        def __init__(self, _stream, *, mode: str) -> None:
+        def __init__(self, _stream, *, mode: str, max_extract_size: int) -> None:
             assert mode == "r"
+            assert max_extract_size == 256 * 1024 * 1024
 
         def __enter__(self):
             return self
@@ -438,6 +515,61 @@ def test_historical_source_files_extracts_real_7z_project() -> None:
         "fixtures/input.txt": "42\n",
     }
     assert omissions == []
+
+
+def test_historical_source_files_extracts_source_from_7z_larger_than_four_mib() -> None:
+    assert moodle_history_service._py7zr is not None
+    archive_bytes = io.BytesIO()
+    # COPY yields a real large archive quickly, without random fixtures or a
+    # large decompressor dictionary. The binary member must never be retained.
+    with moodle_history_service._py7zr.SevenZipFile(
+        archive_bytes,
+        mode="w",
+        filters=[{"id": moodle_history_service._py7zr.FILTER_COPY}],
+    ) as archive:
+        archive.writestr(b"x" * (4 * 1024 * 1024 + 1), "build/student-program.exe")
+        archive.writestr(b"int main() { return 0; }\n", "src/main.cpp")
+    assert len(archive_bytes.getvalue()) > 4 * 1024 * 1024
+    omissions: list[dict[str, str]] = []
+
+    files = historical_source_files(
+        {"responses": [{"artifacts": [_encoded_artifact("project.7z", archive_bytes.getvalue())]}]},
+        import_omissions=omissions,
+    )
+
+    assert [(row["path"], row["content"]) for row in files] == [
+        ("src/main.cpp", "int main() { return 0; }\n")
+    ]
+    assert omissions == []
+
+
+def test_historical_7z_bounds_skipped_solid_archive_members(monkeypatch) -> None:
+    class OversizedSolidArchive:
+        def __init__(self, _stream, *, mode: str, max_extract_size: int) -> None:
+            assert mode == "r"
+            assert max_extract_size == 256 * 1024 * 1024
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def list(self):
+            return [
+                SimpleNamespace(filename="build/program.exe", uncompressed=256 * 1024 * 1024),
+                SimpleNamespace(filename="main.cpp", uncompressed=25),
+            ]
+
+        def extract(self, **_kwargs) -> None:
+            pytest.fail("Oversized solid streams must be rejected before decompression")
+
+    monkeypatch.setattr(
+        moodle_history_service, "_py7zr", SimpleNamespace(SevenZipFile=OversizedSolidArchive)
+    )
+    files, reason = moodle_history_service._seven_zip_sources(b"fixture", set())
+    assert files == []
+    assert reason == "ARCHIVE_EXPANDED_SIZE_LIMIT"
 
 
 def test_historical_7z_without_library_is_explicit_not_generic(monkeypatch) -> None:
@@ -665,7 +797,181 @@ async def test_legacy_source_snapshot_is_rematerialized_once_without_remote_revi
         ("moodle-online-text.cpp", "int main(){return 0;}"),
     }
     assert mapping is not None
-    assert mapping.metadata_json["historical_source_materialization_version"] == 5
+    assert mapping.metadata_json["historical_source_materialization_version"] == 6
+
+
+@pytest.mark.parametrize("materialization_version", [5, 6])
+async def test_larger_attachment_limit_repairs_placeholder_without_changing_local_review(
+    app_bundle,
+    materialization_version: int,
+) -> None:
+    _, session_factory, _ = app_bundle
+    ids = await _seed_history_target(session_factory)
+    omitted = _finished_item()
+    omitted["grade"] = None
+    omitted["responses"][0]["answer_text"] = ""
+    omitted["responses"][0]["artifacts"] = [
+        {"filename": "solution.cpp", "downloaded": False, "omission_reason": "FILE_TOO_LARGE"}
+    ]
+    recovered = copy.deepcopy(omitted)
+    recovered["responses"][0]["artifacts"] = [
+        _encoded_artifact("solution.cpp", b"int main() { return 0; }\n")
+    ]
+
+    async with session_factory() as db, db.begin():
+        course = await db.get(Course, ids["course_id"])
+        assessment = await db.get(Assessment, ids["assessment_id"])
+        assert course is not None and assessment is not None
+        await materialize_historical_submissions(
+            db,
+            course=course,
+            assessment=assessment,
+            actor_external_subject="42",
+            items=[omitted],
+        )
+        mapping = await db.scalar(
+            select(ExternalMapping).where(
+                ExternalMapping.external_type == "moodle_historical_submission"
+            )
+        )
+        submission = await db.scalar(select(Submission))
+        assert mapping is not None and submission is not None
+        assert submission.external_receipt["source_complete"] is False
+        mapping.metadata_json = {
+            **mapping.metadata_json,
+            "historical_source_materialization_version": materialization_version,
+        }
+        db.add(
+            ReviewDecision(
+                submission_id=submission.id,
+                reviewer_id=ids["teacher_id"],
+                revision=1,
+                grade=Decimal("7"),
+                comment="Local teacher review must survive source recovery",
+                status="APPLIED",
+                lms_export_state="PENDING",
+            )
+        )
+
+    async with session_factory() as db, db.begin():
+        course = await db.get(Course, ids["course_id"])
+        assessment = await db.get(Assessment, ids["assessment_id"])
+        assert course is not None and assessment is not None
+        updated = await materialize_historical_submissions(
+            db,
+            course=course,
+            assessment=assessment,
+            actor_external_subject="42",
+            items=[recovered],
+        )
+        unchanged = await materialize_historical_submissions(
+            db,
+            course=course,
+            assessment=assessment,
+            actor_external_subject="42",
+            items=[recovered],
+        )
+
+    async with session_factory() as db:
+        submission = await db.scalar(select(Submission))
+        files = list((await db.scalars(select(WorkspaceFile))).all())
+        decisions = list((await db.scalars(select(ReviewDecision))).all())
+
+    assert updated.updated == 1
+    assert unchanged.unchanged == 1
+    assert submission is not None
+    assert submission.external_receipt["source_complete"] is True
+    assert submission.external_receipt["source_omissions"] == []
+    assert [(row.path, row.content) for row in files] == [
+        ("solution.cpp", "int main() { return 0; }\n")
+    ]
+    assert len(decisions) == 1
+    assert decisions[0].grade == Decimal("7")
+    assert decisions[0].comment == "Local teacher review must survive source recovery"
+    assert decisions[0].status == "APPLIED"
+    assert decisions[0].lms_export_state == "PENDING"
+
+
+async def test_failed_source_upgrade_keeps_complete_snapshot_and_can_be_retried(app_bundle):
+    _, session_factory, _ = app_bundle
+    ids = await _seed_history_target(session_factory)
+    complete = _finished_item()
+    failed = copy.deepcopy(complete)
+    failed["responses"][0]["answer_text"] = ""
+    failed["responses"][0]["artifacts"] = [
+        {"filename": "solution.cpp", "downloaded": False, "omission_reason": "DOWNLOAD_FAILED"}
+    ]
+    async with session_factory() as db, db.begin():
+        course = await db.get(Course, ids["course_id"])
+        assessment = await db.get(Assessment, ids["assessment_id"])
+        assert course is not None and assessment is not None
+        await materialize_historical_submissions(
+            db, course=course, assessment=assessment, actor_external_subject="42", items=[complete]
+        )
+        mapping = await db.scalar(
+            select(ExternalMapping).where(
+                ExternalMapping.external_type == "moodle_historical_submission"
+            )
+        )
+        submission = await db.scalar(select(Submission))
+        assert mapping is not None and submission is not None
+        original_snapshot_id = submission.snapshot_id
+        mapping.metadata_json = {
+            **mapping.metadata_json,
+            "historical_source_materialization_version": 5,
+        }
+        failure = await materialize_historical_submissions(
+            db, course=course, assessment=assessment, actor_external_subject="42", items=[failed]
+        )
+        assert failure.unchanged == 1
+        assert submission.snapshot_id == original_snapshot_id
+        assert submission.external_receipt["source_complete"] is True
+        assert submission.external_receipt["source_refresh_complete"] is False
+        assert submission.external_receipt["source_refresh_omissions"][0]["reason"] == (
+            "DOWNLOAD_FAILED"
+        )
+        assert mapping.metadata_json["historical_source_materialization_version"] == 5
+        assert await db.scalar(select(func.count(Snapshot.id))) == 1
+
+        success = await materialize_historical_submissions(
+            db, course=course, assessment=assessment, actor_external_subject="42", items=[complete]
+        )
+        assert success.updated == 1
+        assert submission.external_receipt["source_refresh_complete"] is True
+        assert submission.external_receipt["source_refresh_omissions"] == []
+        assert mapping.metadata_json["historical_source_materialization_version"] == 6
+
+
+@pytest.mark.parametrize("split_questions", [False, True])
+async def test_history_source_conversion_runs_once_per_question_off_event_loop(
+    app_bundle, monkeypatch, split_questions: bool
+) -> None:
+    _, session_factory, _ = app_bundle
+    ids = await _seed_history_target(session_factory)
+    convert = moodle_history_service.historical_source_files
+    event_loop_thread = threading.get_ident()
+    conversion_threads: list[int] = []
+
+    def recording_conversion(*args, **kwargs):
+        conversion_threads.append(threading.get_ident())
+        return convert(*args, **kwargs)
+
+    monkeypatch.setattr(moodle_history_service, "historical_source_files", recording_conversion)
+    async with session_factory() as db, db.begin():
+        course = await db.get(Course, ids["course_id"])
+        assessment = await db.get(Assessment, ids["assessment_id"])
+        assert course is not None and assessment is not None
+        stats = await materialize_historical_submissions(
+            db,
+            course=course,
+            assessment=assessment,
+            actor_external_subject="42",
+            items=[_multi_essay_item() if split_questions else _finished_item()],
+        )
+
+    assert stats.created == (2 if split_questions else 1)
+    assert len(conversion_threads) == (2 if split_questions else 1)
+    assert all(thread != event_loop_thread for thread in conversion_threads)
 
 
 async def test_imported_comment_signature_becomes_separate_reviewer_identity(app_bundle) -> None:
@@ -2300,9 +2606,7 @@ async def test_ungraded_refresh_supersedes_an_erroneous_imported_grade(app_bundl
         decisions = list((await db.scalars(select(ReviewDecision))).all())
         applied = list(
             (
-                await db.scalars(
-                    select(ReviewDecision).where(ReviewDecision.status == "APPLIED")
-                )
+                await db.scalars(select(ReviewDecision).where(ReviewDecision.status == "APPLIED"))
             ).all()
         )
 
@@ -2462,6 +2766,11 @@ async def test_history_outbox_page_materializes_and_queues_next_cursor(app_bundl
             select(SyncOutbox).where(SyncOutbox.event_type == "moodle.history.import")
         )
         assert initial is not None
+        # A previously queued offset-based event must still drain after the
+        # rollout; new inventories have their own pipeline coverage.
+        initial.payload = {
+            key: value for key, value in initial.payload.items() if key != "scan_only"
+        }
         initial_id = initial.id
         initial_limit = initial.payload["limit"]
 
@@ -2523,6 +2832,7 @@ async def test_history_outbox_page_materializes_and_queues_next_cursor(app_bundl
         "cursor": "0:0",
         "limit": initial_limit,
         "priority_only": True,
+        "include_activity_metadata": False,
     }
     assert len(events) == 2
     delivered = next(event for event in events if event.id == initial_id)
@@ -2567,7 +2877,8 @@ async def test_empty_history_import_completes_without_an_error_or_submission(app
 
     class EmptyBridge:
         async def discover_historical_submissions(
-            self, payload: dict[str, Any],
+            self,
+            payload: dict[str, Any],
         ) -> _BrowserDeliveryResult:
             return _BrowserDeliveryResult(
                 value={
@@ -2583,7 +2894,10 @@ async def test_empty_history_import_completes_without_an_error_or_submission(app
 
     async with httpx.AsyncClient() as client:
         assert await process_outbox_once(
-            session_factory, settings, bridge_factory=lambda *_args: EmptyBridge(), client=client,
+            session_factory,
+            settings,
+            bridge_factory=lambda *_args: EmptyBridge(),
+            client=client,
         )
 
     async with session_factory() as db:
@@ -2663,7 +2977,7 @@ async def test_completed_priority_history_scan_queues_exhaustive_scan(app_bundle
     assert exhaustive.payload["priority_only"] is False
 
 
-async def test_priority_history_scan_is_queued_while_legacy_full_scan_is_active(
+async def test_duplicate_history_scan_is_not_queued_while_another_scan_is_active(
     app_bundle,
 ) -> None:
     _, session_factory, settings = app_bundle
@@ -2705,9 +3019,8 @@ async def test_priority_history_scan_is_queued_while_legacy_full_scan_is_active(
             ).all()
         )
 
-    assert queued == 1
-    assert len(rows) == 2
-    assert {(row.payload or {}).get("priority_only") is True for row in rows} == {False, True}
+    assert queued == 0
+    assert len(rows) == 1
 
 
 async def test_browser_session_contention_never_exhausts_history_import_retry_budget(
@@ -2719,9 +3032,7 @@ async def test_browser_session_contention_never_exhausts_history_import_retry_bu
     async with session_factory() as db, db.begin():
         course = await db.get(Course, ids["course_id"])
         credential = await db.scalar(
-            select(MoodleCredential).where(
-                MoodleCredential.principal_id == ids["teacher_id"]
-            )
+            select(MoodleCredential).where(MoodleCredential.principal_id == ids["teacher_id"])
         )
         assert course is not None and credential is not None
         assert (
@@ -2735,15 +3046,21 @@ async def test_browser_session_contention_never_exhausts_history_import_retry_bu
         credential.lease_owner = "another-history-worker"
         credential.lease_expires_at = datetime.now(UTC) + timedelta(hours=1)
 
+    class BusyConnector:
+        async def discover_historical_submissions(self, payload):
+            from app.integrations.errors import IntegrationBusy
+
+            raise IntegrationBusy("Moodle history pool is busy")
+
+    # Read snapshots now bypass the exclusive session lease. Connector pool
+    # collisions still must not exhaust the external-delivery retry budget.
     # More collisions than the external-delivery retry budget previously made
     # the page terminally FAILED and severed the rest of its cursor chain.
     for _ in range(6):
         process_now = datetime.now(UTC)
         async with session_factory() as db, db.begin():
             event = await db.scalar(
-                select(SyncOutbox).where(
-                    SyncOutbox.event_type == "moodle.history.import"
-                )
+                select(SyncOutbox).where(SyncOutbox.event_type == "moodle.history.import")
             )
             assert event is not None
             event.next_attempt_at = process_now - timedelta(seconds=1)
@@ -2751,13 +3068,12 @@ async def test_browser_session_contention_never_exhausts_history_import_retry_bu
             session_factory,
             settings,
             now=process_now,
+            bridge_factory=lambda *_: BusyConnector(),
         )
 
     async with session_factory() as db:
         event = await db.scalar(
-            select(SyncOutbox).where(
-                SyncOutbox.event_type == "moodle.history.import"
-            )
+            select(SyncOutbox).where(SyncOutbox.event_type == "moodle.history.import")
         )
 
     assert event is not None
@@ -2945,9 +3261,9 @@ async def test_enqueue_history_import_does_not_fan_out_to_other_active_teacher_s
 
     assert first_count == 1
     assert second_count == 0
-    assert other_actor_count == 1
+    assert other_actor_count == 0
     assert missing_session_count == 0
-    assert {event.payload["actor_external_subject"] for event in events} == {"42", "84"}
+    assert {event.payload["actor_external_subject"] for event in events} == {"42"}
 
 
 async def test_teacher_outbox_status_hides_other_history_actor_chain(app_bundle) -> None:

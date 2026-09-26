@@ -81,6 +81,10 @@ MOODLE_CREDENTIAL_ENCRYPTION_KEY=<отдельный-постоянный-secret
 MOODLE_BROWSER_SHARED_SECRET=<отдельный-HMAC-secret-не-короче-32-байт>
 MOODLE_BROWSER_MAX_CONCURRENT_OPERATIONS=3
 MOODLE_BROWSER_QUEUE_WAIT_SECONDS=8
+MOODLE_BROWSER_STUDENT_QUEUE_WAIT_SECONDS=180
+MOODLE_BROWSER_STUDENT_OPERATION_TIMEOUT_SECONDS=240
+MOODLE_BROWSER_MAX_PENDING_STUDENT_OPERATIONS=64
+MOODLE_BROWSER_MAX_CONCURRENT_STUDENT_OPERATIONS=4
 MOODLE_BROWSER_NAVIGATION_TIMEOUT_MS=30000
 MOODLE_BROWSER_LOGIN_OPERATION_TIMEOUT_SECONDS=45
 ```
@@ -228,14 +232,20 @@ sandbox; предупреждение в readiness является ожидае
 
 - `DBLOGIN` → `POSTGRES_USER`;
 - `DBPASSWORD` → `POSTGRES_PASSWORD`;
-- `OPENROUTER_API_KEY` → `AI_API_KEY`;
-- `OPENROUTER_MODEL` → `AI_MODEL`.
+- `OPENROUTER_API_KEY` → `LLM_API_KEY`;
+- `OPENROUTER_MODEL` → `LLM_MODEL`.
 
 При наличии ключа OpenRouter скрипт также задаёт
-`AI_BASE_URL=https://openrouter.ai/api/v1` и
+`LLM_API_ADDRESS=https://openrouter.ai/api/v1` и
 `AI_API_STYLE=chat_completions`. Пароль PostgreSQL URL-кодируется перед созданием
 `DATABASE_URL`, поэтому его специальные символы не попадают в URI как
 разделители.
+
+Новые настройки провайдера — `LLM_API_ADDRESS`, `LLM_API_KEY`, `LLM_MODEL`,
+`LLM_THINKING`. Они имеют приоритет над прежними `AI_*`/`OPENROUTER_*` именами.
+Пустой `LLM_API_KEY` явно отключает наследование старого ключа. Launcher
+автоматически включает AI при новых настройках адреса/модели, если
+`AI_ENABLED=false` не задан явно. Это позволяет подключать локальный сервер без ключа.
 
 `EnvironmentFile=/home/alexey/cpp_markup.env` в systemd экспортирует эти
 переменные процессу launcher автоматически. При ручном запуске launcher сам
@@ -853,18 +863,138 @@ Compose не должен удалять его даже с `down -v`. Всё р
 
 ## 7. AI-провайдер
 
-По умолчанию `AI_ENABLED=false`. Включайте AI только после согласования передачи учебных данных:
+При прямом Docker Compose запуске по умолчанию `AI_ENABLED=false`.
+Для единого подключения к Ollama, vLLM, SGLang или другому
+OpenAI-совместимому серверу в `~/cpp_markup.env` задайте:
 
 ```dotenv
 AI_ENABLED=true
 AI_MOCK_ENABLED=false
-AI_BASE_URL=https://api.openai.com/v1
-AI_API_KEY=...
-AI_MODEL=...
-AI_API_STYLE=responses
+LLM_API_ADDRESS=https://llm.example.org/v1
+LLM_API_KEY=""
+LLM_MODEL=Maternion/minicpm5:2b-q4_K_M
+LLM_THINKING=
+AI_API_STYLE=chat_completions
 ```
 
-API key находится только в backend. Frontend и runner его не получают.
+Замените `llm.example.org` адресом своего сервера/туннеля, а `LLM_MODEL` —
+точным идентификатором развёрнутой модели (его можно посмотреть через
+`GET /v1/models`). Ключ задайте, если сервер или reverse proxy требует
+авторизацию; при пустом ключе заголовок Authorization не отправляется.
+Ключ OpenRouter для Ollama не нужен.
+
+Запрос одинаков для всех этих серверов: `POST /v1/chat/completions`, JSON с
+`model`, `messages` (system/user/assistant) и `stream: false`; ответ читается из
+`choices[0].message.content`. При непустом ключе используется стандартный
+`Authorization: Bearer …`. Система передаёт контекст и историю в каждом запросе,
+без создания provider-specific threads. Пустой `LLM_THINKING` оставляет запрос
+без дополнительных параметров reasoning — это наиболее переносимый вариант.
+Протокол сверяется с [OpenAI Chat Completions](https://developers.openai.com/api/reference/cli/resources/chat/subresources/completions/methods/create);
+его поддерживают [Ollama](https://docs.ollama.com/api/openai-compatibility),
+[vLLM](https://docs.vllm.ai/en/latest/serving/online_serving/openai_compatible_server/)
+и [SGLang](https://docs.sglang.io/docs/basic_usage/openai_api_completions).
+
+Адрес должен быть доступен именно из backend-контейнера. `127.0.0.1`/`localhost`
+внутри Docker обозначает сам контейнер, а не NUC. Для backend, запущенного прямо
+на хосте с обычной Ollama, подходит `http://127.0.0.1:11434/v1`.
+Если используется Xray, на стороне Ollama туннель направляется на
+`127.0.0.1:11434`; в `LLM_API_ADDRESS` указывается доступный backend вход туннеля
+с суффиксом `/v1`. Приложение не настраивает туннель, firewall или Ollama.
+Compose-запись `host.docker.internal:host-gateway` — только соответствие имени
+адресу хоста; сама по себе она не пробрасывает порт и не открывает listener.
+Не открывайте незащищённую Ollama в интернет.
+
+### Возврат Ollama к настройкам сети по умолчанию
+
+Ранее для доступа через Docker-мост предлагался override, созданный командой
+`sudo systemctl edit ollama.service`. Обычно он находится в
+`/etc/systemd/system/ollama.service.d/override.conf`. Уточните фактический путь:
+
+```bash
+systemctl show ollama.service -p FragmentPath -p DropInPaths
+systemctl cat ollama.service
+```
+
+Откройте указанный drop-in (не основной файл `ollama.service`):
+
+```bash
+sudoedit /etc/systemd/system/ollama.service.d/override.conf
+```
+
+Удалите только ранее добавленные настройки:
+
+```ini
+[Unit]
+Wants=docker.service
+After=docker.service
+
+[Service]
+Environment="OLLAMA_HOST=172.17.0.1:11434"
+```
+
+Если в файле есть другие параметры, сохраните их и нужные заголовки секций.
+Если override содержит только этот блок, его можно оставить пустым. Не удаляйте
+основной unit и не используйте `systemctl revert` для удаления всех чужих
+настроек. Если `OLLAMA_HOST` добавляли в другом drop-in или основном unit,
+уберите именно эту добавленную строку там. Затем:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart ollama.service
+ss -ltn '( sport = :11434 )'
+curl --fail --silent --show-error http://127.0.0.1:11434/v1/models
+```
+
+Ожидаемый listener — `127.0.0.1:11434`, штатный адрес
+[Ollama](https://docs.ollama.com/faq). Модели и данные не удаляются.
+Если отдельно добавляли `export OLLAMA_HOST=…` в `~/.bashrc`/`~/.profile`, удалите
+только этот export и выполните `unset OLLAMA_HOST` в текущей оболочке. Это
+относится к ручному запуску Ollama, а не заменяет перезапуск systemd-сервиса.
+
+### Совместимость с прежними настройками
+
+`AI_API_STYLE=auto` определяет протокол по адресу:
+
+- `/api`, `/api/chat` или корень на порту 11434 — родной API Ollama;
+- `/v1` — Chat Completions-совместимый API;
+- `/responses` или `api.openai.com` — Responses API.
+
+Полный адрес endpoint тоже поддерживается; суффикс не добавляется повторно.
+Для нестандартного reverse proxy можно явно задать `AI_API_STYLE=ollama`,
+`chat_completions` или `responses`.
+Для стандартного OpenAI Chat Completions используйте `/v1` и
+`AI_API_STYLE=chat_completions`, в том числе с Ollama. Старый `/api` оставлен
+для родного протокола Ollama и существующих конфигураций.
+
+Для OpenRouter вместо локального адреса:
+
+```dotenv
+AI_ENABLED=true
+LLM_API_ADDRESS=https://openrouter.ai/api/v1
+LLM_API_KEY=your-openrouter-key
+LLM_MODEL=provider/model-id
+LLM_THINKING=0
+AI_API_STYLE=auto
+```
+
+Перед подключением внешнего провайдера согласуйте передачу учебных данных.
+Ключ передаётся только backend; frontend, runner и Moodle workers его не получают.
+Публичные адреса требуют HTTPS; локальные HTTP endpoints работают без `APP_DEBUG=true`.
+
+`LLM_THINKING=0` запрашивает отключение thinking, `1` — включение. Если переменная
+не задана/пустая, параметр не отправляется и остаётся настройка провайдера.
+В родном API Ollama это `think: false/true`, в Chat Completions —
+`reasoning_effort: none/medium`, в OpenRouter — `reasoning.enabled`, в Responses —
+`reasoning.effort`. Поддержка зависит от сервера и модели; OpenAI-совместимость
+чата сама по себе не гарантирует поддержку `reasoning_effort`. Для переносимой
+конфигурации оставляйте `LLM_THINKING=`. Например, GPT-OSS не позволяет
+полностью отключить thinking. Система не подменяет ответ текстом reasoning.
+См. [Ollama thinking](https://docs.ollama.com/capabilities/thinking) и
+[совместимость API](https://docs.ollama.com/api/openai-compatibility).
+
+После изменения ENV перезапустите `eduprog.service` штатным способом.
+`./run_eduprog.sh diagnose-ai` показывает эффективный адрес, модель и thinking,
+но не значение ключа. Миграция БД для этих настроек не требуется.
 
 ## 8. TLS и reverse proxy
 
@@ -947,6 +1077,35 @@ limits. Hard limit core workspace — 64 файла и 512 KiB исходног�
 
 ## 10. Операционные лимиты baseline
 
+### Запас времени для отправки в Moodle
+
+В `~/cpp_markup.env` (или основном ENV-файле Compose) можно задать:
+
+```dotenv
+MOODLE_SYNC_TIMEOUT=300
+```
+
+Это **резерв в секундах перед дедлайном Moodle**, а не сетевой таймаут.
+При 15 минутах в Moodle и значении `300` студент получает 10 минут решения;
+`600` оставит 5 минут решения и 10 минут резерва. Преподаватель устанавливает
+лимит в Moodle с учётом этого запаса; приложение настройки Moodle не изменяет.
+Значение `0` убирает запас. Лимит Moodle должен быть больше резерва: иначе
+редактирование сразу заканчивается и запускается автосдача сохранённых ответов.
+
+Используется живой таймер конкретной попытки, включая продления. В момент
+локального дедлайна сервер запрещает изменения, `deadline-worker` фиксирует
+все задачи и передаёт их через очередь сдачи, даже если вкладка закрыта.
+Убедитесь, что `deadline-worker` и `sync-worker` запущены. Работы без таймера
+не ограничиваются этим параметром. Сетевые ошибки по-прежнему приводят к
+повторным попыткам доставки, а не к потере сохранённой работы.
+
+После обновления кода пересоберите сервисы: `./run_eduprog.sh start` (не включайте
+`EDUPROG_SKIP_BUILD=true`). Для последующих изменений только ENV достаточно
+пересоздать контейнеры через тот же launcher. Резерв запоминается у конкретной
+попытки: смена значения не отнимает время у уже начатых работ.
+
+### Лимиты компонентов
+
 | Область | Значение по умолчанию / hard bound |
 | --- | --- |
 | Workspace core | 64 файла, 512 KiB source text |
@@ -959,10 +1118,10 @@ limits. Hard limit core workspace — 64 файла и 512 KiB исходног�
 | Local checkpoint | canonical snapshot authoritative локально; mapped Quiz Essay/Assignment получает online text либо file artifact через retrying outbox; ровно один source → `main.c`/`main.cpp`, любой второй файл → `submission.zip` |
 | Checkpoint cadence | `D/10`, затем `D/20`; clamp 30–900 с |
 | Final checkpoints | start, manual submit, `<60 с`, deadline |
-| LMS retries | 8 попыток, exponential 15–3600 с, lease 300 с; 2 sync-worker lanes (`LMS_SYNC_WORKER_CONCURRENCY`) и одна резервная lane только для финальной сдачи |
-| Course reconciliation | каждые 900 с (`LMS_SYNC_COURSE_INTERVAL_SECONDS`) |
+| LMS retries | 8 попыток, exponential 15–3600 с, lease 300 с; 2 общие sync-worker lanes (`LMS_SYNC_WORKER_CONCURRENCY`), 2 только для сдачи (`LMS_SYNC_TERMINAL_CONCURRENCY`) и резервный обработчик в каждом backend worker |
+| Course / historical answer reconciliation | только по ручной команде преподавателя; каталог и состав курса также читаются один раз при добавлении |
 | LMS receipt | не более 64 KiB (`LMS_SYNC_RECEIPT_MAX_BYTES`) |
-| Moodle browser / AI / authorship HTTP | 300 / 45 / 30 с по `.env.example`; budget чтения settings всех activity — 240 с |
+| Moodle browser / AI / authorship HTTP | 300 / 45 / 30 с по `.env.example`; course read deadline — 240 с; настройки отдельной activity читаются при её ручной синхронизации |
 
 `DEADLINE_POLL_SECONDS` задаёт частоту polling scheduler, а не checkpoint
 interval. `LMS_SYNC_WORKER_POLL_SECONDS` задаёт ожидание пустой outbox, а
@@ -971,16 +1130,72 @@ hard bound 8). Student checkpoints выбираются раньше долги�
 обход курса не должен задерживать финальную сдачу. Меняйте лимиты только после
 нагрузочного теста; container CPU/memory не заменяют per-job limits runner.
 
+`LMS_SYNC_TERMINAL_CONCURRENCY=2` добавляет в sync-worker две выделенные lane
+только для финальных сдач, помимо общих lane. Уже запущенные импорты не могут их
+занять. Реальное число одновременных обменов по-прежнему ограничено коннектором.
+
+`LMS_SYNC_HISTORY_CONCURRENCY=2` выделяет ещё две lane для вручную запрошенных
+списков сдач и ответов. У коннектора для истории отдельные два script-free слота
+и deadline 150 с. После нажатия кнопки работы сначала читается inventory, затем
+файлы загружаются отдельными задачами по точному ID попытки. Каждый новый ручной
+запуск перечитывает ответы и комментарии без кеша предыдущего запуска.
+При выделенных history-lane общие lane не берут те же задачи; очередь коннектора
+ожидает свободный слот до 30 с. Готовые ответы доступны преподавателю сразу,
+независимо от остальных задач запуска. Успешный импорт с пропусками отмечается
+`PARTIAL`; коды предупреждений сохраняются в `receipt.warning_codes`.
+
+Периодический импорт курсов и сдач отключён. При добавлении курса один раз
+загружаются список работ, группы и состав студентов/преподавателей, без ответов.
+После изменений в Moodle преподаватель вручную обновляет курс либо выбранную
+работу. Синхронизация курса и его работ взаимно исключаются только внутри этого
+курса, а повторные нажатия разных преподавателей объединяются на уровне БД.
+Другие курсы и студенческие отправки продолжают обрабатываться. Подтверждение
+сдачи, доставка оценок и ограниченные повторы уже запрошенных операций остаются
+автоматическими: ручной режим относится к импорту, а не к отправке работы.
+
+Явное добавление/обновление курса использует отдельную ограниченную очередь:
+`MOODLE_BROWSER_MAX_CONCURRENT_COURSE_READS=2`,
+`MOODLE_BROWSER_COURSE_QUEUE_WAIT_SECONDS=60`,
+`MOODLE_BROWSER_COURSE_OPERATION_TIMEOUT_SECONDS=240` (включая очередь).
+Поэтому ручной sync одного курса не отбирает единственный слот у добавления
+другого. Кнопка курса ставит долговечную задачу и не ждёт чтения Moodle в HTTP-
+запросе; состояние отображается всем преподавателям курса. Общий retry записи
+outbox не используется для повторного импорта — запускайте новую синхронизацию
+кнопкой курса или работы.
+После обновления пересоберите **backend, scheduler, sync-worker и moodle-browser**;
+простого копирования Python-файлов недостаточно для уже собранных контейнеров.
+
 `LMS_EMBEDDED_TERMINAL_WORKER_ENABLED=true` оставляет в backend одну резервную
 lane, которая забирает только финальные `SUBMISSION`/`DEADLINE` checkpoints.
 Она не заменяет `sync-worker` для синхронизации курсов и истории, но остановка
 отдельного worker-контейнера больше не оставляет студента в бесконечном окне
 «Передаём работу в Moodle».
 
-Один процесс Chromium выбран намеренно для N150. Внутри него три изолированных
-контекста имеют разные полосы: фон не занимает контекст входа, а ручная
-синхронизация не ждёт исторического импорта. Не увеличивайте значение выше `3`
-и не запускайте несколько Uvicorn workers до измерения RAM, CPU и общей очереди.
+Один процесс Chromium выбран намеренно для N150. Тяжёлые страницы используют
+три изолированных контекста: фон не занимает контекст входа. Для запуска работ
+и сдачи Quiz/Assignment предусмотрена **отдельная очередь лёгких контекстов без
+JavaScript Moodle**: одновременно 4 операции, максимум 64 активных/ожидающих
+запроса, ожидание слота до 180 секунд. Эти параметры задаются соответственно
+`MOODLE_BROWSER_MAX_CONCURRENT_STUDENT_OPERATIONS`,
+`MOODLE_BROWSER_MAX_PENDING_STUDENT_OPERATIONS`,
+`MOODLE_BROWSER_STUDENT_QUEUE_WAIT_SECONDS`. Ожидание не создаёт вкладку Chromium.
+`MOODLE_BROWSER_STUDENT_OPERATION_TIMEOUT_SECONDS=240` ограничивает суммарно
+ожидание сессии, очереди и всю студенческую операцию (допустимо 10–240 секунд).
+Это не резерв времени решения `MOODLE_SYNC_TIMEOUT` и не обязательная задержка:
+успешная операция завершается сразу. Очистка браузерного контекста ограничена
+10 секундами; полный backend HTTP-запрос, включая получение тела, — 300 секундами.
+При изменении backend timeout оставляйте запас относительно общего бюджета
+коннектора и очистки, чтобы он успел завершить операцию до освобождения сессии.
+Импорт преподавателя не занимает эти 4 слота; операции одного студента остаются
+последовательными. Код в IDE сохраняется в БД и не требует занятого браузера
+Moodle на протяжении работы. Сдача использует штатный upload endpoint и формы
+студента, без настройки плагинов/API Moodle; файлы проверяются по SHA-256 перед
+Finish. Не увеличивайте параллельность без измерения RAM/CPU и нагрузки Moodle
+на целевом NUC. Это ограничение одновременных обменов, а не количества студентов.
+Worker продлевает свою блокировку outbox во время работы; при штатной отмене
+задача сразу возвращается в очередь, при аварийной остановке — после истечения
+lease. Планировщик фиксирует checkpoint/автосдачу отдельной транзакцией для
+каждой попытки, чтобы не удерживать блокировки всей группы до конца обхода.
 Quiz Essay checkpoint
 jobs coalesce/supersede устаревшие revisions; это поведение всё равно нужно
 проверить под фактической экзаменационной нагрузкой.

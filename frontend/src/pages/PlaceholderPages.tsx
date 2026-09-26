@@ -56,7 +56,6 @@ export function AssessmentIntroPage() {
   const [starting, setStarting] = useState(false);
   const startController = useRef<AbortController | null>(null);
   const [editing, setEditing] = useState(false);
-  const [accepted, setAccepted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const navigate = useNavigate();
   const load = useCallback(async () => {
@@ -100,7 +99,7 @@ export function AssessmentIntroPage() {
       <div className="intro-facts"><div><Clock3 /><span><small>Продолжительность</small><strong>{item.durationMinutes ? `${item.durationMinutes} минут` : 'Без ограничения'}</strong></span></div><div><FileCode2 /><span><small>{lmsManaged ? 'Формат ответа' : 'Рабочая область'}</small><strong>{lmsManaged ? `Уточняется при запуске · ${item.standard}` : `${item.fileMode === 'MULTI' ? 'Несколько файлов' : 'Один файл'} · ${item.standard}`}</strong></span></div><div><ShieldCheck /><span><small>Правило вставки</small><strong>{item.pastePolicy === 'STRICT' ? 'Только внутри попытки' : 'Разрешена'}</strong></span></div></div>
       {lmsManaged && item.durationMinutes && <p className="schedule-copy">Указан лимит Moodle. Время решения уточняется при запуске с учётом настроек для вашей учётной записи и резерва на отправку; этот резерв вычитается из таймера Quiz.</p>}
       {item.startsAt && <p className="schedule-copy">Открытие: {formatDate(item.startsAt)}{item.deadlineAt && ` · закрытие: ${formatDate(item.deadlineAt)}`}</p>}
-      {primaryRole === 'TEACHER' ? <div className="teacher-intro-actions"><p>Название, условие, сроки, максимальный балл и число попыток загружаются из Moodle. В Мехмат.Практикуме вы выбираете группы преподавателя и разрешаете или запрещаете ИИ-помощь. Возможность сдачи для конкретного студента и способ отправки проверяются непосредственно в Moodle при запуске.</p>{item.publicationStatus !== 'CLOSED' && <div><Button size="lg" onClick={() => setEditing(true)}><ShieldCheck size={16} /> {item.publicationStatus === 'DRAFT' ? 'Настроить доступ' : 'Изменить доступ'}</Button></div>}</div> : <><div className="self-check"><CheckCircle2 /><span><strong>Интерфейс готов к началу</strong><small>{lmsManaged ? 'При запуске Moodle проверит доступность работы именно для вашей учётной записи.' : 'Окончательную доступность, срок и число попыток проверит сервер.'}</small></span></div><label className="rules-check"><input type="checkbox" checked={accepted} onChange={(event) => setAccepted(event.target.checked)} /><span>Я ознакомился с параметрами работы и понимаю, что серверное время является авторитетным.</span></label>{item.attemptId ? <Button size="lg" loading={starting} onClick={() => lmsManaged ? void start() : navigate(`/ide/${item.attemptId}`)}>Продолжить попытку</Button> : <Button size="lg" loading={starting} disabled={!accepted || (!lmsManaged && (notOpened || closed))} onClick={() => void start()}>{!lmsManaged && closed ? 'Работа закрыта' : !lmsManaged && notOpened ? `Откроется ${formatDate(item.startsAt)}` : 'Начать попытку'}</Button>}</>}
+      {primaryRole === 'TEACHER' ? <div className="teacher-intro-actions"><p>Название, условие, сроки, максимальный балл и число попыток загружаются из Moodle. В Мехмат.Практикуме вы выбираете группы преподавателя и разрешаете или запрещаете ИИ-помощь. Возможность сдачи для конкретного студента и способ отправки проверяются непосредственно в Moodle при запуске.</p>{item.publicationStatus !== 'CLOSED' && <div><Button size="lg" onClick={() => setEditing(true)}><ShieldCheck size={16} /> {item.publicationStatus === 'DRAFT' ? 'Настроить доступ' : 'Изменить доступ'}</Button></div>}</div> : <><div className="self-check"><CheckCircle2 /><span><strong>Интерфейс готов к началу</strong><small>{lmsManaged ? 'При запуске Moodle проверит доступность работы именно для вашей учётной записи.' : 'Окончательную доступность, срок и число попыток проверит сервер.'}</small></span></div>{item.attemptId ? <Button size="lg" loading={starting} onClick={() => lmsManaged ? void start() : navigate(`/ide/${item.attemptId}`)}>Продолжить попытку</Button> : <Button size="lg" loading={starting} disabled={!lmsManaged && (notOpened || closed)} onClick={() => void start()}>{!lmsManaged && closed ? 'Работа закрыта' : !lmsManaged && notOpened ? `Откроется ${formatDate(item.startsAt)}` : 'Начать попытку'}</Button>}</>}
     </Card>
     {editing && <MoodlePublicationEditor assessment={item} onUpdated={setAssessment} onClose={() => setEditing(false)} />}
   </div>;
@@ -140,7 +139,7 @@ function MoodlePublicationEditor({ assessment, onUpdated, onClose }: { assessmen
   }
 
   async function save() {
-    if (!selectedGroups.size) return;
+    if (loading || saving || !targets || (assessment.publicationStatus === 'DRAFT' && !selectedGroups.size)) return;
     setSaving(true);
     setError(null);
     try {
@@ -158,7 +157,7 @@ function MoodlePublicationEditor({ assessment, onUpdated, onClose }: { assessmen
     }
   }
 
-  return <Modal open title={assessment.publicationStatus === 'DRAFT' ? 'Открыть работу' : 'Доступ к работе'} width="720px" onClose={onClose} footer={<><Button variant="ghost" onClick={onClose}>Отмена</Button><Button loading={saving} disabled={loading || !selectedGroups.size} onClick={() => void save()}><ShieldCheck size={15} /> {assessment.publicationStatus === 'DRAFT' ? 'Открыть работу' : 'Сохранить доступ'}</Button></>}>
+  return <Modal open title={assessment.publicationStatus === 'DRAFT' ? 'Открыть работу' : 'Доступ к работе'} width="720px" onClose={onClose} footer={<><Button variant="ghost" onClick={onClose}>Отмена</Button><Button loading={saving} disabled={loading || !targets || (assessment.publicationStatus === 'DRAFT' && !selectedGroups.size)} onClick={() => void save()}><ShieldCheck size={15} /> {assessment.publicationStatus === 'DRAFT' ? 'Открыть работу' : 'Сохранить доступ'}</Button></>}>
     <div className="moodle-publication-form">
       <section className="moodle-source-summary"><strong>{assessment.title}</strong><p>{assessment.summary || 'Moodle не опубликовал отдельное условие для этой активности.'}</p><dl><div><dt>Период</dt><dd>{assessment.startsAt ? formatDate(assessment.startsAt) : 'без даты открытия'} · {assessment.deadlineAt ? formatDate(assessment.deadlineAt) : 'без даты закрытия'}</dd></div><div><dt>Оценивание</dt><dd>до {assessment.maxScore} баллов · попыток: {assessment.attemptLimit ?? 'без ограничения'}</dd></div></dl><small>Эти данные доступны только для чтения и обновляются при синхронизации курса с Moodle.</small></section>
       {error && <InlineError message={error} />}
@@ -166,7 +165,7 @@ function MoodlePublicationEditor({ assessment, onUpdated, onClose }: { assessmen
         <header><strong>ИИ-помощь студентам</strong><small>Настройка действует для всех задач этой работы только в Мехмат.Практикуме и не меняет Moodle. Администратор может отключить ИИ для всей системы.</small></header>
         <label className="option-check"><input type="checkbox" checked={studentAiEnabled} disabled={saving} onChange={(event) => setStudentAiEnabled(event.target.checked)} /><span><strong>Разрешить учебного ИИ-помощника</strong><small>Объяснения и подсказки без готового решения.</small></span></label>
       </section>
-      <section className="moodle-group-picker"><header><strong>Группы преподавателя</strong><small>Работа появится у всех студентов выбранных групп. При запуске Moodle отдельно проверит доступность для конкретного студента.</small></header>{loading ? <PageLoader label="Получаем группы…" /> : targets?.groups.length ? targets.groups.map((group) => <label key={group.id} className="option-check"><input type="checkbox" checked={selectedGroups.has(group.id)} onChange={() => toggleGroup(group.id)} /><span><strong>{group.name}</strong><small>Идентификатор группы Moodle: {group.externalId}</small></span></label>) : <p className="modal-copy">Доступных групп нет.</p>}</section>
+      <section className="moodle-group-picker"><header><strong>Группы преподавателя</strong><small>Работа появится у всех студентов выбранных групп. При запуске Moodle отдельно проверит доступность для конкретного студента.</small><small>Чтобы закрыть доступ для всех групп из этого списка, снимите все галочки и сохраните. Уже сданные работы сохранятся.</small></header>{loading ? <PageLoader label="Получаем группы…" /> : targets?.groups.length ? targets.groups.map((group) => <label key={group.id} className="option-check"><input type="checkbox" checked={selectedGroups.has(group.id)} disabled={saving} onChange={() => toggleGroup(group.id)} /><span><strong>{group.name}</strong><small>Идентификатор группы Moodle: {group.externalId}</small></span></label>) : <p className="modal-copy">Доступных групп нет.</p>}</section>
     </div>
   </Modal>;
 }

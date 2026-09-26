@@ -46,7 +46,8 @@ def _without_avatar_initials(value: str) -> str:
         return value
     marker = words[0].casefold().replace("ё", "е")
     initials = "".join(word[0] for word in words[1:] if word).casefold().replace("ё", "е")
-    if marker != initials[: len(marker)]:
+    reversed_avatar = len(words) == 3 and words[0].isupper() and marker == initials[::-1]
+    if marker != initials[: len(marker)] and not reversed_avatar:
         return value
     visible_name = words[1:]
     if len(visible_name) >= 2:
@@ -1650,9 +1651,15 @@ def parse_participants_page(
             if user_id:
                 break
         if not user_id or user_id in seen or profile is None:
+            # An unrecognized participant is not proof that their previous
+            # enrollment disappeared. Do not revoke local memberships after
+            # a partial/changed table, including a nameless identity row.
+            if _text(row):
+                all_rows_classified = False
             continue
         display_name = _visible_text(profile)
         if not display_name:
+            all_rows_classified = False
             continue
         cells = row.find_all(["th", "td"], recursive=False)
         role_index = indexes.get("role", -1)

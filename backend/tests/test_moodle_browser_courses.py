@@ -52,6 +52,7 @@ from app.services.moodle_materialization import (
     materialize_moodle_activity_drafts,
 )
 from app.services.policy import MembershipContext, ensure_assessment_available
+from app.services.sync import process_outbox_once
 
 
 def _state(marker: str) -> dict[str, object]:
@@ -577,14 +578,15 @@ async def _csrf(client: AsyncClient) -> dict[str, str]:
     return {"X-CSRFToken": response.json()["csrf_token"]}
 
 
-def test_moodle_activity_classifier_is_explicit_and_excludes_archives() -> None:
+def test_moodle_activity_classifier_does_not_hide_activities_by_name() -> None:
     assert classify_moodle_assessment("Задание 1", "Лабораторные работы") == "LAB"
     assert classify_moodle_assessment("Работа 2", "Самостоятельные") == "INDEPENDENT"
     assert classify_moodle_assessment("Проверочная работа", "Тема 3") == "CONTROL"
     assert classify_moodle_assessment("Итог", "Экзамен") == "EXAM"
-    assert classify_moodle_assessment("Экзамен 2024", "АРХИВ") is None
-    assert classify_moodle_assessment("Тест 1", "Тесты") is None
-    assert classify_moodle_assessment("Вариант 1", "Индивидуальные") is None
+    assert classify_moodle_assessment("Экзамен 2024", "АРХИВ") == "EXAM"
+    assert classify_moodle_assessment("Работа с архивами", "Лабораторные") == "LAB"
+    assert classify_moodle_assessment("Тест 1", "Тесты") == "LAB"
+    assert classify_moodle_assessment("Вариант 1", "Индивидуальные") == "LAB"
 
 
 async def test_closed_moodle_quiz_publishes_to_group_and_defers_student_access_to_moodle(
@@ -842,6 +844,9 @@ async def test_closed_moodle_quiz_publishes_to_group_and_defers_student_access_t
                 )
             )
             assert mapping is not None
+            # Publication must not rewrite the last manually imported snapshot
+            # from a separately cached course index.
+            assert mapping.metadata_json["sync_state"] == "MOODLE_SOURCE_UNCONFIRMED"
             mapping.external_id = "invalid-cmid"
             await db.commit()
         invalid_mapping = await client.post(
@@ -990,13 +995,18 @@ async def test_playwright_course_import_and_manual_sync_refresh_encrypted_state(
             json={},
         )
         assert confirmed.status_code == 200, confirmed.text
+        async with session_factory() as db:
+            assert list((await db.scalars(select(SyncOutbox))).all()) == []
         synced = await client.post(
             f"/api/v1/courses/{confirmed.json()['confirmed_course']}/sync",
             headers=await _csrf(client),
             json={},
         )
         assert synced.status_code == 200, synced.text
-        assert synced.json()["title"] == "C++ course revision 2"
+        assert synced.json()["title"] == "C++ course revision 1"
+        assert synced.json()["sync_status"] == "SYNCING"
+        assert calls == 1
+        assert await process_outbox_once(session_factory, settings)
 
         async with session_factory() as db:
             manual_receipt = await db.scalar(
@@ -1006,9 +1016,10 @@ async def test_playwright_course_import_and_manual_sync_refresh_encrypted_state(
                     SyncOutbox.state == SyncOutboxState.DELIVERED.value,
                 )
             )
-        assert manual_receipt is not None
-        assert manual_receipt.payload.get("foreground") is True
-        assert manual_receipt.receipt.get("foreground") is True
+            errors = list((await db.scalars(select(SyncOutbox.last_error))).all())
+        assert manual_receipt is not None, errors
+        assert manual_receipt.payload.get("manual_run_id")
+        assert manual_receipt.payload.get("actor_external_subject") == "42"
 
         async def unavailable(*_args, **_kwargs) -> MoodleBrowserDiscoveryResult:
             raise IntegrationUnavailable("bounded connector outage")
@@ -1019,8 +1030,9 @@ async def test_playwright_course_import_and_manual_sync_refresh_encrypted_state(
             headers=await _csrf(client),
             json={},
         )
-        assert failed.status_code == 502
-        assert failed.json()["code"] == "UNAVAILABLE"
+        assert failed.status_code == 200 and failed.json()["sync_status"] == "SYNCING"
+        settings.sync_max_attempts = 1
+        assert await process_outbox_once(session_factory, settings)
         listed = await client.get("/api/v1/courses")
         assert listed.status_code == 200
         failed_course = next(
@@ -1046,7 +1058,7 @@ async def test_playwright_course_import_and_manual_sync_refresh_encrypted_state(
     assert calls == 2
 
 
-async def test_manual_course_sync_uses_foreground_snapshot_while_history_worker_holds_lease(
+async def test_manual_course_sync_uses_read_snapshot_while_other_worker_holds_lease(
     app_bundle, monkeypatch
 ) -> None:
     app, session_factory, settings = app_bundle
@@ -1106,7 +1118,9 @@ async def test_manual_course_sync_uses_foreground_snapshot_while_history_worker_
         )
 
     assert synced.status_code == 200, synced.text
-    assert synced.json()["title"] == "C++ course revision 2"
+    assert synced.json()["title"] == "C++ course revision 1"
+    assert synced.json()["sync_status"] == "SYNCING"
+    assert await process_outbox_once(session_factory, settings)
     assert calls == 2
     async with session_factory() as db:
         current = await db.get(MoodleCredential, credential.id)
@@ -1201,7 +1215,8 @@ async def test_manual_course_sync_coalesces_with_queued_background_refresh(
     async with session_factory() as db:
         queued = await db.get(SyncOutbox, queued_id)
     assert queued is not None and queued.state == SyncOutboxState.RETRY.value
-    assert queued.next_attempt_at < delayed_until.replace(tzinfo=None)
+    # A duplicate button press cannot reset backoff or alter a running job.
+    assert queued.next_attempt_at == delayed_until.replace(tzinfo=None)
 
 
 async def test_course_import_materializes_idempotent_moodle_managed_drafts(
@@ -1545,6 +1560,7 @@ async def test_course_import_materializes_idempotent_moodle_managed_drafts(
             json={},
         )
         assert synced.status_code == 200, synced.text
+        assert await process_outbox_once(session_factory, settings)
 
     async with session_factory() as db:
         course = await db.get(Course, course_id)
@@ -1821,6 +1837,7 @@ async def test_manual_course_sync_updates_quiz_essay_schedule_and_active_attempt
             json={},
         )
         assert synced.status_code == 200, synced.text
+        assert await process_outbox_once(session_factory, settings)
 
     async with session_factory() as db:
         assessment = await db.get(Assessment, assessment_id)
@@ -1891,10 +1908,9 @@ async def test_playwright_import_safely_takes_over_expired_lease(app_bundle, mon
         ("missing", "NOT_CONFIGURED"),
         ("expired", "NOT_CONFIGURED"),
         ("invalid_shape", "NOT_CONFIGURED"),
-        ("busy", "BROWSER_BUSY"),
     ],
 )
-async def test_playwright_import_fails_closed_for_missing_expired_or_busy_session(
+async def test_playwright_import_fails_closed_for_missing_expired_or_invalid_session(
     app_bundle,
     monkeypatch,
     credential_mode: str,
@@ -1930,13 +1946,7 @@ async def test_playwright_import_fails_closed_for_missing_expired_or_busy_sessio
     async with session_factory() as db:
         job = await db.scalar(select(CourseImportJob))
         assert job is not None and job.state == "FAILED"
-        if credential_mode == "busy":
-            assert credential is not None
-            current = await db.get(MoodleCredential, credential.id)
-            assert current is not None
-            assert current.lease_owner == "another-request"
-            assert current.lease_expires_at is not None
-        elif credential is not None:
+        if credential is not None:
             current = await db.get(MoodleCredential, credential.id)
             assert current is not None
             assert current.lease_owner is None and current.lease_expires_at is None

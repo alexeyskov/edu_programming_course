@@ -131,7 +131,7 @@ def _observation_external_id(
 
 def _observation_metadata(mapping: ExternalMapping) -> dict[str, object] | None:
     metadata = mapping.metadata_json
-    if not isinstance(metadata, dict):
+    if not isinstance(metadata, dict) or metadata.get("deleted_in_moodle") is True:
         return None
     remote_attempt_id = str(metadata.get("remote_attempt_id", "")).strip()
     principal_id = str(metadata.get("principal_id", "")).strip()
@@ -465,6 +465,8 @@ async def is_latest_completed_moodle_attempt(
     same remote grouping and active-retry observations used by the queue.
     """
 
+    if attempt.state == AttemptState.VOID.value:
+        return False
     if _completed_moodle_attempt_key(submission, attempt, assessment) is None:
         return True
     rows = list(

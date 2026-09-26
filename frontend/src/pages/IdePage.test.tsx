@@ -25,7 +25,7 @@ vi.mock('../lib/api', () => ({ api: mocks, ApiError: ApiErrorMock }));
 vi.mock('../components/CodeWorkspace', () => ({
   CodeWorkspace: forwardRef((props: any, ref) => {
     useImperativeHandle(ref, () => ({ openDiagnostic: vi.fn(), focus: vi.fn() }));
-    return <div data-testid="code-workspace" data-read-only={String(props.readOnly)}>Редактор<button aria-label="Изменить файл" disabled={props.readOnly} onClick={() => props.onChange('main', 'int main() { return 1; }', 'typing')}>edit</button><button aria-label="Внутренняя вставка" onClick={() => props.onChange('main', 'int main() {}int', 'internal_paste', 'receipt-1', { offset: 13, deleteCount: 0 })}>paste</button><button aria-label="Создать файл" onClick={props.onCreateFile}>+</button></div>;
+    return <div data-testid="code-workspace" data-explorer-visible={String(props.explorerVisible)} data-read-only={String(props.readOnly)}><aside id={props.explorerId} hidden={!props.explorerVisible}>Список файлов</aside><span data-testid="editor-content">{props.files.find((file: any) => file.id === props.activeFileId)?.content}</span>Редактор<button aria-label="Изменить файл" disabled={props.readOnly} onClick={() => props.onChange('main', 'int main() { return 1; }', 'typing')}>edit</button><button aria-label="Внутренняя вставка" onClick={() => props.onChange('main', 'int main() {}int', 'internal_paste', 'receipt-1', { offset: 13, deleteCount: 0 })}>paste</button><button aria-label="Создать файл" onClick={props.onCreateFile}>+</button></div>;
   }),
 }));
 
@@ -84,6 +84,62 @@ beforeEach(() => {
 afterEach(() => { cleanup(); window.sessionStorage.clear(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe('student interactive console', () => {
+  it('opens code without waiting for ancillary history or course lookups', async () => {
+    mocks.getHistory.mockImplementation(() => new Promise(() => undefined));
+    mocks.resolveCourseId.mockImplementation(() => new Promise(() => undefined));
+    renderPage();
+    expect(await screen.findByTestId('code-workspace')).toHaveAttribute('data-read-only', 'false');
+    fireEvent.click(screen.getByRole('button', { name: 'Изменить файл' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Сохранить и выйти' }));
+    expect(await screen.findByText('Вернулись к работе')).toBeInTheDocument();
+    expect(mocks.saveFile).toHaveBeenCalledOnce();
+  });
+
+  it('keeps the current code when reloading failed ancillary metadata', async () => {
+    mocks.getHistory.mockRejectedValueOnce(new Error('history unavailable')).mockResolvedValueOnce([]);
+    renderPage();
+    await screen.findByTestId('code-workspace');
+    fireEvent.click(screen.getByRole('button', { name: 'Изменить файл' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Повторить загрузку дополнительных данных' }));
+    await waitFor(() => expect(mocks.getHistory).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole('button', { name: 'Сохранить и выйти' }));
+    await screen.findByText('Вернулись к работе');
+    expect(mocks.getAttempt).toHaveBeenCalledOnce();
+    expect(mocks.saveFile).toHaveBeenCalledWith('attempt-1', expect.objectContaining({ content: 'int main() { return 1; }' }), 0, 'typing', undefined, undefined);
+  });
+
+  it('does not reopen an auto-submitted attempt when an earlier save acknowledgement arrives late', async () => {
+    vi.useFakeTimers();
+    let acknowledge!: (value: { revision: number }) => void;
+    mocks.saveFile.mockReturnValue(new Promise((resolve) => { acknowledge = resolve; }));
+    mocks.getAttemptStatus
+      .mockResolvedValueOnce({ id: attempt.id, status: 'ACTIVE', checkpointStatus: 'SYNCED' })
+      .mockResolvedValueOnce({ id: attempt.id, status: 'SUBMITTED', checkpointStatus: 'PENDING' })
+      .mockImplementation(() => new Promise(() => undefined));
+    renderPage();
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    fireEvent.click(screen.getByRole('button', { name: 'Изменить файл' }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+    expect(mocks.saveFile).toHaveBeenCalledOnce();
+    expect(screen.getByTestId('code-workspace')).toHaveAttribute('data-read-only', 'true');
+
+    await act(async () => { acknowledge({ revision: 1 }); });
+
+    expect(screen.getByTestId('code-workspace')).toHaveAttribute('data-read-only', 'true');
+    expect(screen.getByRole('heading', { name: 'Передаём работу в Moodle…' })).toBeInTheDocument();
+    expect(screen.queryByText('Работа сдана')).not.toBeInTheDocument();
+  });
+
+  it('does not interpret a stale ACTIVE periodic checkpoint as final delivery', async () => {
+    mocks.getAttempt.mockResolvedValue({ ...attempt, status: 'SUBMITTED', checkpointStatus: 'PENDING' });
+    mocks.getAttemptStatus.mockResolvedValue({ id: attempt.id, status: 'ACTIVE', checkpointStatus: 'SYNCED' });
+    renderPage();
+    await screen.findByTestId('code-workspace');
+    expect(screen.getByRole('heading', { name: 'Передаём работу в Moodle…' })).toBeInTheDocument();
+    expect(screen.getByTestId('code-workspace')).toHaveAttribute('data-read-only', 'true');
+    expect(screen.queryByText('Работа сдана')).not.toBeInTheDocument();
+  });
+
   it('saves paste metadata separately from subsequent typing', async () => {
     mocks.saveFile.mockResolvedValueOnce({ revision: 1 }).mockResolvedValueOnce({ revision: 2 });
     renderPage(); await screen.findByTestId('code-workspace');
@@ -95,7 +151,7 @@ describe('student interactive console', () => {
     expect(mocks.saveFile).toHaveBeenNthCalledWith(2, 'attempt-1', expect.objectContaining({ content: 'int main() { return 1; }' }), 1, 'typing', undefined, undefined);
   });
 
-  it('shows only editing time with a separate Moodle upload reserve', async () => {
+  it('shows the reduced editing time without exposing the Moodle reserve notice', async () => {
     const now = Date.now();
     vi.spyOn(Date, 'now').mockReturnValue(now);
     mocks.getAttempt.mockResolvedValue({
@@ -108,7 +164,7 @@ describe('student interactive console', () => {
     await screen.findByTestId('code-workspace');
     expect(screen.getByText('10:00')).toBeInTheDocument();
     expect(screen.queryByText('15:00')).not.toBeInTheDocument();
-    expect(screen.getByRole('note')).toHaveTextContent('Резерв на отправку в Moodle: 300 с. Он уже вычтен из таймера.');
+    expect(screen.queryByText(/Резерв на отправку в Moodle/)).not.toBeInTheDocument();
   });
 
   it('locks at the local deadline and follows server auto-submission without a manual click', async () => {
@@ -244,10 +300,17 @@ describe('student interactive console', () => {
     await screen.findByTestId('code-workspace');
 
     expect(screen.getByText('Прочитайте строки до EOF.')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Скрыть условие' }));
-    expect(screen.queryByText('Прочитайте строки до EOF.')).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Показать условие' }));
-    expect(screen.getByText('Прочитайте строки до EOF.')).toBeInTheDocument();
+    const toggle = screen.getByRole('button', { name: 'Скрыть условие' });
+    toggle.focus();
+    fireEvent.click(toggle);
+    expect(screen.getByText('Прочитайте строки до EOF.')).not.toBeVisible();
+    expect(screen.getByText('Задание')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Показать условие' })).toBe(toggle);
+    expect(toggle).toHaveFocus();
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(toggle).toHaveAttribute('aria-controls', 'attempt-condition');
+    fireEvent.click(toggle);
+    expect(screen.getByText('Прочитайте строки до EOF.')).toBeVisible();
 
     expect(screen.getByText('Проблем не найдено')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Закрыть' }));
@@ -266,6 +329,39 @@ describe('student interactive console', () => {
 
     expect(await screen.findByText('Введите число:')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Закрыть' })).toHaveAttribute('aria-expanded', 'true');
+  });
+
+  it('keeps run at the bottom left of close, separate from submission', async () => {
+    renderPage();
+    await screen.findByTestId('code-workspace');
+    const run = screen.getByRole('button', { name: 'Запустить' });
+    const close = screen.getByRole('button', { name: 'Закрыть' });
+    expect(run.nextElementSibling).toBe(close);
+    expect(run.closest('.bottom-panel')).not.toBeNull();
+    expect(run.closest('.ide-toolbar')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Завершить' }).closest('.ide-toolbar')).not.toBeNull();
+    fireEvent.click(close);
+    expect(screen.getByRole('button', { name: 'Запустить' })).toBe(run);
+  });
+
+  it('hides files without remounting the editor or losing unsaved code', async () => {
+    renderPage();
+    const editor = await screen.findByTestId('code-workspace');
+    fireEvent.click(screen.getByRole('button', { name: 'Изменить файл' }));
+    const toggle = screen.getByRole('button', { name: 'Скрыть файлы' });
+    toggle.focus();
+    fireEvent.click(toggle);
+    expect(screen.getByRole('button', { name: 'Показать файлы' })).toBe(toggle);
+    expect(toggle).toHaveFocus();
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(toggle).toHaveAttribute('aria-controls', 'student-file-explorer');
+    expect(screen.getByText('Список файлов')).not.toBeVisible();
+    expect(screen.getByTestId('code-workspace')).toBe(editor);
+    expect(screen.getByTestId('editor-content')).toHaveTextContent('int main() { return 1; }');
+    fireEvent.click(toggle);
+    expect(screen.getByText('Список файлов')).toBeVisible();
+    expect(screen.getByTestId('code-workspace')).toBe(editor);
+    expect(screen.getByTestId('editor-content')).toHaveTextContent('int main() { return 1; }');
   });
 
   it('starts once, sends Enter-delimited lines and supports stop', async () => {
@@ -456,6 +552,104 @@ describe('student interactive console', () => {
     expect(screen.getByTestId('code-workspace')).toHaveAttribute('data-read-only', 'true');
     expect(mocks.saveFile).not.toHaveBeenCalled();
     expect(mocks.submitAttempt).not.toHaveBeenCalled();
+  });
+
+  it('opens a deleted Moodle attempt read-only with no resubmission or runtime recovery', async () => {
+    window.sessionStorage.setItem('eduprog:interactive-attempt:attempt-1', 'b'.repeat(32));
+    mocks.getAttempt.mockResolvedValue({
+      ...attempt, status: 'LOCKED', closureReason: 'LMS_ATTEMPT_DELETED',
+      checkpointStatus: 'ERROR',
+    });
+    renderPage();
+
+    expect(await screen.findByRole('heading', { name: 'Попытка удалена в Moodle' })).toBeInTheDocument();
+    expect(screen.getByTestId('code-workspace')).toHaveAttribute('data-read-only', 'true');
+    expect(screen.getByText(/сохранённый код остался в системе/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Повторить отправку' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Вернуться к работам' })).toBeInTheDocument();
+    expect(mocks.getInteractiveAttempt).not.toHaveBeenCalled();
+    expect(mocks.startAttempt).not.toHaveBeenCalled();
+  });
+
+  it('does not interpret deletion during final delivery as a successful submission', async () => {
+    mocks.getAttempt.mockResolvedValue({ ...attempt, status: 'SUBMITTED', checkpointStatus: 'PENDING' });
+    mocks.getAttemptStatus.mockResolvedValue({
+      id: attempt.id, status: 'LOCKED', closureReason: 'LMS_ATTEMPT_DELETED',
+      checkpointStatus: 'SYNCED',
+    });
+    renderPage();
+
+    expect(await screen.findByRole('heading', { name: 'Попытка удалена в Moodle' })).toBeInTheDocument();
+    expect(screen.queryByText('Работа сдана')).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Передаём работу в Moodle…' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Повторить отправку' })).not.toBeInTheDocument();
+    expect(mocks.retryAttemptSubmission).not.toHaveBeenCalled();
+  });
+
+  it('keeps polling failed delivery so a deleted attempt does not offer retry forever', async () => {
+    mocks.getAttempt.mockResolvedValue({ ...attempt, status: 'SUBMITTED', checkpointStatus: 'ERROR' });
+    mocks.getAttemptStatus.mockResolvedValue({
+      id: attempt.id, status: 'LOCKED', closureReason: 'LMS_ATTEMPT_DELETED',
+      checkpointStatus: 'ERROR',
+    });
+    renderPage();
+
+    expect(await screen.findByRole('heading', { name: 'Попытка удалена в Moodle' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Повторить отправку' })).not.toBeInTheDocument();
+  });
+
+  it('ignores an old successful status response after retry confirms deletion', async () => {
+    let acknowledge!: (value: object) => void;
+    mocks.getAttempt.mockResolvedValue({ ...attempt, status: 'SUBMITTED', checkpointStatus: 'ERROR' });
+    mocks.getAttemptStatus.mockReturnValue(new Promise((resolve) => { acknowledge = resolve; }));
+    mocks.retryAttemptSubmission.mockRejectedValue(new ApiErrorMock(
+      409, 'LMS_ATTEMPT_DELETED', 'Attempt deleted in Moodle',
+    ));
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Повторить отправку' }));
+    await screen.findByRole('heading', { name: 'Попытка удалена в Moodle' });
+    await act(async () => {
+      acknowledge({ id: attempt.id, status: 'SUBMITTED', checkpointStatus: 'SYNCED' });
+    });
+
+    expect(screen.getByRole('heading', { name: 'Попытка удалена в Moodle' })).toBeInTheDocument();
+    expect(screen.getByTestId('code-workspace')).toHaveAttribute('data-read-only', 'true');
+    expect(screen.queryByText('Работа сдана')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Повторить отправку' })).not.toBeInTheDocument();
+  });
+
+  it('shows deletion reported while loading without a generic reload loop', async () => {
+    mocks.getAttempt.mockRejectedValue(new ApiErrorMock(
+      409, 'LMS_ATTEMPT_DELETED', 'Attempt deleted in Moodle',
+    ));
+    renderPage();
+    expect(await screen.findByRole('heading', { name: 'Попытка удалена в Moodle' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Вернуться к работам' })).toBeInTheDocument();
+    expect(screen.queryByText('Не получилось загрузить данные')).not.toBeInTheDocument();
+  });
+
+  it('stops a late runner startup after polling confirms the Moodle attempt was deleted', async () => {
+    vi.useFakeTimers();
+    let started!: (value: InteractiveRun) => void;
+    mocks.startInteractiveAttempt.mockReturnValue(new Promise((resolve) => { started = resolve; }));
+    mocks.getAttemptStatus
+      .mockResolvedValueOnce({ id: attempt.id, status: 'ACTIVE', checkpointStatus: 'SYNCED' })
+      .mockResolvedValue({
+        id: attempt.id, status: 'LOCKED', closureReason: 'LMS_ATTEMPT_DELETED',
+        checkpointStatus: 'ERROR',
+      });
+    renderPage();
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    fireEvent.click(screen.getByRole('button', { name: 'Запустить' }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+    expect(screen.getByRole('heading', { name: 'Попытка удалена в Moodle' })).toBeInTheDocument();
+
+    await act(async () => { started(runningSession()); });
+
+    expect(mocks.stopInteractiveAttempt).toHaveBeenCalledWith('attempt-1', 'a'.repeat(32));
+    expect(screen.queryByRole('button', { name: 'Остановить' })).not.toBeInTheDocument();
+    expect(window.sessionStorage.getItem('eduprog:interactive-attempt:attempt-1')).toBeNull();
+    expect(screen.getByTestId('code-workspace')).toHaveAttribute('data-read-only', 'true');
   });
 
   it('treats LMS finalization during autosave as terminal instead of a revision conflict', async () => {

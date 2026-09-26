@@ -1861,7 +1861,7 @@ async def test_stale_external_delivery_profile_stops_attempt_until_course_refres
 
     with pytest.raises(DomainError) as error:
         await start_attempt(db, assessment_id=assessment.id, principal_id=student.id)
-    assert error.value.code == "LMS_DELIVERY_PROFILE_UNRESOLVED"
+    assert error.value.code == "MOODLE_ASSESSMENT_UNAVAILABLE"
 
 
 @pytest.mark.parametrize("second_transport", ["ASSIGN_FILE", "ASSIGN_ONLINE_TEXT"])

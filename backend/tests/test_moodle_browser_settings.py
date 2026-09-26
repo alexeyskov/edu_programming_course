@@ -19,6 +19,8 @@ def test_moodle_browser_default_request_limit_fits_four_mibibyte_artifact(
     # Four MiB expands to roughly 5.34 MiB in base64.  Six MiB leaves room for
     # the signed envelope and the bounded Playwright storage state.
     assert settings.moodle_browser_request_body_max_bytes == 6 * 1024 * 1024
+    assert settings.moodle_browser_history_max_response_bytes == 160 * 1024 * 1024
+    assert settings.moodle_browser_max_response_bytes == 4 * 1024 * 1024
 
 
 def test_moodle_browser_settings_are_parsed_from_environment(monkeypatch) -> None:
@@ -27,6 +29,7 @@ def test_moodle_browser_settings_are_parsed_from_environment(monkeypatch) -> Non
     monkeypatch.setenv("MOODLE_BROWSER_HTTP_TIMEOUT_SECONDS", "91.5")
     monkeypatch.setenv("MOODLE_BROWSER_REQUEST_BODY_MAX_BYTES", "1048576")
     monkeypatch.setenv("MOODLE_BROWSER_MAX_RESPONSE_BYTES", "4194304")
+    monkeypatch.setenv("MOODLE_BROWSER_HISTORY_MAX_RESPONSE_BYTES", "150994944")
     monkeypatch.setenv("MOODLE_BROWSER_STORAGE_STATE_MAX_BYTES", "262144")
 
     settings = Settings(
@@ -40,6 +43,7 @@ def test_moodle_browser_settings_are_parsed_from_environment(monkeypatch) -> Non
     assert settings.moodle_browser_http_timeout_seconds == 91.5
     assert settings.moodle_browser_request_body_max_bytes == 1_048_576
     assert settings.moodle_browser_max_response_bytes == 4_194_304
+    assert settings.moodle_browser_history_max_response_bytes == 150_994_944
     assert settings.moodle_browser_storage_state_max_bytes == 262_144
 
 

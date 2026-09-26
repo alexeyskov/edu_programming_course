@@ -4,7 +4,7 @@ import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ToastProvider } from '../components/ui';
 import { ThemeProvider } from '../context/ThemeContext';
-import type { Submission } from '../types';
+import type { Submission, WorkspaceFile } from '../types';
 import { ReviewPage } from './ReviewPage';
 
 const mocks = vi.hoisted(() => ({
@@ -23,9 +23,26 @@ vi.mock('@monaco-editor/react', () => ({
   ),
 }));
 vi.mock('../components/CodeWorkspace', () => ({
-  CodeWorkspace: forwardRef(({ explorerVisible = true, onExplorerCollapse }: { explorerVisible?: boolean; onExplorerCollapse?(): void }, ref) => {
+  CodeWorkspace: forwardRef(({ files, activeFileId, onActiveFile, onChange, readOnly, explorerVisible = true, explorerId, onExplorerCollapse }: {
+    files: WorkspaceFile[];
+    activeFileId: string;
+    onActiveFile(id: string): void;
+    onChange(id: string, content: string): void;
+    readOnly?: boolean;
+    explorerVisible?: boolean;
+    explorerId?: string;
+    onExplorerCollapse?(): void;
+  }, ref) => {
     useImperativeHandle(ref, () => ({ openDiagnostic: vi.fn(), focus: vi.fn() }));
-    return <div data-testid="code-workspace">Код работы{explorerVisible && onExplorerCollapse && <aside className="file-explorer"><button type="button" aria-label="Скрыть файлы" onClick={onExplorerCollapse}>Скрыть</button></aside>}</div>;
+    const activeFile = files.find((file) => file.id === activeFileId) ?? files[0];
+    return <div data-testid="code-workspace">
+      Код работы
+      <aside id={explorerId} className="file-explorer" hidden={!explorerVisible}>
+        {onExplorerCollapse && <button type="button" aria-label="Скрыть файлы" onClick={onExplorerCollapse}>Скрыть</button>}
+        {files.map((file) => <button key={file.id} type="button" onClick={() => onActiveFile(file.id)}>{file.path}</button>)}
+      </aside>
+      {activeFile && <textarea aria-label={`Код ${activeFile.path}`} readOnly={readOnly} value={activeFile.content} onChange={(event) => onChange(activeFile.id, event.target.value)} />}
+    </div>;
   }),
 }));
 
@@ -399,15 +416,22 @@ describe('reviewed submission', () => {
     expect(screen.getAllByText(/utils\.cpp/)).toHaveLength(2);
   });
 
-  it('collapses both side panels and leaves small restoration controls', async () => {
+  it('keeps the file toggle in place and leaves a restoration control for the review panel', async () => {
     renderPage();
     await screen.findByText('Работа проверена');
 
     const hideFiles = screen.getByRole('button', { name: 'Скрыть файлы' });
-    expect(hideFiles.closest('.file-explorer')).not.toBeNull();
+    expect(hideFiles.closest('.workspace-files-rail')).not.toBeNull();
+    expect(hideFiles).toHaveAttribute('aria-expanded', 'true');
+    expect(hideFiles).toHaveAttribute('aria-controls', 'review-file-explorer');
+    expect(document.getElementById('review-file-explorer')).toBeVisible();
+    hideFiles.focus();
     fireEvent.click(hideFiles);
-    expect(screen.getByRole('button', { name: 'Показать файлы' })).toBeInTheDocument();
-    expect(screen.getByLabelText('Панель файлов скрыта')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Показать файлы' })).toBe(hideFiles);
+    expect(hideFiles).toHaveAttribute('aria-expanded', 'false');
+    expect(hideFiles).toHaveFocus();
+    expect(document.getElementById('review-file-explorer')).not.toBeVisible();
+    expect(screen.getByLabelText('Панель файлов')).toBeVisible();
 
     const hideReview = screen.getByRole('button', { name: 'Скрыть панель проверки' });
     expect(hideReview.closest('.review-side__top')).not.toBeNull();
@@ -418,8 +442,47 @@ describe('reviewed submission', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Показать файлы' }));
     fireEvent.click(screen.getByRole('button', { name: 'Показать панель проверки' }));
-    expect(screen.getByRole('button', { name: 'Скрыть файлы' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Скрыть файлы' })).toBe(hideFiles);
+    expect(hideFiles).toHaveAttribute('aria-expanded', 'true');
+    expect(document.getElementById('review-file-explorer')).toBeVisible();
     expect(screen.getByRole('button', { name: 'Скрыть панель проверки' })).toBeInTheDocument();
+  });
+
+  it('preserves the selected file and its unsaved sandbox content when files are collapsed and restored', async () => {
+    const files = [
+      ...submission.files,
+      { id: 'utils', path: 'utils.cpp', content: 'int answer() { return 41; }', language: 'cpp' },
+    ];
+    mocks.getSubmission.mockResolvedValue({ ...submission, files });
+    mocks.createExperiment.mockResolvedValue({
+      id: 'experiment-1', submissionId: 'graded', revision: 0, changed: false,
+      files, createdAt: '2026-08-25T12:00:00Z',
+    });
+    mocks.saveExperimentFile.mockResolvedValue({
+      id: 'experiment-1', submissionId: 'graded', revision: 1, changed: true,
+      files, createdAt: '2026-08-25T12:00:00Z',
+    });
+
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Открыть преподавательскую песочницу' }));
+    await screen.findByRole('button', { name: 'Закрыть преподавательскую песочницу' });
+    fireEvent.click(screen.getByRole('button', { name: 'utils.cpp' }));
+    const editor = screen.getByRole('textbox', { name: 'Код utils.cpp' });
+    const editedCode = 'int answer() { return 42; }';
+    fireEvent.change(editor, { target: { value: editedCode } });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Скрыть файлы' }));
+    expect(screen.getByRole('textbox', { name: 'Код utils.cpp' })).toBe(editor);
+    expect(editor).toHaveValue(editedCode);
+    expect(screen.queryByRole('button', { name: 'utils.cpp' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Показать файлы' }));
+    expect(screen.getByRole('textbox', { name: 'Код utils.cpp' })).toBe(editor);
+    expect(editor).toHaveValue(editedCode);
+    expect(screen.getByRole('button', { name: 'utils.cpp' })).toBeVisible();
+    expect(mocks.createExperiment).toHaveBeenCalledTimes(1);
+    expect(mocks.resetExperiment).not.toHaveBeenCalled();
+    expect(mocks.deleteExperiment).not.toHaveBeenCalled();
   });
 
   it('labels the similarity evidence tab as plagiarism', async () => {
@@ -626,13 +689,70 @@ describe('reviewed submission', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Открыть чат' }));
     const input = await screen.findByPlaceholderText('Вопрос о текущем коде…');
+    expect(screen.queryByRole('button', { name: 'Почему не проходит тест?' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Что проверить вручную?' })).not.toBeInTheDocument();
+    await waitFor(() => expect(input).not.toBeDisabled());
     fireEvent.change(input, { target: { value: 'Что проверить вручную?' } });
     fireEvent.click(screen.getByRole('button', { name: 'Отправить' }));
 
     await waitFor(() => expect(mocks.createTeacherAiThread).toHaveBeenCalledWith('graded', 'course-1'));
-    await waitFor(() => expect(mocks.sendAiMessage).toHaveBeenCalledWith('teacher-thread-1', 'Что проверить вручную?'));
+    await waitFor(() => expect(mocks.sendAiMessage).toHaveBeenCalledWith('teacher-thread-1', 'Что проверить вручную?', { teacherComment: 'Хорошая работа' }));
     expect(await screen.findByText('Проверьте граничные значения.')).toBeInTheDocument();
     expect(mocks.claimSubmission).not.toHaveBeenCalled();
     expect(screen.getByLabelText(/Итоговый балл/)).toBeDisabled();
+  });
+
+  it('uses a separate AI thread and comment for each reviewed question', async () => {
+    const reviewGroup = {
+      id: 'quiz-response-ai', title: 'Самостоятельная работа',
+      items: [
+        { submissionId: 'question-1', position: 1, title: 'Строки', maxScore: 5, status: 'GRADED' as const },
+        { submissionId: 'question-2', position: 2, title: 'Массивы', maxScore: 5, status: 'GRADED' as const },
+      ],
+    };
+    mocks.getSubmission.mockImplementation(async (id: string) => ({
+      ...submission, id, reviewGroup,
+      latestDecision: { ...decision, comment: `Комментарий ${id}` },
+    }));
+    mocks.createTeacherAiThread.mockImplementation(async (id: string) => ({ id: `thread-${id}` }));
+    let finishFirst!: (value: { content: string; citations: [] }) => void;
+    mocks.sendAiMessage.mockImplementationOnce(() => new Promise((resolve) => { finishFirst = resolve; }));
+    renderPage('/review/question-1');
+    await screen.findByRole('navigation', { name: 'Задания в ответе студента' });
+    fireEvent.click(screen.getByRole('button', { name: 'ИИ' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Открыть чат' }));
+    await waitFor(() => expect(screen.getByPlaceholderText('Вопрос о текущем коде…')).not.toBeDisabled());
+    fireEvent.change(screen.getByPlaceholderText('Вопрос о текущем коде…'), { target: { value: 'Первый вопрос' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Отправить' }));
+    await waitFor(() => expect(mocks.sendAiMessage).toHaveBeenCalledWith('thread-question-1', 'Первый вопрос', { teacherComment: 'Комментарий question-1' }));
+
+    fireEvent.click(screen.getByRole('tab', { name: /№2 Массивы/ }));
+    await screen.findByText('Задание 2 из 2');
+    fireEvent.click(await screen.findByRole('button', { name: 'Открыть чат' }));
+    await waitFor(() => expect(screen.getByPlaceholderText('Вопрос о текущем коде…')).not.toBeDisabled());
+    await act(async () => { finishFirst({ content: 'Ответ для первой задачи', citations: [] }); });
+    expect(screen.queryByText('Первый вопрос')).not.toBeInTheDocument();
+    expect(screen.queryByText('Ответ для первой задачи')).not.toBeInTheDocument();
+    fireEvent.change(screen.getByPlaceholderText('Вопрос о текущем коде…'), { target: { value: 'Второй вопрос' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Отправить' }));
+    await waitFor(() => expect(mocks.sendAiMessage).toHaveBeenLastCalledWith('thread-question-2', 'Второй вопрос', { teacherComment: 'Комментарий question-2' }));
+    expect(mocks.saveReview).not.toHaveBeenCalled();
+  });
+
+  it('includes the unsaved comment in chat without saving the review', async () => {
+    mocks.getSubmission.mockResolvedValue({
+      ...submission, status: 'CLAIMED', latestDecision: undefined, decisionHistory: [],
+      claim: { id: 'claim-1', ownerId: 'teacher-1', ownerName: 'Учитель', expiresAt: '2099-01-01T00:00:00Z', mine: true },
+    });
+    renderPage();
+    const comment = await screen.findByLabelText('Комментарий студенту');
+    fireEvent.change(comment, { target: { value: 'Проверить пустой ввод' } });
+    fireEvent.click(screen.getByRole('button', { name: 'ИИ' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Открыть чат' }));
+    await waitFor(() => expect(screen.getByPlaceholderText('Вопрос о текущем коде…')).not.toBeDisabled());
+    fireEvent.change(screen.getByPlaceholderText('Вопрос о текущем коде…'), { target: { value: 'Верно ли замечание?' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Отправить' }));
+    await waitFor(() => expect(mocks.sendAiMessage).toHaveBeenCalledWith('teacher-thread-1', 'Верно ли замечание?', { teacherComment: 'Проверить пустой ввод' }));
+    expect(mocks.saveReview).not.toHaveBeenCalled();
   });
 });

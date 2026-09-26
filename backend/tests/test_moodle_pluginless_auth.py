@@ -110,9 +110,8 @@ async def test_pluginless_login_stores_only_bound_encrypted_token(app_bundle, mo
         )
         assert response.status_code == 201, response.text
         assert response.headers["cache-control"] == "no-store"
-        assert response.json()["roles"] == ["STUDENT"]
-        assert len(response.json()["memberships"]) == 1
-        assert response.json()["memberships"][0]["course_name"] == "C++"
+        assert response.json()["roles"] == []
+        assert response.json()["memberships"] == []
         assert response.json()["capabilities"] == ["SYSTEM_SETTINGS"]
         assert settings.session_cookie_name in client.cookies
 
@@ -128,7 +127,7 @@ async def test_pluginless_login_stores_only_bound_encrypted_token(app_bundle, mo
         assert principal is not None and credential is not None
         assert attempt is not None and attempt.succeeded and attempt.outcome == "SUCCESS"
         assert local_session is not None and audit is not None
-        assert [membership.role for membership in memberships] == ["STUDENT"]
+        assert memberships == []
         assert upstream_password not in credential.encrypted_secret
         assert credential.metadata_json["upload_files"] is True
         assert (

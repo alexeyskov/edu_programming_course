@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import math
 import os
 import re
@@ -77,14 +78,21 @@ from app.services.common import (
     sha256_text,
     validate_source_path,
 )
-from app.services.course_sync_state import course_sync_stale_before
 from app.services.delivery_profile import resolve_assessment_workspace_delivery_profile
+from app.services.moodle_attempt_reconciliation import (
+    known_quiz_attempt_probe_batch,
+    reconcile_deleted_quiz_attempts,
+)
 from app.services.moodle_attempt_selection import is_latest_completed_moodle_attempt
 from app.services.moodle_history import (
-    enqueue_historical_submission_imports,
+    enqueue_historical_answer_reads,
     materialize_historical_submissions,
 )
-from app.services.moodle_materialization import materialize_moodle_activity_drafts
+from app.services.moodle_history_diagnostics import history_warning_codes
+from app.services.moodle_materialization import (
+    materialize_moodle_activity_drafts,
+    merge_moodle_course_index,
+)
 from app.services.moodle_quiz_runtime import (
     pinned_moodle_quiz_binding,
     resolve_moodle_assignment_context,
@@ -110,6 +118,7 @@ from app.services.workspace import (
 type SessionFactory = async_sessionmaker[AsyncSession]
 type ClientFactory = Callable[[], httpx.AsyncClient]
 
+LOGGER = logging.getLogger("eduprog.sync")
 _MAX_LMS_SECTIONS = 2_000
 _MAX_LMS_ACTIVITIES = 5_000
 _MAX_LMS_ACTIVITIES_BYTES = 128 * 1024
@@ -197,6 +206,7 @@ class ConnectionTarget:
     browser_credential_id: uuid.UUID | None = None
     browser_credential_revision: int | None = None
     browser_lease_owner: str | None = None
+    browser_read_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,7 +228,6 @@ class ClaimedOutboxEvent:
 class SchedulerResult:
     checkpoints_enqueued: int = 0
     attempts_submitted: int = 0
-    courses_enqueued: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -404,11 +413,29 @@ def _raise_invalid_json_constant(value: str) -> None:
     raise ValueError(f"invalid JSON constant: {value}")
 
 
+async def _active_root_attempt_ids(db: AsyncSession) -> list[uuid.UUID]:
+    from app.models.attempts import MoodleQuizQuestion
+
+    sibling_ids = select(MoodleQuizQuestion.attempt_id).where(
+        MoodleQuizQuestion.attempt_id != MoodleQuizQuestion.root_attempt_id
+    )
+    return list(
+        (
+            await db.scalars(
+                select(Attempt.id)
+                .where(Attempt.state == AttemptState.ACTIVE.value, Attempt.id.not_in(sibling_ids))
+                .order_by(Attempt.deadline_at.asc().nulls_last(), Attempt.started_at, Attempt.id)
+            )
+        ).all()
+    )
+
+
 async def maintain_attempts(
     db: AsyncSession,
     settings: Settings,
     *,
     now: datetime | None = None,
+    attempt_ids: list[uuid.UUID] | None = None,
 ) -> SchedulerResult:
     """Create due checkpoints and submit the authoritative last revision at deadline.
 
@@ -419,30 +446,25 @@ async def maintain_attempts(
     """
 
     now = _as_utc(now or utcnow())
-    from app.models.attempts import MoodleQuizQuestion
-
-    sibling_ids = select(MoodleQuizQuestion.attempt_id).where(
-        MoodleQuizQuestion.attempt_id != MoodleQuizQuestion.root_attempt_id
-    )
-    attempt_ids = list(
-        (
-            await db.scalars(
-                select(Attempt.id)
-                .where(Attempt.state == AttemptState.ACTIVE.value, Attempt.id.not_in(sibling_ids))
-                .order_by(Attempt.deadline_at.asc().nulls_last(), Attempt.started_at, Attempt.id)
-            )
-        ).all()
-    )
+    await db.flush()
+    if attempt_ids is None:
+        attempt_ids = await _active_root_attempt_ids(db)
     checkpoints = 0
     submitted = 0
     for attempt_id in attempt_ids:
         attempt = await db.scalar(
-            select(Attempt).where(Attempt.id == attempt_id).with_for_update(skip_locked=True)
+            select(Attempt)
+            .where(Attempt.id == attempt_id)
+            .with_for_update(skip_locked=True)
+            .execution_options(populate_existing=True)
         )
         if attempt is None or attempt.state != AttemptState.ACTIVE.value:
             continue
         workspace = await db.scalar(
-            select(Workspace).where(Workspace.attempt_id == attempt.id).with_for_update()
+            select(Workspace)
+            .where(Workspace.attempt_id == attempt.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         assessment = await db.get(Assessment, attempt.assessment_id)
         if workspace is None or assessment is None:
@@ -468,45 +490,44 @@ async def maintain_attempts(
             deadline is not None and timedelta(0) < deadline - now <= timedelta(seconds=60)
         )
         reason = "FINAL_MINUTE" if final_minute else "PERIODIC"
-        last_event = await db.scalar(
-            select(SyncOutbox)
+        last_checkpoint_at = await db.scalar(
+            select(SyncOutbox.created_at)
             .where(
                 SyncOutbox.attempt_id == attempt.id,
                 SyncOutbox.event_type == "attempt.checkpoint",
             )
             .order_by(SyncOutbox.created_at.desc())
+            .limit(1)
         )
         interval = checkpoint_interval_seconds(attempt, assessment, now=now)
         # Prepared Moodle Quiz attempts already exist remotely. They retain a
         # local starter snapshot without queuing an immediate template upload;
         # wait the normal interval, then back up the current (not starter) code.
-        checkpoint_since = (
-            last_event.created_at if last_event is not None else attempt.started_at
-        )
+        checkpoint_since = last_checkpoint_at or attempt.started_at
         policy = attempt.integrity_policy or {}
         prepared_quiz = (
             policy.get("moodle_runtime_prepared") is True
             and bool(policy.get("moodle_attempt_id"))
             and policy.get("moodle_answer_transport") in {"ESSAY_ATTACHMENT", "ESSAY_ONLINE_TEXT"}
         )
-        is_due = (
-            (last_event is None and not prepared_quiz)
-            or (now - _as_utc(checkpoint_since)).total_seconds() >= interval
-        )
-        checkpoint_payloads = list(
-            (
-                await db.scalars(
-                    select(SyncOutbox.payload).where(
+        is_due = (last_checkpoint_at is None and not prepared_quiz) or (
+            now - _as_utc(checkpoint_since)
+        ).total_seconds() >= interval
+        already_final = False
+        if final_minute and not is_due:
+            # Only ask for existence. Historical payloads include full source
+            # manifests and must not be loaded on every scheduler tick.
+            already_final = (
+                await db.scalar(
+                    select(SyncOutbox.id)
+                    .where(
                         SyncOutbox.attempt_id == attempt.id,
                         SyncOutbox.event_type == "attempt.checkpoint",
+                        SyncOutbox.payload["reason"].as_string() == "FINAL_MINUTE",
                     )
+                    .limit(1)
                 )
-            ).all()
-        )
-        already_final = any(
-            isinstance(payload, dict) and payload.get("reason") == "FINAL_MINUTE"
-            for payload in checkpoint_payloads
-        )
+            ) is not None
         if not is_due and not (final_minute and not already_final):
             continue
         snapshot = await create_snapshot(db, workspace, reason)
@@ -530,138 +551,37 @@ async def maintain_attempts(
     return SchedulerResult(checkpoints_enqueued=checkpoints, attempts_submitted=submitted)
 
 
-async def enqueue_course_synchronizations(
-    db: AsyncSession,
-    settings: Settings,
-    *,
-    now: datetime | None = None,
-) -> int:
-    now = now or utcnow()
-    interval = max(60, int(getattr(settings, "sync_course_interval_seconds", 900)))
-    bucket = int(now.timestamp()) // interval
-    stale_before = course_sync_stale_before(settings, now)
-    courses = list(
-        (
-            await db.scalars(
-                select(Course)
-                .join(LMSConnection, LMSConnection.id == Course.connection_id)
-                .where(
-                    Course.archived_at.is_(None),
-                    Course.catalog_enabled.is_(True),
-                    LMSConnection.enabled.is_(True),
-                )
-                .order_by(Course.id)
-            )
-        ).all()
-    )
-    enqueued = 0
-    for course in courses:
-        outstanding = await db.scalar(
-            select(SyncOutbox.id).where(
-                SyncOutbox.course_id == course.id,
-                SyncOutbox.event_type == "course.sync",
-                SyncOutbox.state.in_(
-                    [
-                        SyncOutboxState.PENDING.value,
-                        SyncOutboxState.PROCESSING.value,
-                        SyncOutboxState.RETRY.value,
-                    ]
-                ),
-            )
-        )
-        if outstanding is not None:
-            continue
-        # ``POST /courses/{id}/sync`` performs discovery in the request so it
-        # has no worker-owned outbox lease.  Its durable course marker is the
-        # coordination point: do not overwrite a live foreground refresh with
-        # PENDING.  A marker older than the external-I/O bound is deliberately
-        # recoverable below, so a cancelled API request cannot wedge a course.
-        if course.sync_status == "SYNCING" and _as_utc(course.updated_at) > _as_utc(stale_before):
-            continue
-        recent_row = (
-            await db.execute(
-                select(SyncOutbox.delivered_at, SyncOutbox.created_at)
-                .where(
-                    SyncOutbox.course_id == course.id,
-                    SyncOutbox.event_type == "course.sync",
-                    SyncOutbox.state == SyncOutboxState.DELIVERED.value,
-                )
-                .order_by(SyncOutbox.delivered_at.desc(), SyncOutbox.created_at.desc())
-                .limit(1)
-            )
-        ).first()
-        recent = (recent_row[0] or recent_row[1]) if recent_row is not None else None
-        if (
-            course.sync_status == "CURRENT"
-            and recent is not None
-            and _as_utc(recent) > now - timedelta(seconds=interval)
-        ):
-            continue
-        recovering_stale_marker = course.sync_status in {"PENDING", "SYNCING"} and _as_utc(
-            course.updated_at
-        ) <= _as_utc(stale_before)
-        key_kind = "course-sync-recovery" if recovering_stale_marker else "course-sync"
-        key = f"{key_kind}:{course.id}:{bucket}"[:100]
-        if await db.scalar(select(SyncOutbox.id).where(SyncOutbox.idempotency_key == key)):
-            continue
-        # Serialize concurrent scheduler iterations without preventing stale
-        # PENDING/SYNCING recovery.  A second scheduler observing the fresh
-        # PENDING written here must not create another bucket row.
-        claimed = await db.execute(
-            update(Course)
-            .where(
-                Course.id == course.id,
-                or_(
-                    Course.sync_status.in_(["CURRENT", "FAILED"]),
-                    and_(
-                        Course.sync_status.in_(["PENDING", "SYNCING"]),
-                        Course.updated_at <= stale_before,
-                    ),
-                ),
-            )
-            .values(sync_status="PENDING", updated_at=now)
-            .execution_options(synchronize_session=False)
-        )
-        if claimed.rowcount != 1:  # type: ignore[attr-defined]
-            continue
-        db.add(
-            SyncOutbox(
-                connection_id=course.connection_id,
-                course_id=course.id,
-                event_type="course.sync",
-                aggregate_type="Course",
-                aggregate_id=course.id,
-                idempotency_key=key,
-                payload={"course_id": course.external_id, "schedule_bucket": bucket},
-            )
-        )
-        enqueued += 1
-    await db.flush()
-    return enqueued
-
-
 async def run_scheduler_iteration(
     session_factory: SessionFactory,
     settings: Settings,
     *,
     now: datetime | None = None,
-    include_course_sync: bool = True,
 ) -> SchedulerResult:
-    """Run one idempotent scheduler transaction; it never contacts an external service."""
+    """Maintain roots in short independent transactions, without external I/O.
+
+    Do not hold the first student's Attempt/Workspace locks while processing
+    the rest of a class. Catalog and answer imports are exclusively manual.
+    A broken attempt must not prevent
+    other students' deadline submissions from being committed.
+    """
 
     now = now or utcnow()
-    async with session_factory() as db, db.begin():
-        attempt_result = await maintain_attempts(db, settings, now=now)
-        courses = (
-            await enqueue_course_synchronizations(db, settings, now=now)
-            if include_course_sync
-            else 0
-        )
-        return SchedulerResult(
-            checkpoints_enqueued=attempt_result.checkpoints_enqueued,
-            attempts_submitted=attempt_result.attempts_submitted,
-            courses_enqueued=courses,
-        )
+    async with session_factory() as db:
+        attempt_ids = await _active_root_attempt_ids(db)
+    checkpoints = 0
+    submitted = 0
+    for attempt_id in attempt_ids:
+        try:
+            async with session_factory() as db, db.begin():
+                result = await maintain_attempts(db, settings, now=now, attempt_ids=[attempt_id])
+            checkpoints += result.checkpoints_enqueued
+            submitted += result.attempts_submitted
+        except Exception:
+            LOGGER.exception("attempt maintenance failed attempt=%s", attempt_id)
+    return SchedulerResult(
+        checkpoints_enqueued=checkpoints,
+        attempts_submitted=submitted,
+    )
 
 
 async def claim_next_outbox_event(
@@ -670,6 +590,8 @@ async def claim_next_outbox_event(
     *,
     now: datetime | None = None,
     terminal_checkpoints_only: bool = False,
+    history_imports_only: bool = False,
+    exclude_history_imports: bool = False,
 ) -> ClaimedOutboxEvent | None:
     """Atomically claim one due row using PostgreSQL ``FOR UPDATE SKIP LOCKED``."""
 
@@ -691,6 +613,10 @@ async def claim_next_outbox_event(
             ),
         )
         filters = [due]
+        if history_imports_only:
+            filters.append(SyncOutbox.event_type == "moodle.history.import")
+        if exclude_history_imports:
+            filters.append(SyncOutbox.event_type != "moodle.history.import")
         if terminal_checkpoints_only:
             filters.extend(
                 [
@@ -724,12 +650,20 @@ async def claim_next_outbox_event(
                     (
                         and_(
                             SyncOutbox.event_type == "moodle.history.import",
+                            SyncOutbox.payload["probe_only"].as_boolean().is_(True),
+                        ),
+                        7,
+                    ),
+                    (
+                        and_(
+                            SyncOutbox.event_type == "moodle.history.import",
                             SyncOutbox.payload["priority_only"].as_boolean().is_(True),
                         ),
                         5,
                     ),
-                    # Exhaustive history is deliberately last.  Its priority
-                    # pass has already imported attempts awaiting review.
+                    # Read inventories before their pinned answer jobs, but
+                    # do not keep ready answers behind batches of deletion
+                    # probes. Each answer becomes reviewable after its commit.
                     else_=6,
                 ),
                 SyncOutbox.next_attempt_at,
@@ -762,8 +696,17 @@ async def claim_next_outbox_event(
                     submission.lms_export_state = "PROCESSING"
         row.state = SyncOutboxState.PROCESSING.value
         row.attempts += 1
-        row.last_attempt_at = now
-        row.locked_at = now
+        # last_attempt_at is the immutable fencing token; locked_at becomes
+        # the renewable heartbeat. Never reuse a token, even if the clock was
+        # adjusted backwards or a queue-contention retry did not consume an attempt.
+        claim_time = max(
+            _as_utc(now),
+            _as_utc(row.last_attempt_at) + timedelta(microseconds=1)
+            if row.last_attempt_at is not None
+            else _as_utc(now),
+        )
+        row.last_attempt_at = claim_time
+        row.locked_at = claim_time
         row.last_error = ""
         if row.event_type == "course.sync" and row.course_id is not None:
             course = await db.get(Course, row.course_id)
@@ -794,6 +737,8 @@ async def process_outbox_once(
     client_factory: ClientFactory | None = None,
     now: datetime | None = None,
     terminal_checkpoints_only: bool = False,
+    history_imports_only: bool = False,
+    exclude_history_imports: bool = False,
 ) -> bool:
     """Claim, commit, call Moodle, then persist the result in a fresh transaction."""
 
@@ -802,9 +747,123 @@ async def process_outbox_once(
         settings,
         now=now,
         terminal_checkpoints_only=terminal_checkpoints_only,
+        history_imports_only=history_imports_only,
+        exclude_history_imports=exclude_history_imports,
     )
     if claim is None:
         return False
+    delivery = asyncio.create_task(
+        _process_claim(
+            session_factory,
+            settings,
+            claim,
+            bridge_factory=bridge_factory,
+            client=client,
+            client_factory=client_factory,
+            now=now,
+        )
+    )
+    heartbeat = asyncio.create_task(_keep_outbox_claim_alive(session_factory, settings, claim))
+    try:
+        completed, _pending = await asyncio.wait(
+            (delivery, heartbeat),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if delivery in completed:
+            return await delivery
+        # Lost ownership (or the DB cannot renew it). Stop external work before
+        # another worker can continue this event; its result cannot be committed.
+        await heartbeat
+        return True
+    finally:
+        interrupted = not delivery.done() or delivery.cancelled()
+        if not interrupted:
+            interrupted = delivery.exception() is not None
+        delivery.cancel()
+        heartbeat.cancel()
+        await asyncio.gather(delivery, heartbeat, return_exceptions=True)
+        if interrupted:
+            await _requeue_interrupted_claim_best_effort(session_factory, claim)
+
+
+async def _renew_outbox_claim(
+    session_factory: SessionFactory,
+    claim: ClaimedOutboxEvent,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    async with session_factory() as db, db.begin():
+        renewed = await db.execute(
+            update(SyncOutbox)
+            .where(
+                SyncOutbox.id == claim.id,
+                SyncOutbox.state == SyncOutboxState.PROCESSING.value,
+                SyncOutbox.last_attempt_at == claim.locked_at,
+                SyncOutbox.attempts == claim.attempts,
+                SyncOutbox.locked_at.is_not(None),
+            )
+            .values(locked_at=now or utcnow())
+            .execution_options(synchronize_session=False)
+        )
+        return renewed.rowcount == 1
+
+
+async def _keep_outbox_claim_alive(
+    session_factory: SessionFactory,
+    settings: Settings,
+    claim: ClaimedOutboxEvent,
+) -> None:
+    interval = min(10.0, max(5, settings.sync_lease_seconds) / 3)
+    while True:
+        await asyncio.sleep(interval)
+        # A stalled DB renewal is also loss of ownership: stop delivery before
+        # another worker can reclaim the expired lease. Do not let the heartbeat
+        # itself wait indefinitely behind a locked row or a lost DB connection.
+        async with asyncio.timeout(interval):
+            renewed = await _renew_outbox_claim(session_factory, claim)
+        if not renewed:
+            return
+
+
+async def _requeue_interrupted_claim_best_effort(
+    session_factory: SessionFactory,
+    claim: ClaimedOutboxEvent,
+) -> None:
+    async def requeue() -> None:
+        async with asyncio.timeout(5), session_factory() as db, db.begin():
+            row = await _owned_claim(db, claim)
+            if row is None:
+                return
+            row.state = SyncOutboxState.RETRY.value
+            row.attempts = max(0, row.attempts - 1)
+            row.locked_at = None
+            row.next_attempt_at = utcnow()
+            row.last_error = "WORKER_INTERRUPTED: Delivery interrupted; awaiting retry"
+
+    task = asyncio.create_task(requeue())
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await asyncio.shield(task)
+        except BaseException:
+            pass
+    except Exception:
+        # If the database is unavailable the normal stale-lease recovery is
+        # still safe. Never clear the claim owned by another worker.
+        LOGGER.warning("could not requeue interrupted outbox event %s", claim.id)
+
+
+async def _process_claim(
+    session_factory: SessionFactory,
+    settings: Settings,
+    claim: ClaimedOutboxEvent,
+    *,
+    bridge_factory: BridgeFactory | None,
+    client: httpx.AsyncClient | None,
+    client_factory: ClientFactory | None,
+    now: datetime | None,
+) -> bool:
     try:
         context = await _prepare_delivery(session_factory, settings, claim)
     except _BlockedDelivery as exc:
@@ -1016,6 +1075,9 @@ class _MoodleBrowserAdapter:
             base_url=connection.base_url,
             storage_state=connection.browser_state,
         )
+        self.history_artifact_max_bytes = getattr(
+            settings, "moodle_browser_history_artifact_max_bytes", 100 * 1024 * 1024
+        )
 
     async def store_checkpoint(
         self,
@@ -1136,7 +1198,9 @@ class _MoodleBrowserAdapter:
         external_id: str,
         actor_external_subject: str,
     ) -> _BrowserDeliveryResult:
-        result = await self.browser.discover_course(external_id, actor_external_subject)
+        result = await self.browser.discover_course(
+            external_id, actor_external_subject, interactive=True
+        )
         return _BrowserDeliveryResult(
             value=result.discovery,
             storage_state=result.storage_state,
@@ -1154,15 +1218,32 @@ class _MoodleBrowserAdapter:
             cursor=str(payload.get("cursor", "0:0")),
             limit=payload.get("limit", 10),
             priority_only=payload.get("priority_only", False),
+            known_attempt_ids=payload.get("known_attempt_ids", []),
+            scan_only=payload.get("scan_only", False),
+            attempt_refs=payload.get("attempt_refs", []),
+            include_activity_metadata=payload.get("include_activity_metadata", False),
+            probe_only=payload.get("probe_only", False),
+            attachment_delivery="reference",
+        )
+        from app.services.moodle_history_download import hydrate_historical_attachments
+
+        items = list(result.items)
+        attachment_warnings = await hydrate_historical_attachments(
+            items, base_url=self.browser.base_url, storage_state=result.storage_state,
+            maximum_bytes=self.history_artifact_max_bytes,
         )
         return _BrowserDeliveryResult(
             value={
                 "course_id": result.course_id,
                 "activity": {"module": result.module, "cmid": result.cmid},
-                "items": list(result.items),
+                "items": items,
                 "next_cursor": result.next_cursor,
                 "complete": result.complete,
-                "warnings": list(result.warnings),
+                "warnings": [*result.warnings, *attachment_warnings],
+                "deleted_attempt_ids": list(getattr(result, "deleted_attempt_ids", ())),
+                "scan_only": getattr(result, "scan_only", False),
+                "candidates": list(getattr(result, "candidates", ())),
+                "activity_metadata": getattr(result, "activity_metadata", None),
             },
             storage_state=result.storage_state,
         )
@@ -1213,22 +1294,32 @@ async def _prepare_delivery(
     settings: Settings,
     claim: ClaimedOutboxEvent,
 ) -> DeliveryContext:
-    async with session_factory() as db:
-        connection = await db.get(LMSConnection, claim.connection_id)
-        if connection is None or not connection.enabled:
-            raise _BlockedDelivery("CONNECTION_DISABLED", "LMS connection is unavailable")
-        target = _connection_target(settings, connection)
-        if claim.event_type == "attempt.checkpoint":
-            return await _prepare_checkpoint(db, settings, claim, target)
-        if claim.event_type == "review.decision":
-            return await _prepare_grade(db, settings, claim, target)
-        if claim.event_type == "task.version":
-            return await _prepare_task_version(db, claim, target)
-        if claim.event_type == "course.sync":
-            return await _prepare_course_sync(db, settings, claim, target)
-        if claim.event_type == "moodle.history.import":
-            return await _prepare_history_import(db, settings, claim, target)
-        raise _BlockedDelivery("UNSUPPORTED_EVENT", "Outbox event type is not supported")
+    context: DeliveryContext | None = None
+    try:
+        async with session_factory() as db:
+            connection = await db.get(LMSConnection, claim.connection_id)
+            if connection is None or not connection.enabled:
+                raise _BlockedDelivery("CONNECTION_DISABLED", "LMS connection is unavailable")
+            target = _connection_target(settings, connection)
+            if claim.event_type == "attempt.checkpoint":
+                context = await _prepare_checkpoint(db, settings, claim, target)
+            elif claim.event_type == "review.decision":
+                context = await _prepare_grade(db, settings, claim, target)
+            elif claim.event_type == "task.version":
+                context = await _prepare_task_version(db, claim, target)
+            elif claim.event_type == "course.sync":
+                context = await _prepare_course_sync(db, settings, claim, target)
+            elif claim.event_type == "moodle.history.import":
+                context = await _prepare_history_import(db, settings, claim, target)
+            else:
+                raise _BlockedDelivery("UNSUPPORTED_EVENT", "Outbox event type is not supported")
+        return context
+    except BaseException:
+        # Session close is an await point after the credential lease committed,
+        # but before the caller receives this context and can clean it up.
+        if context is not None:
+            await _release_browser_context_best_effort(session_factory, context)
+        raise
 
 
 async def _prepare_checkpoint(
@@ -1243,6 +1334,8 @@ async def _prepare_checkpoint(
     snapshot = await db.get(Snapshot, claim.aggregate_id)
     if attempt is None or snapshot is None:
         raise _BlockedDelivery("MISSING_CHECKPOINT", "Checkpoint source no longer exists")
+    if attempt.state == AttemptState.VOID.value:
+        raise _BlockedDelivery("MOODLE_ATTEMPT_DELETED", "Moodle attempt is no longer active")
     if attempt.submission_source == "MOODLE_FINALIZED":
         raise _BlockedDelivery(
             "MOODLE_ATTEMPT_FINALIZED",
@@ -1898,6 +1991,19 @@ async def _prepare_grade(
         or claim.course_id != course.id
     ):
         raise _BlockedDelivery("GRADE_CONTEXT_MISMATCH", "Grade ownership is invalid")
+    enrolled = await db.scalar(select(CourseMembership.id).where(
+        CourseMembership.course_id == course.id,
+        CourseMembership.principal_id == principal.id,
+        CourseMembership.active.is_(True),
+        or_(CourseMembership.valid_until.is_(None), CourseMembership.valid_until > utcnow()),
+    ).limit(1))
+    if enrolled is None or not principal.active or course.archived_at is not None:
+        raise _BlockedDelivery(
+            "LMS_EXPORT_UNAVAILABLE",
+            "Отправка ответа в LMS недоступна. Свяжитесь с администратором.",
+        )
+    if attempt.state == AttemptState.VOID.value:
+        raise _BlockedDelivery("MOODLE_ATTEMPT_DELETED", "Moodle attempt is no longer active")
     if not await is_latest_completed_moodle_attempt(
         db,
         submission=submission,
@@ -1930,6 +2036,26 @@ async def _prepare_grade(
         if root_attempt is None or root_attempt.principal_id != principal.id:
             raise _BlockedDelivery("GRADE_CONTEXT_MISMATCH", "Quiz session ownership is invalid")
         parent_assessment_id = root_attempt.assessment_id
+    parent_id = (assessment.policy or {}).get("moodle_parent_assessment_id")
+    try:
+        scoped_assessments = {assessment.id, parent_assessment_id}
+        if parent_id:
+            scoped_assessments.add(uuid.UUID(str(parent_id)))
+    except (TypeError, ValueError) as exc:
+        raise _BlockedDelivery(
+            "GRADE_CONTEXT_MISMATCH", "Quiz parent assessment is invalid"
+        ) from exc
+    missing_mapping = await db.scalar(select(ExternalMapping.id).where(
+        ExternalMapping.connection_id == course.connection_id,
+        ExternalMapping.local_type.in_(["Assessment", "core.assessment"]),
+        ExternalMapping.local_id.in_(scoped_assessments),
+        ExternalMapping.metadata_json["sync_state"].as_string() == "MISSING_IN_MOODLE",
+    ).limit(1))
+    if missing_mapping is not None:
+        raise _BlockedDelivery(
+            "LMS_EXPORT_UNAVAILABLE",
+            "Отправка ответа в LMS недоступна. Свяжитесь с администратором.",
+        )
     historical_metadata = (
         historical_mapping.metadata_json
         if historical_mapping is not None and isinstance(historical_mapping.metadata_json, dict)
@@ -2348,6 +2474,9 @@ async def _prepare_course_sync(
         ).all()
     ]
     actors = [actor for actor in actors if await teacher_membership_is_authorized(db, actor[0])]
+    requested_actor = str((claim.payload or {}).get("actor_external_subject", ""))
+    if requested_actor:
+        actors = [actor for actor in actors if actor[1] == requested_actor]
     if not actors:
         raise _BlockedDelivery(
             "TEACHER_CONTEXT_REQUIRED", "Course sync requires an active Moodle teacher"
@@ -2357,7 +2486,7 @@ async def _prepare_course_sync(
         connection_with_credential = None
         for candidate_id, candidate_external_subject in actors:
             try:
-                connection_with_credential = await _principal_credential_target(
+                connection_with_credential = await _principal_browser_read_target(
                     db, settings, connection, candidate_id
                 )
             except _BlockedDelivery:
@@ -2384,7 +2513,7 @@ async def _prepare_history_import(
     claim: ClaimedOutboxEvent,
     connection: ConnectionTarget,
 ) -> _HistoryImportDelivery:
-    """Validate one bounded historical-import page and lease a teacher session."""
+    """Validate one page of an explicitly requested assessment import."""
 
     if claim.course_id is None or claim.aggregate_type != "Assessment":
         raise _BlockedDelivery(
@@ -2508,9 +2637,19 @@ async def _prepare_history_import(
             "HISTORY_IMPORT_ACTOR_FORBIDDEN",
             "Historical Moodle import actor is no longer an authorized course teacher",
         )
-    # Never fall back to another teacher here: every subsequent page belongs
-    # to the exact Moodle visibility scope captured by the initial event.
-    leased_connection = await _principal_credential_target(
+    known_attempt_ids = (
+        await known_quiz_attempt_probe_batch(
+            db, course=course, assessment=assessment, mapping=mapping, cmid=cmid
+        )
+        if module == "quiz" and not payload.get("attempt_refs") and not payload.get("manual_run_id")
+        else []
+    )
+    if payload.get("probe_only") is True:
+        known_attempt_ids = payload.get("known_attempt_ids", [])
+    # The read snapshot commits the probe cursor before network I/O. History
+    # does not take the exclusive credential lease used by student/grade writes.
+    # Never fall back to another teacher: every page retains its actor scope.
+    leased_connection = await _principal_browser_read_target(
         db,
         settings,
         connection,
@@ -2529,6 +2668,17 @@ async def _prepare_history_import(
             "cursor": cursor,
             "limit": limit,
             "priority_only": priority_only,
+            **({"scan_only": True} if payload.get("scan_only") is True else {}),
+            **({"manual_run_id": payload["manual_run_id"]} if payload.get("manual_run_id") else {}),
+            "include_activity_metadata": bool(
+                payload.get("manual_run_id")
+                and payload.get("scan_only") is True
+                and not payload.get("probe_only")
+                and cursor == "0:0"
+            ),
+            **({"probe_only": True} if payload.get("probe_only") is True else {}),
+            **({"attempt_refs": payload["attempt_refs"]} if payload.get("attempt_refs") else {}),
+            **({"known_attempt_ids": known_attempt_ids} if known_attempt_ids else {}),
         },
     )
 
@@ -2775,7 +2925,15 @@ async def _finish_delivered(
                     "Historical Moodle import result has an invalid shape"
                 )
             course = await db.get(Course, context.course_id)
-            assessment = await db.get(Assessment, context.assessment_id)
+            # Serialize only the local apply phase for this activity. Remote
+            # reads stay concurrent; an old response must not resurrect rows
+            # after another import confirmed their deletion.
+            assessment = await db.scalar(
+                select(Assessment)
+                .where(Assessment.id == context.assessment_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
             if (
                 course is None
                 or assessment is None
@@ -2790,13 +2948,6 @@ async def _finish_delivered(
                 raise IntegrationProtocolError(
                     "Historical Moodle submissions have an invalid shape"
                 )
-            stats = await materialize_historical_submissions(
-                db,
-                course=course,
-                assessment=assessment,
-                actor_external_subject=context.actor_external_subject,
-                items=items,
-            )
             next_cursor = result.get("next_cursor")
             complete = result.get("complete")
             if (
@@ -2805,6 +2956,95 @@ async def _finish_delivered(
                 or (not complete and not isinstance(next_cursor, str))
             ):
                 raise IntegrationProtocolError("Historical Moodle pagination is inconsistent")
+            activity_metadata = result.get("activity_metadata")
+            if (
+                activity_metadata is not None
+                and "ACTIVITY_METADATA_INCOMPLETE" not in result.get("warnings", [])
+            ):
+                if (
+                    context.payload.get("include_activity_metadata") is not True
+                    or not isinstance(activity_metadata, dict)
+                    or str(activity_metadata.get("cmid")) != str(context.payload["cmid"])
+                    or activity_metadata.get("module") != context.payload["module"]
+                ):
+                    raise IntegrationProtocolError("Unexpected Moodle activity metadata")
+                actor_id = await db.scalar(select(ExternalPrincipal.id).where(
+                    ExternalPrincipal.connection_id == course.connection_id,
+                    ExternalPrincipal.external_subject == context.actor_external_subject,
+                ))
+                if actor_id is None:
+                    raise IntegrationProtocolError("Moodle activity sync actor is missing")
+                section = (
+                    await db.get(CourseSection, assessment.section_id)
+                    if assessment.section_id else None
+                )
+                activity = _project_lms_activity(
+                    activity_metadata,
+                    section.external_id if section is not None else "",
+                )
+                if activity is None:
+                    raise IntegrationProtocolError("Moodle activity metadata is invalid")
+                await materialize_moodle_activity_drafts(
+                    db, course=course, activities=[activity], created_by_id=actor_id
+                )
+                await _apply_activity_deadlines(
+                    db, course, [activity], assessment_id=assessment.id
+                )
+                # Independent activity jobs may complete together. Serialize
+                # the tiny shared catalog projection so one cannot drop the
+                # other's freshly fetched metadata.
+                course = await db.scalar(select(Course).where(
+                    Course.id == context.course_id
+                ).with_for_update().execution_options(populate_existing=True))
+                if course is None:
+                    raise IntegrationProtocolError("Moodle activity course disappeared")
+                policies = dict(course.policies or {})
+                policies["lms_activities"] = [
+                    _activity_policy_projection(activity)
+                    if str(item.get("cmid")) == str(activity["cmid"])
+                    and item.get("module") == activity["module"] else item
+                    for item in policies.get("lms_activities", [])
+                    if isinstance(item, dict)
+                ]
+                course.policies = policies
+            retired_attempts = 0
+            if context.payload.get("module") == "quiz":
+                retired_attempts = await reconcile_deleted_quiz_attempts(
+                    db,
+                    course=course,
+                    assessment=assessment,
+                    cmid=context.payload["cmid"],
+                    actor_external_subject=context.actor_external_subject,
+                    known_attempt_ids=context.payload.get("known_attempt_ids", []),
+                    deleted_attempt_ids=result.get("deleted_attempt_ids", []),
+                )
+            elif result.get("deleted_attempt_ids"):
+                raise IntegrationProtocolError("Unexpected Moodle Assignment deletion evidence")
+            stats = await materialize_historical_submissions(
+                db,
+                course=course,
+                assessment=assessment,
+                actor_external_subject=context.actor_external_subject,
+                items=items,
+            )
+            scan_only = result.get("scan_only") is True
+            answers_queued = 0
+            if scan_only:
+                if context.payload.get("scan_only") is not True or items:
+                    raise IntegrationProtocolError(
+                        "Historical inventory contains unexpected answers"
+                    )
+                answers_queued = await enqueue_historical_answer_reads(
+                    db,
+                    course=course,
+                    assessment=assessment,
+                    actor_external_subject=context.actor_external_subject,
+                    module=context.payload["module"],
+                    cmid=context.payload["cmid"],
+                    candidates=result.get("candidates", []),
+                    scan_id=claim.id,
+                    manual_run_id=context.payload.get("manual_run_id"),
+                )
             next_page_queued = False
             full_scan_queued = False
             if isinstance(next_cursor, str):
@@ -2829,11 +3069,16 @@ async def _finish_delivered(
                                 "cursor": next_cursor,
                                 "limit": context.payload["limit"],
                                 "priority_only": context.payload.get("priority_only", False),
+                                **({"scan_only": True} if scan_only else {}),
+                                **(
+                                    {"manual_run_id": context.payload["manual_run_id"]}
+                                    if context.payload.get("manual_run_id") else {}
+                                ),
                             },
                         )
                     )
                     next_page_queued = True
-            elif context.payload.get("priority_only") is True:
+            elif context.payload.get("priority_only") is True and not scan_only:
                 active_history_rows = list(
                     (
                         await db.scalars(
@@ -2886,12 +3131,23 @@ async def _finish_delivered(
                 "updated": stats.updated,
                 "unchanged": stats.unchanged,
                 "skipped": stats.skipped,
+                **({"retired_attempts": retired_attempts} if retired_attempts else {}),
                 "warning_count": len(warnings) if isinstance(warnings, list) else 0,
+                **({"warning_codes": history_warning_codes(warnings)} if warnings else {}),
                 "complete": complete,
                 "next_page_queued": next_page_queued,
                 "full_scan_queued": full_scan_queued,
                 "priority_only": context.payload.get("priority_only", False),
                 "actor_external_subject": context.actor_external_subject,
+                **(
+                    {
+                        "scan_only": True,
+                        "listed": len(result.get("candidates", [])),
+                        "answers_queued": answers_queued,
+                    }
+                    if scan_only
+                    else {}
+                ),
             }
         else:
             if not isinstance(result, dict):
@@ -3196,7 +3452,9 @@ async def _finish_failure(
                         course.sync_status = "SYNCING"
                         _clear_course_sync_error(course)
                     else:
-                        course.sync_status = "PENDING"
+                        course.sync_status = "SYNCING"
+                else:
+                    course.sync_status = "FAILED"
         return True
 
 
@@ -3209,7 +3467,9 @@ async def _owned_claim(
         row is None
         or row.state != SyncOutboxState.PROCESSING.value
         or row.locked_at is None
-        or not _same_instant(row.locked_at, claim.locked_at)
+        or row.last_attempt_at is None
+        or not _same_instant(row.last_attempt_at, claim.locked_at)
+        or row.attempts != claim.attempts
     ):
         return None
     return row
@@ -3278,6 +3538,7 @@ async def _apply_course_discovery(
         if external_id not in seen_sections:
             section.visible = False
 
+    activities = await merge_moodle_course_index(db, course=course, activities=activities)
     policy_activities = [_activity_policy_projection(row) for row in activities]
     _bounded_canonical_json(
         policy_activities,
@@ -3316,13 +3577,7 @@ async def _apply_course_discovery(
         str(preview.get("membership_revision", "")),
         complete=bool(snapshot.get("complete", True)),
     )
-    # The current roster determines the authorized actor set for independent
-    # history crawl chains.
-    await enqueue_historical_submission_imports(
-        db,
-        course=course,
-        actor_external_subject=actor_external_subject,
-    )
+    # Answers are imported only by a separate, explicit assessment sync.
     await db.flush()
 
 
@@ -3657,6 +3912,8 @@ async def _apply_activity_deadlines(
     db: AsyncSession,
     course: Course,
     activities: list[dict[str, Any]],
+    *,
+    assessment_id: uuid.UUID | None = None,
 ) -> None:
     """Apply schedules only through explicit Assessment -> Moodle mappings."""
 
@@ -3683,6 +3940,8 @@ async def _apply_activity_deadlines(
         ).all()
     )
     for mapping in mappings:
+        if assessment_id is not None and mapping.local_id != assessment_id:
+            continue
         module = _moodle_activity_mapping_module(mapping)
         if module not in {"assign", "quiz"}:
             continue
@@ -4053,15 +4312,20 @@ async def _release_browser_context(
     ):
         return
     async with session_factory() as db, db.begin():
-        await db.execute(
-            update(MoodleCredential)
-            .where(
-                MoodleCredential.id == target.browser_credential_id,
-                MoodleCredential.lease_owner == target.browser_lease_owner,
-            )
-            .values(lease_owner=None, lease_expires_at=None)
-            .execution_options(synchronize_session=False)
+        await _clear_owned_browser_lease(db, target)
+
+
+async def _clear_owned_browser_lease(db: AsyncSession, target: ConnectionTarget) -> None:
+    await db.execute(
+        update(MoodleCredential)
+        .where(
+            MoodleCredential.id == target.browser_credential_id,
+            MoodleCredential.lease_owner == target.browser_lease_owner,
+            MoodleCredential.revision == target.browser_credential_revision,
         )
+        .values(lease_owner=None, lease_expires_at=None)
+        .execution_options(synchronize_session=False)
+    )
 
 
 async def _release_browser_context_best_effort(
@@ -4070,7 +4334,11 @@ async def _release_browser_context_best_effort(
 ) -> None:
     """Release a browser lease even while the worker task is being cancelled."""
 
-    release_task = asyncio.create_task(_release_browser_context(session_factory, context))
+    async def release() -> None:
+        async with asyncio.timeout(5):
+            await _release_browser_context(session_factory, context)
+
+    release_task = asyncio.create_task(release())
     try:
         await asyncio.shield(release_task)
     except asyncio.CancelledError:
@@ -4091,17 +4359,25 @@ async def _invalidate_browser_context(
     """Expire a leased browser state after Moodle rejects the authenticated page."""
 
     target = context.connection
-    if target.transport != "PLAYWRIGHT" or not (
-        target.browser_credential_id and target.browser_lease_owner
-    ):
+    if target.transport != "PLAYWRIGHT" or target.browser_credential_id is None:
+        return
+    if not target.browser_read_only and not target.browser_lease_owner:
         return
     now = utcnow()
+    ownership = (
+        and_(
+            MoodleCredential.revision == target.browser_credential_revision,
+            or_(MoodleCredential.lease_owner.is_(None), MoodleCredential.lease_expires_at <= now),
+        )
+        if target.browser_read_only
+        else MoodleCredential.lease_owner == target.browser_lease_owner
+    )
     async with session_factory() as db, db.begin():
         await db.execute(
             update(MoodleCredential)
             .where(
                 MoodleCredential.id == target.browser_credential_id,
-                MoodleCredential.lease_owner == target.browser_lease_owner,
+                ownership,
             )
             .values(
                 status="EXPIRED",
@@ -4152,7 +4428,7 @@ async def _persist_browser_context(
         or target.principal_id is None
         or target.browser_credential_id is None
         or target.browser_credential_revision is None
-        or target.browser_lease_owner is None
+        or (target.browser_lease_owner is None and not target.browser_read_only)
     ):
         raise IntegrationProtocolError("Moodle browser credential lease is incomplete")
     try:
@@ -4165,11 +4441,19 @@ async def _persist_browser_context(
     except ValueError as exc:
         raise IntegrationProtocolError("Moodle browser returned an invalid session state") from exc
     now = utcnow()
+    ownership = (
+        or_(
+            MoodleCredential.lease_owner.is_(None),
+            MoodleCredential.lease_expires_at <= now,
+        )
+        if target.browser_read_only
+        else MoodleCredential.lease_owner == target.browser_lease_owner
+    )
     updated = await db.execute(
         update(MoodleCredential)
         .where(
             MoodleCredential.id == target.browser_credential_id,
-            MoodleCredential.lease_owner == target.browser_lease_owner,
+            ownership,
             MoodleCredential.revision == target.browser_credential_revision,
             MoodleCredential.status == "ACTIVE",
             MoodleCredential.revoked_at.is_(None),
@@ -4184,8 +4468,59 @@ async def _persist_browser_context(
         )
         .execution_options(synchronize_session=False)
     )
-    if updated.rowcount != 1:  # type: ignore[attr-defined]
+    if updated.rowcount != 1 and not target.browser_read_only:  # type: ignore[attr-defined]
         raise IntegrationUnavailable("Moodle browser session changed during delivery")
+
+
+async def _principal_browser_read_target(
+    db: AsyncSession,
+    settings: Settings,
+    connection: ConnectionTarget,
+    principal_id: uuid.UUID,
+) -> ConnectionTarget:
+    """Detached teacher cookies for read-only history; no exclusive write lease.
+
+    A course crawl, a different course's history, and a student's writes must
+    not lock each other out. Refreshed cookies are only committed by CAS, so a
+    concurrent login/grade export always retains its newer session.
+    """
+    credential = await db.scalar(
+        select(MoodleCredential).where(
+            MoodleCredential.connection_id == connection.id,
+            MoodleCredential.principal_id == principal_id,
+            MoodleCredential.kind == BROWSER_STATE_CREDENTIAL_KIND,
+        )
+    )
+    if (
+        credential is None
+        or credential.status != "ACTIVE"
+        or credential.revoked_at is not None
+        or (credential.expires_at is not None and _as_utc(credential.expires_at) <= utcnow())
+    ):
+        raise _BlockedDelivery("LMS_REAUTH_REQUIRED", "Moodle reauthentication is required")
+    try:
+        state = decrypt_moodle_browser_state(
+            credential.encrypted_secret,
+            settings,
+            connection_id=connection.id,
+            principal_id=principal_id,
+        )
+    except CredentialDecryptionError as exc:
+        raise _BlockedDelivery(
+            "LMS_REAUTH_REQUIRED", "Stored Moodle session cannot be opened"
+        ) from exc
+    result = replace(
+        connection,
+        principal_id=principal_id,
+        browser_state=state,
+        browser_credential_id=credential.id,
+        browser_credential_revision=credential.revision,
+        browser_read_only=True,
+    )
+    # Persist the deletion-probe cursor, but never hold a DB connection across
+    # the potentially slow network read.
+    await db.commit()
+    return result
 
 
 async def _principal_credential_target(
@@ -4312,8 +4647,7 @@ async def _principal_browser_credential_target(
         await db.rollback()
         raise IntegrationBusy("Moodle browser session is busy")
     credential_id = credential.id
-    await db.commit()
-    return replace(
+    leased_target = replace(
         connection,
         principal_id=principal_id,
         browser_state=state,
@@ -4321,6 +4655,38 @@ async def _principal_browser_credential_target(
         browser_credential_revision=revision,
         browser_lease_owner=owner,
     )
+    try:
+        await db.commit()
+    except BaseException:
+        # COMMIT may have reached the database even when cancellation/error
+        # prevents its acknowledgement. The caller does not own a context yet.
+        # Reset the session, then release only this exact owner/revision.
+        await _release_unreturned_browser_lease_best_effort(db, leased_target)
+        raise
+    return leased_target
+
+
+async def _release_unreturned_browser_lease_best_effort(
+    db: AsyncSession,
+    target: ConnectionTarget,
+) -> None:
+    async def release() -> None:
+        async with asyncio.timeout(5):
+            await db.rollback()
+            async with db.begin():
+                await _clear_owned_browser_lease(db, target)
+
+    task = asyncio.create_task(release())
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await asyncio.shield(task)
+        except BaseException:
+            pass
+    except Exception:
+        # Expiry is still the fallback when the DB cannot complete cleanup.
+        LOGGER.warning("could not release interrupted Moodle credential preparation")
 
 
 def _connection_target(settings: Settings, connection: LMSConnection) -> ConnectionTarget:
@@ -4761,7 +5127,6 @@ __all__ = [
     "checkpoint_interval_seconds",
     "claim_next_outbox_event",
     "default_bridge_factory",
-    "enqueue_course_synchronizations",
     "maintain_attempts",
     "process_outbox_once",
     "recover_attempt_checkpoint",

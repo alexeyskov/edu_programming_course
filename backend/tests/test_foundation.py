@@ -78,7 +78,8 @@ async def test_complete_metadata_is_created(app_bundle):
         table_names = await connection.run_sync(lambda sync: set(inspect(sync).get_table_names()))
 
     assert table_names == set(Base.metadata.tables)
-    assert len(table_names) == 49
+    assert len(table_names) == 50
+    assert "core_historywarningdismissal" in table_names
     assert "core_moodlequizquestion" in table_names
     assert "core_attempt" in table_names
     assert "core_principalsession" in table_names

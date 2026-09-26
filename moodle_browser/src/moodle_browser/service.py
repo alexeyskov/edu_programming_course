@@ -5,6 +5,7 @@ import base64
 import hashlib
 import hmac
 import html
+import json
 import logging
 import re
 from collections import OrderedDict
@@ -16,6 +17,7 @@ from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlsplit
 
+import httpx
 from bs4 import BeautifulSoup
 from playwright.async_api import (
     Browser,
@@ -44,8 +46,14 @@ from .assignment import (
     parse_assignment_edit_page,
     parse_assignment_view_page,
 )
+from .attempt_probe import (
+    READ_ATTEMPT_METHOD,
+    missing_quiz_attempt_response,
+    teacher_session_key,
+)
 from .config import Settings, exact_https_origin
 from .historical import (
+    HistoricalIndexPage,
     _trim_empty_boundary_lines,
     finalize_historical_submission,
     parse_assignment_grader_page,
@@ -65,6 +73,7 @@ from .models import (
     CourseDiscoverResponse,
     GradeRequest,
     GradeResponse,
+    HistoricalAttemptRef,
     HistoricalSubmissionsRequest,
     HistoricalSubmissionsResponse,
     LoginRequest,
@@ -132,6 +141,7 @@ from .quiz_upload import (
     DraftSessionExpired,
     DraftUnavailable,
     draft_request,
+    parse_assignment_draft,
     parse_essay_draft,
 )
 from .storage import InvalidStorageState, has_moodle_session, sanitize_storage_state
@@ -147,21 +157,20 @@ _LOGIN_ROLE_PAGE_MAX_BYTES = 2 * 1024 * 1024
 _LOGIN_ROLE_FETCH_TIMEOUT_MS = 3_000
 _ACTIVITY_DETAIL_FETCH_TIMEOUT_MS = 2_000
 _ACTIVITY_DETAIL_MAX_PAGES = 256
-_ASSESSMENT_DETAIL_TYPE_WORDS: tuple[tuple[str, ...], ...] = (
-    ("экзамен", "exam"),
-    ("самостоятель", "independent"),
-    ("контрольн", "проверочн", "control"),
-    ("лаборатор", "практич", "lab"),
-)
 _ASSESSMENT_DETAIL_ARCHIVE_WORDS = ("архив", "archive")
 _QUESTION_MARK_MAX = re.compile(
     r"(?:(?:out\s+of|из)\s*|/\s*)([0-9]{1,7}(?:[.,][0-9]{1,6})?)",
     re.I,
 )
 _QUIZ_MARK_QUANTUM = Decimal("0.0000000001")
-# Keep the serialized JSON safely below the core client's default 4 MiB
-# response ceiling after storage_state, JSON escaping and fixed metadata.
-_HISTORICAL_CONTENT_BUDGET_BYTES = 2 * 1024 * 1024
+# Allow one full-size historical attachment, including base64 overhead, plus
+# the existing bounded text allowance. The core history RPC permits 160 MiB;
+# other connector RPCs and student upload limits remain unchanged.
+_HISTORICAL_TEXT_BUDGET_BYTES = 2 * 1024 * 1024
+_HISTORICAL_CONTENT_BUDGET_BYTES = ((100 * 1024 * 1024 + 2) // 3) * 4 + (
+    _HISTORICAL_TEXT_BUDGET_BYTES
+)
+_HISTORICAL_ARTIFACT_DOWNLOAD_SECONDS = 60.0
 _HISTORICAL_QUIZ_REVIEW_MAX_PAGES = 64
 _HISTORICAL_QUIZ_REVIEW_MAX_RESPONSES = 32
 _MANAGED_SUBMISSION_FILENAMES = frozenset(
@@ -175,11 +184,10 @@ def _activity_needs_assessment_detail(
 ) -> bool:
     """Select activities the core can materialize as programming assessments.
 
-    Discovery still returns every course-page activity. Fetching Moodle edit,
-    override, and question-bank pages is reserved for the exact title/section
-    families accepted by ``backend.app.services.moodle_materialization``. This
-    keeps unsupported and archived activities fail-closed without spending the
-    bounded browser session on details the core deliberately discards.
+    Discovery still returns every course-page activity. Explicit task sync
+    accepts any non-archived Assignment/Quiz, including generic titles such as
+    "Задание 1". The actual answer transport, not the title, decides whether it
+    can later be enabled in the IDE.
     """
 
     if str(activity.get("module", "")) not in {"assign", "quiz"}:
@@ -189,11 +197,7 @@ def _activity_needs_assessment_detail(
         " ",
         f"{section_title} {activity.get('name', '')}".casefold(),
     ).strip()
-    if any(marker in evidence for marker in _ASSESSMENT_DETAIL_ARCHIVE_WORDS):
-        return False
-    return any(
-        marker in evidence for markers in _ASSESSMENT_DETAIL_TYPE_WORDS for marker in markers
-    )
+    return not any(marker in evidence for marker in _ASSESSMENT_DETAIL_ARCHIVE_WORDS)
 
 
 def _managed_target_replace_existing(
@@ -275,62 +279,6 @@ async ({url, timeoutMs, maxBytes}) => {
   }
 }
 """
-_HISTORICAL_BINARY_FETCH_SCRIPT = """
-async ({url, maxBytes}) => {
-  const target = new URL(url);
-  if (
-    target.origin !== window.location.origin ||
-    !target.pathname.startsWith('/pluginfile.php/')
-  ) {
-    return {error: 'invalid-target'};
-  }
-  try {
-    const response = await fetch(target.href, {
-      cache: 'no-store',
-      credentials: 'include',
-      redirect: 'follow',
-    });
-    const finalUrl = new URL(response.url);
-    if (finalUrl.origin !== window.location.origin || !response.ok) {
-      return {status: response.status, error: 'download-failed'};
-    }
-    const declaredLength = Number(response.headers.get('content-length') || '0');
-    if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
-      return {status: response.status, tooLarge: true, size: declaredLength};
-    }
-    if (!response.body) {
-      return {status: response.status, error: 'empty-body'};
-    }
-    const reader = response.body.getReader();
-    const chunks = [];
-    let total = 0;
-    while (true) {
-      const {done, value} = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      if (total > maxBytes) {
-        await reader.cancel();
-        return {status: response.status, tooLarge: true, size: total};
-      }
-      chunks.push(value);
-    }
-    let binary = '';
-    for (const chunk of chunks) {
-      for (let offset = 0; offset < chunk.length; offset += 32768) {
-        binary += String.fromCharCode(...chunk.subarray(offset, offset + 32768));
-      }
-    }
-    return {
-      status: response.status,
-      size: total,
-      contentType: (response.headers.get('content-type') || '').slice(0, 255),
-      contentBase64: btoa(binary),
-    };
-  } catch (error) {
-    return {error: error instanceof Error ? error.name : 'download-failed'};
-  }
-}
-"""
 
 
 def _dashboard_courses_in_catalog(
@@ -360,16 +308,18 @@ class BrowserNavigationUnavailable(BrowserUnavailable):
     """A fixed, safe diagnostic; never include Playwright's URL/call log."""
 
     def __init__(
-        self, phase: str, error: Exception | None = None, *, http_status: int | None = None,
+        self,
+        phase: str,
+        error: Exception | None = None,
+        *,
+        http_status: int | None = None,
     ) -> None:
         phase = phase if phase in {"response", "document", "content"} else "response"
         reason = "BROWSER_ERROR"
         code = "MOODLE_NAVIGATION_ERROR"
         if isinstance(error, TimeoutError | PlaywrightTimeoutError):
             reason = "TIMEOUT"
-            code = (
-                "MOODLE_RESPONSE_TIMEOUT" if phase == "response" else "MOODLE_DOCUMENT_TIMEOUT"
-            )
+            code = "MOODLE_RESPONSE_TIMEOUT" if phase == "response" else "MOODLE_DOCUMENT_TIMEOUT"
         elif error is not None:
             # Playwright exceptions can contain a complete URL, cookies in
             # headers and a multi-line call log. Only known Chromium codes
@@ -459,6 +409,10 @@ class MoodleBrowserService:
         self._background_semaphore = asyncio.Semaphore(
             max(1, settings.max_concurrent_operations - 2)
         )
+        self._course_read_semaphore = asyncio.Semaphore(settings.max_concurrent_course_reads)
+        self._pending_course_reads = 0
+        self._active_course_reads = 0
+        self._history_read_semaphore = asyncio.Semaphore(2)
         self._lifecycle_lock = asyncio.Lock()
         # Browser state belongs to one Moodle login. Mutations made through
         # the same MoodleSession must stay sequential, but unrelated students
@@ -534,6 +488,71 @@ class MoodleBrowserService:
             raise MoodleContractError("Moodle origin is not configured") from exc
 
     @asynccontextmanager
+    async def _course_discovery_operation(self, *, foreground: bool) -> AsyncIterator[Browser]:
+        """Bounded HTML-only foreground reads do not compete with heavy crawls.
+
+        The heavy pool's non-login reservation has only one free slot while a
+        history import is running. Reusing it for both manual refresh and new
+        course discovery caused the second action to fail with BROWSER_BUSY.
+        Keep a separate small pool, as for native student forms, without
+        stealing their capacity or the login reserve.
+        """
+        if not foreground:
+            try:
+                async with asyncio.timeout(self.settings.course_operation_timeout_seconds):
+                    async with self._operation() as browser:
+                        yield browser
+            except TimeoutError as exc:
+                raise BrowserUnavailable(
+                    "Moodle course read exceeded its total time budget"
+                ) from exc
+            return
+        if self._pending_course_reads >= 16:
+            raise BrowserBusy("Moodle foreground course queue is full")
+        self._pending_course_reads += 1
+        acquired = False
+        started = asyncio.get_running_loop().time()
+        try:
+            async with asyncio.timeout(self.settings.course_operation_timeout_seconds):
+                _LOGGER.info(
+                    "Moodle course read stage=queued active=%s pending=%s limit=%s",
+                    self._active_course_reads,
+                    self._pending_course_reads,
+                    self.settings.max_concurrent_course_reads,
+                )
+                try:
+                    await asyncio.wait_for(
+                        self._course_read_semaphore.acquire(),
+                        timeout=self.settings.course_queue_wait_seconds,
+                    )
+                except TimeoutError as exc:
+                    raise BrowserBusy("Moodle foreground course queue wait expired") from exc
+                acquired = True
+                self._active_course_reads += 1
+                browser = self._browser
+                if browser is None or not browser.is_connected():
+                    raise BrowserUnavailable("Chromium is not connected")
+                _LOGGER.info(
+                    "Moodle course read stage=admitted wait_ms=%s active=%s",
+                    round((asyncio.get_running_loop().time() - started) * 1000),
+                    self._active_course_reads,
+                )
+                yield browser
+        except TimeoutError as exc:
+            raise BrowserUnavailable("Moodle course read exceeded its total time budget") from exc
+        finally:
+            if acquired:
+                self._active_course_reads -= 1
+                self._course_read_semaphore.release()
+            self._pending_course_reads -= 1
+            _LOGGER.info(
+                "Moodle course read stage=released elapsed_ms=%s active=%s pending=%s",
+                round((asyncio.get_running_loop().time() - started) * 1000),
+                self._active_course_reads,
+                self._pending_course_reads,
+            )
+
+    @asynccontextmanager
     async def _operation(  # type: ignore[no-untyped-def]
         self,
         *,
@@ -552,7 +571,8 @@ class MoodleBrowserService:
             self._pending_student_operations += 1
         wait_seconds = (
             self.settings.student_queue_wait_seconds
-            if student else self.settings.queue_wait_seconds
+            if student
+            else self.settings.queue_wait_seconds
         )
         wait_started = asyncio.get_running_loop().time()
         acquired: list[asyncio.Semaphore] = []
@@ -651,16 +671,30 @@ class MoodleBrowserService:
             )
         acquired = False
         try:
-            try:
-                await asyncio.wait_for(entry.lock.acquire(), timeout=wait_seconds)
-                acquired = True
-            except TimeoutError as exc:
-                raise BrowserBusy("Moodle student browser session is busy") from exc
-            yield
+            async with asyncio.timeout(self.settings.student_operation_timeout_seconds):
+                try:
+                    await asyncio.wait_for(entry.lock.acquire(), timeout=wait_seconds)
+                    acquired = True
+                except TimeoutError as exc:
+                    raise BrowserBusy("Moodle student browser session is busy") from exc
+                yield
+        except TimeoutError as exc:
+            raise BrowserUnavailable(
+                "Moodle student operation exceeded its total time budget"
+            ) from exc
         finally:
             if acquired:
                 entry.lock.release()
             await asyncio.shield(self._return_student_session_lock(key, entry))
+
+    @staticmethod
+    async def _close_student_context(context: BrowserContext) -> None:
+        # Cleanup must not turn a bounded submission into an unbounded RPC.
+        # Closing the context interrupts any outstanding page/API requests.
+        try:
+            await asyncio.wait_for(context.close(), timeout=10)
+        except (TimeoutError, PlaywrightError):
+            _LOGGER.warning("Moodle student browser context cleanup was interrupted")
 
     async def _new_context(
         self,
@@ -679,6 +713,27 @@ class MoodleBrowserService:
         if storage_state is not None:
             options["storage_state"] = storage_state.model_dump(mode="json")
         context = await browser.new_context(**options)
+        try:
+            await self._configure_context(
+                context,
+                html_only=html_only,
+                server_rendered=server_rendered,
+            )
+        except BaseException:
+            # Callers cannot enter their own try/finally until this method
+            # returns. Admission deadlines/cancellation during route setup
+            # must not leak a context outside either capacity pool.
+            await self._close_student_context(context)
+            raise
+        return context
+
+    async def _configure_context(
+        self,
+        context: BrowserContext,
+        *,
+        html_only: bool,
+        server_rendered: bool,
+    ) -> None:
         # Static readers retain CSS for faithful innerText/whitespace, but
         # have no editors to initialize. Their load event waits only for CSS.
         context._eduprog_navigation_mode = (
@@ -698,11 +753,16 @@ class MoodleBrowserService:
                     or int(declared_length) > self._public_asset_cache.max_asset_bytes
                 ):
                     return
-                if self._public_asset_cache.response_ttl(
-                    response.url, status=response.status, headers=headers
-                ) is not None:
+                if (
+                    self._public_asset_cache.response_ttl(
+                        response.url, status=response.status, headers=headers
+                    )
+                    is not None
+                ):
                     self._public_asset_cache.put(
-                        response.url, status=response.status, headers=headers,
+                        response.url,
+                        status=response.status,
+                        headers=headers,
                         body=await response.body(),
                     )
             except PlaywrightError:
@@ -742,7 +802,10 @@ class MoodleBrowserService:
                 await route.abort("blockedbyclient")
                 return
             if server_rendered and request.resource_type not in {
-                "document", "stylesheet", "fetch", "xhr",
+                "document",
+                "stylesheet",
+                "fetch",
+                "xhr",
             }:
                 await route.abort("blockedbyclient")
                 return
@@ -765,7 +828,6 @@ class MoodleBrowserService:
             await route.continue_()
 
         await context.route("**/*", restrict_route)
-        return context
 
     async def _goto(self, page: Page, url: str) -> str:
         mode = getattr(
@@ -793,7 +855,9 @@ class MoodleBrowserService:
                 response = await page.goto(url, wait_until="commit")
                 _LOGGER.info(
                     "Moodle navigation response target=%s mode=%s status=%s elapsed_ms=%d",
-                    target, mode, response.status if response is not None else None,
+                    target,
+                    mode,
+                    response.status if response is not None else None,
                     round((asyncio.get_running_loop().time() - started) * 1_000),
                 )
                 if response is not None and response.status >= 500:
@@ -808,7 +872,8 @@ class MoodleBrowserService:
                 markup = await page.content()
                 _LOGGER.info(
                     "Moodle navigation ready target=%s mode=%s elapsed_ms=%d",
-                    target, mode,
+                    target,
+                    mode,
                     round((asyncio.get_running_loop().time() - started) * 1_000),
                 )
                 return markup
@@ -816,8 +881,10 @@ class MoodleBrowserService:
             failure = BrowserNavigationUnavailable(phase, exc)
             _LOGGER.warning(
                 "Moodle navigation interrupted target=%s mode=%s elapsed_ms=%d detail=%s",
-                target, mode,
-                round((asyncio.get_running_loop().time() - started) * 1_000), failure,
+                target,
+                mode,
+                round((asyncio.get_running_loop().time() - started) * 1_000),
+                failure,
             )
             raise failure from exc
 
@@ -1051,10 +1118,8 @@ class MoodleBrowserService:
         if not has_moodle_session(input_state):
             raise MoodleSessionExpired("Moodle browser session is missing")
 
-        async with self._operation(foreground=request.interactive) as browser:
-            context = await self._new_context(
-                browser, storage_state=input_state, html_only=True
-            )
+        async with self._course_discovery_operation(foreground=request.interactive) as browser:
+            context = await self._new_context(browser, storage_state=input_state, html_only=True)
             try:
                 page = await context.new_page()
                 course_url = f"{self.settings.base_url}/course/view.php?" + urlencode(
@@ -1082,19 +1147,15 @@ class MoodleBrowserService:
                     course_html,
                     course,
                 )
-                # The roster is required for authorization and historical
-                # import.  Collect it before optional per-activity settings so
-                # a slow Moodle settings page cannot postpone all useful
-                # synchronization work until the outer request timeout.
+                # A course synchronization is strictly its catalog and roster.
+                # Settings, question banks and answers belong to an explicitly
+                # requested activity synchronization, never to this traversal.
                 members, roster_complete = await self._participants(
                     page, context, request.external_id
                 )
-                course = await self._enrich_course_activities(
-                    page,
-                    context,
-                    request.external_id,
-                    course,
-                )
+                for section in course.get("sections", []):
+                    for activity in section.get("activities", []):
+                        activity["title_confirmed"] = bool(str(activity.get("name", "")).strip())
                 actor = next(
                     (
                         member
@@ -1172,7 +1233,12 @@ class MoodleBrowserService:
                     }
                 )
             finally:
-                await context.close()
+                # Even a timed-out/cancelled discovery must return its slot;
+                # an unresponsive Chromium cleanup cannot hold it indefinitely.
+                try:
+                    await asyncio.wait_for(context.close(), timeout=10)
+                except (TimeoutError, PlaywrightError):
+                    _LOGGER.warning("Moodle course context cleanup was interrupted")
 
     async def discover_historical_submissions(
         self,
@@ -1194,9 +1260,17 @@ class MoodleBrowserService:
             raise MoodleSessionExpired("Moodle browser session is missing")
 
         page_number, offset = (int(value) for value in request.cursor.split(":"))
-        async with self._operation() as browser:
+        history_mode = (
+            "probe" if request.probe_only else "inventory" if request.scan_only
+            else "detail" if request.attempt_refs else "legacy"
+        )
+        started = asyncio.get_running_loop().time()
+        async with self._history_operation() as browser:
             context = await self._new_context(
-                browser, storage_state=input_state, server_rendered=True
+                browser,
+                storage_state=input_state,
+                server_rendered=not request.scan_only,
+                html_only=request.scan_only,
             )
             try:
                 page = await context.new_page()
@@ -1220,7 +1294,55 @@ class MoodleBrowserService:
 
                 module = request.activity.module
                 cmid = request.activity.cmid
-                if module == "quiz":
+                activity_metadata = None
+                if request.include_activity_metadata:
+                    activity_metadata = await self._discover_activity_metadata(
+                        page,
+                        context,
+                        course_html,
+                        course_id=request.course_id,
+                        module=module,
+                        cmid=cmid,
+                    )
+                if request.probe_only:
+                    # Exact existence checks do not depend on a report row,
+                    # pagination position, or the current enrolled-user list.
+                    index = HistoricalIndexPage(items=[], has_next=False)
+                    report_html = course_html
+                elif request.attempt_refs:
+                    # Identities originate in a verified report, not offsets in
+                    # a table that can change between retries. Never accept URLs
+                    # from the queue or share answers across activities/users.
+                    index = HistoricalIndexPage(items=[], has_next=False)
+                    report_html = course_html
+                    for ref in request.attempt_refs:
+                        detail_query = (
+                            {"attempt": ref.attempt_id, "cmid": cmid}
+                            if module == "quiz"
+                            else {
+                                "id": cmid,
+                                "action": "grader",
+                                "userid": ref.user_id,
+                                "attemptnumber": ref.attempt_id.rsplit("-", 1)[-1],
+                            }
+                        )
+                        detail_path = (
+                            "/mod/quiz/review.php" if module == "quiz" else "/mod/assign/view.php"
+                        )
+                        index.items.append(
+                            {
+                                **ref.model_dump(mode="json"),
+                                "module": module,
+                                "cmid": cmid,
+                                "comment": "",
+                                "responses": [],
+                                "_detail_url": (
+                                    f"{self.settings.base_url}{detail_path}?"
+                                    + urlencode(detail_query)
+                                ),
+                            }
+                        )
+                elif module == "quiz":
                     report_url = f"{self.settings.base_url}/mod/quiz/report.php?" + urlencode(
                         {
                             "id": cmid,
@@ -1232,6 +1354,9 @@ class MoodleBrowserService:
                             "onlyregraded": 0,
                             "slotmarks": 1,
                             "group": 0,
+                            # Do not inherit a teacher's alphabet filter.
+                            "tifirst": "",
+                            "tilast": "",
                             # Moodle otherwise reuses the teacher's small table
                             # preference (30 rows on the production course),
                             # placing fresh submissions on page four or later.
@@ -1266,6 +1391,8 @@ class MoodleBrowserService:
                             "action": "grading",
                             "page": page_number,
                             "perpage": 100,
+                            "tifirst": "",
+                            "tilast": "",
                         }
                     )
                     report_html = await self._goto(page, report_url)
@@ -1293,15 +1420,33 @@ class MoodleBrowserService:
 
                 index_items = prioritize_historical_attempts(
                     index.items,
-                    pending_only=request.priority_only,
+                    pending_only=request.priority_only
+                    and not request.scan_only
+                    and not request.attempt_refs,
                 )
-                selected = index_items[offset : offset + request.limit]
+                _LOGGER.info(
+                    "Moodle history course=%s cmid=%s stage=index mode=%s rows=%s elapsed_ms=%s",
+                    request.course_id,
+                    cmid,
+                    history_mode,
+                    len(index_items),
+                    int((asyncio.get_running_loop().time() - started) * 1000),
+                )
+                selected = (
+                    [] if request.scan_only else index_items[offset : offset + request.limit]
+                )
                 warnings: list[str] = []
+                if (
+                    activity_metadata is not None
+                    and activity_metadata.get("settings_confirmed") is not True
+                ):
+                    warnings.append("ACTIVITY_METADATA_INCOMPLETE")
                 if index.skipped_rows:
                     warnings.append(
                         f"SKIPPED_UNIDENTIFIED_ROWS:{min(index.skipped_rows, 999_999)}"
                     )
                 remaining_content_bytes = _HISTORICAL_CONTENT_BUDGET_BYTES
+                remaining_text_bytes = _HISTORICAL_TEXT_BUDGET_BYTES
                 public_items: list[dict[str, Any]] = []
                 for raw_item in selected:
                     item = dict(raw_item)
@@ -1331,7 +1476,7 @@ class MoodleBrowserService:
                     for response in responses:
                         answer = str(response.get("answer_text", ""))
                         answer_bytes = len(answer.encode("utf-8"))
-                        if answer_bytes > remaining_content_bytes:
+                        if answer_bytes > min(remaining_text_bytes, remaining_content_bytes):
                             response["answer_text"] = ""
                             response["answer_complete"] = False
                             response["answer_omission_reason"] = "RESPONSE_BUDGET"
@@ -1341,10 +1486,11 @@ class MoodleBrowserService:
                             )
                         else:
                             remaining_content_bytes -= answer_bytes
+                            remaining_text_bytes -= answer_bytes
                         for text_field in ("comment", "question_text"):
                             value = str(response.get(text_field, ""))
                             value_bytes = len(value.encode("utf-8"))
-                            if value_bytes > remaining_content_bytes:
+                            if value_bytes > min(remaining_text_bytes, remaining_content_bytes):
                                 response[text_field] = ""
                                 warnings.append(
                                     f"FIELD_OMITTED:{item['attempt_id']}:"
@@ -1352,11 +1498,21 @@ class MoodleBrowserService:
                                 )
                             else:
                                 remaining_content_bytes -= value_bytes
+                                remaining_text_bytes -= value_bytes
                         links = list(response.pop("_artifact_links", []))
                         artifacts: list[dict[str, Any]] = []
                         for link in links:
+                            if request.attachment_delivery == "reference":
+                                artifacts.append({
+                                    "external_id": link["external_id"],
+                                    "filename": link["filename"],
+                                    "downloaded": False,
+                                    "omission_reason": "DEFERRED_DOWNLOAD",
+                                    "download_url": link["url"],
+                                })
+                                continue
                             maximum_source_bytes = min(
-                                self.settings.artifact_max_bytes,
+                                self.settings.history_artifact_max_bytes,
                                 (remaining_content_bytes // 4) * 3,
                             )
                             artifact, consumed = await self._historical_artifact(
@@ -1405,21 +1561,77 @@ class MoodleBrowserService:
                             item["grade_max"] = float(sum(maxima))
                     if item.get("grade") is not None:
                         item["state"] = "GRADED"
-                    public_items.append(finalize_historical_submission(item))
+                    public_items.append(
+                        await asyncio.to_thread(finalize_historical_submission, item)
+                    )
 
                 next_offset = offset + len(selected)
-                if next_offset < len(index_items):
+                if request.attempt_refs:
+                    next_cursor = None
+                elif request.scan_only:
+                    next_cursor = f"{page_number + 1}:0" if index.has_next else None
+                elif next_offset < len(index_items):
                     next_cursor = f"{page_number}:{next_offset}"
                 elif index.has_next:
                     next_cursor = f"{page_number + 1}:0"
                 else:
                     next_cursor = None
+                deleted_attempt_ids: list[str] = []
+                if module == "quiz" and request.known_attempt_ids:
+                    # Membership, actor identity and this report's course/cmid
+                    # were verified above. IDs come only from existing local
+                    # bindings; absence from this page is never itself proof.
+                    visible_ids = {str(item["attempt_id"]) for item in index.items}
+                    candidates = [
+                        value for value in request.known_attempt_ids if value not in visible_ids
+                    ]
+                    deleted_attempt_ids, probe_incomplete = await self._probe_deleted_attempts(
+                        context, report_html, candidates
+                    )
+                    if probe_incomplete:
+                        if request.probe_only:
+                            warnings.append("DELETION_CHECK_INCOMPLETE")
+                        # This optional diagnostic is not an import failure:
+                        # keep the verified submissions and all inconclusive
+                        # local attempts, without a false red history banner.
+                        _LOGGER.info(
+                            "Moodle deleted-attempt check incomplete; local data retained"
+                        )
                 state = await self._state(context)
-                return HistoricalSubmissionsResponse.model_validate(
+                _LOGGER.info(
+                    "Moodle history course=%s cmid=%s stage=complete mode=%s "
+                    "items=%s deleted=%s warnings=%s warning_codes=%s elapsed_ms=%s",
+                    request.course_id,
+                    cmid,
+                    history_mode,
+                    len(public_items),
+                    len(deleted_attempt_ids),
+                    len(warnings),
+                    ",".join(sorted({warning.partition(":")[0] for warning in warnings}))
+                    or "none",
+                    int((asyncio.get_running_loop().time() - started) * 1000),
+                )
+                return await asyncio.to_thread(
+                    HistoricalSubmissionsResponse.model_validate,
                     {
                         "course_id": request.course_id,
                         "activity": request.activity.model_dump(mode="json"),
+                        "activity_metadata": activity_metadata,
                         "items": public_items,
+                        "scan_only": request.scan_only,
+                        "candidates": [
+                            HistoricalAttemptRef.model_validate(
+                                {
+                                    key: item[key]
+                                    for key in HistoricalAttemptRef.model_fields
+                                    if key in item
+                                }
+                            ).model_dump(mode="json")
+                            for item in index_items
+                        ]
+                        if request.scan_only
+                        else [],
+                        "deleted_attempt_ids": deleted_attempt_ids,
                         "next_cursor": next_cursor,
                         "complete": next_cursor is None,
                         "warnings": list(dict.fromkeys(warnings))[:32],
@@ -1427,7 +1639,118 @@ class MoodleBrowserService:
                     }
                 )
             finally:
-                await context.close()
+                try:
+                    await asyncio.wait_for(context.close(), timeout=10)
+                except (TimeoutError, PlaywrightError):
+                    _LOGGER.warning("Moodle history context cleanup was interrupted")
+
+    @asynccontextmanager
+    async def _history_operation(self) -> AsyncIterator[Browser]:
+        """Small script-free history reads cannot wait behind an entire course crawl."""
+        acquired = False
+        try:
+            try:
+                # Allow a short read already in progress to finish before
+                # forcing a whole outbox retry. Active contexts stay bounded
+                # at two; this does not compete with the student delivery pool.
+                await asyncio.wait_for(self._history_read_semaphore.acquire(), timeout=30)
+            except TimeoutError as exc:
+                raise BrowserBusy("Moodle history read queue is busy") from exc
+            acquired = True
+            browser = self._browser
+            if browser is None or not browser.is_connected():
+                raise BrowserUnavailable("Chromium is not connected")
+            async with asyncio.timeout(150):
+                yield browser
+        except TimeoutError as exc:
+            raise BrowserUnavailable("Moodle history read exceeded its total time budget") from exc
+        finally:
+            if acquired:
+                self._history_read_semaphore.release()
+
+    async def _probe_deleted_attempts(
+        self,
+        context: BrowserContext,
+        report_html: str,
+        attempt_ids: list[str],
+    ) -> tuple[list[str], bool]:
+        """Bounded, read-only existence checks; never call the reopen operation.
+
+        A single AJAX batch stops at its first error, including the expected
+        missing-record error, so use at most five sequential tiny reads. The
+        Shared budget allows all five three-second checks plus cleanup; a
+        slow first check must not repeatedly starve the last IDs of a batch.
+        Unsupported/custom Moodle installations retain local data unchanged.
+        """
+        if not attempt_ids:
+            return [], False
+        sesskey = teacher_session_key(report_html, base_url=self.settings.base_url)
+        if not sesskey:
+            return [], True
+        deleted: list[str] = []
+        incomplete = False
+        url = f"{self.settings.base_url}/lib/ajax/service.php?" + urlencode(
+            {"sesskey": sesskey, "info": READ_ATTEMPT_METHOD}
+        )
+        try:
+            async with asyncio.timeout(16):
+                for attempt_id in attempt_ids:
+                    response = None
+                    try:
+                        response = await context.request.post(
+                            url,
+                            data=[
+                                {
+                                    "index": 0,
+                                    "methodname": READ_ATTEMPT_METHOD,
+                                    "args": {"attemptid": int(attempt_id)},
+                                }
+                            ],
+                            headers={"Content-Type": "application/json"},
+                            timeout=3_000,
+                            max_redirects=0,
+                        )
+                        if response.status != 200 or response.url != url:
+                            incomplete = True
+                            continue
+                        body = await response.body()
+                        if len(body) > 64 * 1024:
+                            incomplete = True
+                            continue
+                        payload = json.loads(body)
+                        if missing_quiz_attempt_response(payload):
+                            deleted.append(attempt_id)
+                        elif (
+                            isinstance(payload, list)
+                            and len(payload) == 1
+                            and isinstance(payload[0], dict)
+                        ):
+                            # A valid response or wrong-state error confirms
+                            # existence. Everything else is inconclusive.
+                            error = payload[0].get("exception", {})
+                            code = error.get("errorcode") if isinstance(error, dict) else None
+                            if code in {
+                                "invalidsesskey",
+                                "servicerequireslogin",
+                                "requireloginerror",
+                            }:
+                                raise MoodleSessionExpired("Moodle browser session expired")
+                            if (
+                                payload[0].get("error") is not False
+                                and code != "reopenattemptwrongstate"
+                            ):
+                                incomplete = True
+                        else:
+                            incomplete = True
+                    except (ValueError, PlaywrightError):
+                        incomplete = True
+                    finally:
+                        if response is not None:
+                            with suppress(PlaywrightError):
+                                await response.dispose()
+        except TimeoutError:
+            incomplete = True
+        return deleted, incomplete
 
     async def _historical_detail(
         self,
@@ -1801,115 +2124,110 @@ class MoodleBrowserService:
         }
         if maximum_bytes <= 0:
             return {**base, "downloaded": False, "omission_reason": "RESPONSE_BUDGET"}, 0
-        result: dict[str, Any] | None = None
-
-        # This mirrors the proven behaviour of the former Selenium connector:
-        # download attachments through an HTTP client carrying the browser
-        # session cookies.  A page-level ``fetch`` can be blocked by Moodle's
-        # CSP or by a forced-download response even when the same link opens
-        # normally in the authenticated browser.
-        context = getattr(page, "context", None)
-        request = getattr(context, "request", None)
-        target = urlsplit(link["url"])
+        maximum_bytes = min(maximum_bytes, self.settings.history_artifact_max_bytes)
         base_origin = urlsplit(self.settings.base_url)
-        if (
-            request is not None
-            and target.scheme == base_origin.scheme
-            and target.netloc == base_origin.netloc
-            and target.path.startswith("/pluginfile.php/")
-        ):
-            response = None
-            try:
-                response = await request.get(link["url"], timeout=10_000)
-                final = urlsplit(str(response.url))
-                if (
-                    bool(response.ok)
-                    and final.scheme == base_origin.scheme
-                    and final.netloc == base_origin.netloc
-                    and final.path.startswith("/pluginfile.php/")
-                ):
-                    headers = {
-                        str(key).casefold(): str(value)
-                        for key, value in dict(response.headers).items()
-                    }
-                    raw_length = headers.get("content-length", "")
-                    declared_length = int(raw_length) if raw_length.isdigit() else None
-                    if declared_length is not None and declared_length > maximum_bytes:
-                        result = {
-                            "status": int(response.status),
-                            "tooLarge": True,
-                            "size": declared_length,
-                        }
-                    else:
-                        content = await response.body()
-                        if len(content) > maximum_bytes:
-                            result = {
-                                "status": int(response.status),
-                                "tooLarge": True,
-                                "size": len(content),
-                            }
-                        else:
-                            result = {
-                                "status": int(response.status),
-                                "size": len(content),
-                                "contentType": headers.get("content-type", ""),
-                                "contentBase64": base64.b64encode(content).decode("ascii"),
-                            }
-            except (PlaywrightTimeoutError, PlaywrightError, ValueError, TypeError):
-                result = None
-            finally:
-                if response is not None:
-                    with suppress(PlaywrightError):
-                        await response.dispose()
 
-        # Keep the bounded streaming implementation as a compatibility
-        # fallback for test doubles and older Playwright builds.
-        if result is None:
-            try:
-                result = await page.evaluate(
-                    _HISTORICAL_BINARY_FETCH_SCRIPT,
-                    {"url": link["url"], "maxBytes": maximum_bytes},
-                )
-            except (PlaywrightTimeoutError, PlaywrightError, AttributeError):
-                result = None
-        if not isinstance(result, dict):
-            return {**base, "downloaded": False, "omission_reason": "DOWNLOAD_FAILED"}, 0
-        if result.get("tooLarge"):
-            declared = result.get("size")
-            size = (
-                int(declared)
-                if isinstance(declared, int) and 0 <= declared <= 4 * 1024 * 1024
-                else 0
+        def omitted_size(size: int) -> tuple[dict[str, Any], int]:
+            # A response exhausted by preceding files is not evidence that
+            # this attachment itself exceeds the configured per-file limit.
+            reason = (
+                "FILE_TOO_LARGE"
+                if size > self.settings.history_artifact_max_bytes
+                else "RESPONSE_BUDGET"
             )
             return {
                 **base,
-                "size_bytes": size,
+                "size_bytes": size if size <= 100 * 1024 * 1024 else 0,
                 "downloaded": False,
-                "omission_reason": "FILE_TOO_LARGE",
+                "omission_reason": reason,
             }, 0
-        encoded = result.get("contentBase64")
-        size = result.get("size")
-        if (
-            not isinstance(encoded, str)
-            or not isinstance(size, int)
-            or not 0 <= size <= maximum_bytes
-        ):
-            return {**base, "downloaded": False, "omission_reason": "DOWNLOAD_FAILED"}, 0
+
+        # Playwright APIResponse buffers the entire body in its driver before
+        # Python can enforce a limit. Stream directly instead, carrying only
+        # the browser cookies applicable to each validated URL. Never retry a
+        # definitively oversized body with a browser fetch.
         try:
-            content = base64.b64decode(encoded, validate=True)
-        except (ValueError, TypeError):
-            return {**base, "downloaded": False, "omission_reason": "DOWNLOAD_FAILED"}, 0
-        if len(content) != size:
-            return {**base, "downloaded": False, "omission_reason": "DOWNLOAD_FAILED"}, 0
-        return {
-            **base,
-            "mime_type": str(result.get("contentType", ""))[:255],
-            "size_bytes": size,
-            "sha256": hashlib.sha256(content).hexdigest(),
-            "content_base64": encoded,
-            "downloaded": True,
-            "omission_reason": "",
-        }, len(encoded)
+            async with (
+                asyncio.timeout(_HISTORICAL_ARTIFACT_DOWNLOAD_SECONDS),
+                httpx.AsyncClient(
+                    trust_env=False,
+                    follow_redirects=False,
+                    timeout=httpx.Timeout(15.0, connect=10.0),
+                ) as client,
+            ):
+                url = link["url"]
+                for _redirect in range(5):
+                    target = urlsplit(url)
+                    if (
+                        target.scheme != base_origin.scheme
+                        or target.netloc != base_origin.netloc
+                        or target.username is not None
+                        or target.password is not None
+                        or target.fragment
+                        or not target.path.startswith("/pluginfile.php/")
+                        or any(part in {".", ".."} for part in unquote(target.path).split("/"))
+                    ):
+                        break
+                    cookies = await page.context.cookies(url)
+                    cookie_header = "; ".join(
+                        f"{cookie['name']}={cookie['value']}" for cookie in cookies
+                    )
+                    async with client.stream(
+                        "GET",
+                        url,
+                        headers={"Cookie": cookie_header, "Accept-Encoding": "identity"},
+                    ) as response:
+                        if response.status_code in {301, 302, 303, 307, 308}:
+                            location = response.headers.get("location")
+                            if not location:
+                                break
+                            url = urljoin(url, location)
+                            continue
+                        # A partial response is not a complete archive. Request
+                        # identity encoding so compressed transport cannot
+                        # allocate an unbounded decompressed buffer first.
+                        if response.status_code != 200 or response.headers.get(
+                            "content-encoding", "identity"
+                        ).strip().casefold() not in {"", "identity"}:
+                            break
+                        raw_length = response.headers.get("content-length", "")
+                        if raw_length.isdigit() and int(raw_length) > maximum_bytes:
+                            return omitted_size(int(raw_length))
+                        size = 0
+                        digest = hashlib.sha256()
+                        encoded_parts: list[str] = []
+                        remainder = b""
+                        async for chunk in response.aiter_raw(chunk_size=64 * 1024):
+                            size += len(chunk)
+                            if size > maximum_bytes:
+                                return omitted_size(size)
+                            digest.update(chunk)
+                            data = remainder + chunk
+                            aligned = (len(data) // 3) * 3
+                            encoded_parts.append(base64.b64encode(data[:aligned]).decode("ascii"))
+                            remainder = data[aligned:]
+                        if remainder:
+                            encoded_parts.append(base64.b64encode(remainder).decode("ascii"))
+                        encoded = "".join(encoded_parts)
+                        return {
+                            **base,
+                            "mime_type": response.headers.get("content-type", "")[:255],
+                            "size_bytes": size,
+                            "sha256": digest.hexdigest(),
+                            "content_base64": encoded,
+                            "downloaded": True,
+                            "omission_reason": "",
+                        }, len(encoded)
+        except (
+            TimeoutError,
+            httpx.HTTPError,
+            PlaywrightError,
+            AttributeError,
+            ValueError,
+            TypeError,
+        ):
+            pass
+        return {**base, "downloaded": False, "omission_reason": "DOWNLOAD_FAILED"}, 0
 
     async def _crawl_course_section_pages(
         self,
@@ -1956,6 +2274,46 @@ class MoodleBrowserService:
         except MoodleMarkupError as exc:
             raise MoodleProtocolError(str(exc)) from exc
 
+    async def _discover_activity_metadata(
+        self,
+        page: Page,
+        context: BrowserContext,
+        course_html: str,
+        *,
+        course_id: str,
+        module: str,
+        cmid: int,
+    ) -> dict[str, Any]:
+        """Read settings for exactly the manually requested activity, without answers."""
+        try:
+            course = parse_course_page(course_html, self.settings.base_url, course_id)
+        except MoodleMarkupError as exc:
+            raise MoodleProtocolError(str(exc)) from exc
+
+        def locate() -> tuple[dict[str, Any], dict[str, Any]] | None:
+            for section in course.get("sections", []):
+                for activity in section.get("activities", []):
+                    if activity.get("cmid") == cmid and activity.get("module") == module:
+                        return section, activity
+            return None
+
+        target = locate()
+        if target is None:
+            # Multi-page course formats may put this activity in another
+            # section. Only read section indexes; never enrich their siblings.
+            course = await self._crawl_course_section_pages(
+                page, context, course_id, course_html, course
+            )
+            target = locate()
+        if target is None:
+            raise MoodleProtocolError("Moodle activity is absent from the course catalog")
+        section, activity = target
+        scoped = {"sections": [{**section, "activities": [activity]}]}
+        enriched = await self._enrich_course_activities(
+            page, context, course_id, scoped, budget_seconds=60.0
+        )
+        return enriched["sections"][0]["activities"][0]
+
     async def _enrich_course_activities(
         self,
         page: Page,
@@ -1964,6 +2322,7 @@ class MoodleBrowserService:
         course: dict[str, Any],
         *,
         participant_ids: frozenset[str] | None = None,
+        budget_seconds: float | None = None,
     ) -> dict[str, Any]:
         """Fetch bounded, read-only settings for supported Moodle activities.
 
@@ -1981,7 +2340,12 @@ class MoodleBrowserService:
         sections: list[dict[str, Any]] = []
         detail_count = 0
         try:
-            async with asyncio.timeout(self.settings.activity_detail_budget_seconds):
+            async with asyncio.timeout(
+                min(
+                    self.settings.activity_detail_budget_seconds,
+                    budget_seconds if budget_seconds is not None else float("inf"),
+                )
+            ):
                 for raw_section in course.get("sections", []):
                     section = dict(raw_section)
                     activities: list[dict[str, Any]] = []
@@ -2344,6 +2708,8 @@ class MoodleBrowserService:
                     "id": course_id,
                     "perpage": self.settings.participants_per_page,
                     "page": page_number,
+                    "tifirst": "",
+                    "tilast": "",
                 }
             )
             html = await self._goto(
@@ -2602,6 +2968,8 @@ class MoodleBrowserService:
                         "action": "grading",
                         "page": page_number,
                         "perpage": self.settings.participants_per_page,
+                        "tifirst": "",
+                        "tilast": "",
                     }
                 )
                 markup = await self._goto(guard_page, target)
@@ -2784,6 +3152,8 @@ class MoodleBrowserService:
                     "onlyregraded": 0,
                     "slotmarks": 1,
                     "group": 0,
+                    "tifirst": "",
+                    "tilast": "",
                     "page": page_number,
                 }
             )
@@ -2916,7 +3286,7 @@ class MoodleBrowserService:
                         )
                     state = await self._state(context)
                 finally:
-                    await context.close()
+                    await self._close_student_context(context)
             return AssignmentSubmissionPrepareResponse.model_validate(
                 {
                     "status": "READY",
@@ -2981,18 +3351,43 @@ class MoodleBrowserService:
                 return response.model_copy(update={"storage_state": input_state}, deep=True)
 
             # Saving/finalizing a student's answer is a foreground operation.
-            async with self._operation(foreground=True, student=True) as browser:
-                context = await self._new_context(browser, storage_state=input_state)
+            async with self._operation(foreground=True, student=True, lightweight=True) as browser:
+                context = await self._new_context(
+                    browser, storage_state=input_state, html_only=True
+                )
+                context._eduprog_assignment_native_upload = True
                 try:
                     page = await context.new_page()
+                    page._eduprog_assignment_binding = (request.course_id, request.cmid)
                     result = await self._execute_assignment_submission_sync(
                         context,
                         page,
                         request,
                         artifact,
                     )
+                except MoodleAttemptFinalized:
+                    # A successful Save/Submit can lose its HTTP response.
+                    # Recover only by reading and hashing this student's exact
+                    # terminal file; never re-open or overwrite a final answer.
+                    if not request.finalize or request.answer_transport != "ASSIGN_FILE":
+                        raise
+                    await self._verify_final_assignment_file(page, context, request)
+                    result = AssignmentSubmissionSyncResponse.model_validate(
+                        {
+                            "status": "FINALIZED",
+                            "receipt": {
+                                "course_id": request.course_id,
+                                "cmid": request.cmid,
+                                "filename": request.artifact.filename,
+                                "sha256": request.artifact.sha256,
+                                "size_bytes": len(artifact),
+                                "idempotency_key": request.idempotency_key,
+                            },
+                            "storage_state": await self._state(context),
+                        }
+                    )
                 finally:
-                    await context.close()
+                    await self._close_student_context(context)
             self._assignment_sync_cache[request.idempotency_key] = (fingerprint, result)
             self._assignment_sync_cache.move_to_end(request.idempotency_key)
             while len(self._assignment_sync_cache) > self.settings.idempotency_cache_entries:
@@ -3033,6 +3428,7 @@ class MoodleBrowserService:
                 request.previous_managed_filename is not None
                 and request.previous_managed_filename != request.artifact.filename
                 and request.previous_managed_filename in submission.existing_filenames
+                and getattr(context, "_eduprog_assignment_native_upload", False) is not True
             ):
                 # We cannot prove an exact root path from Moodle's rendered
                 # basename inventory.  Saving the new filename would leave two
@@ -3082,6 +3478,12 @@ class MoodleBrowserService:
                     artifact,
                 )
                 status = view.status
+        if (
+            status == "FINALIZED"
+            and request.answer_transport == "ASSIGN_FILE"
+            and getattr(context, "_eduprog_assignment_native_upload", False) is True
+        ):
+            await self._verify_final_assignment_file(page, context, request)
         state = await self._state(context)
         return AssignmentSubmissionSyncResponse.model_validate(
             {
@@ -3188,7 +3590,7 @@ class MoodleBrowserService:
                             question_slot=question_slot,
                         )
                 finally:
-                    await context.close()
+                    await self._close_student_context(context)
             self._quiz_sync_progress.pop(request.idempotency_key, None)
             self._quiz_sync_cache[request.idempotency_key] = (fingerprint, result)
             self._quiz_sync_cache.move_to_end(request.idempotency_key)
@@ -3268,7 +3670,11 @@ class MoodleBrowserService:
             # request bodies or authorization/idempotency secrets in logs.
             _LOGGER.info(
                 "Moodle Quiz delivery attempt=%s cmid=%s final=%s stage=%s page=%s elapsed_ms=%d",
-                request.expected_attempt_id, request.cmid, request.finalize, stage, page_number,
+                request.expected_attempt_id,
+                request.cmid,
+                request.finalize,
+                stage,
+                page_number,
                 round((asyncio.get_running_loop().time() - delivery_started) * 1_000),
             )
 
@@ -3300,7 +3706,9 @@ class MoodleBrowserService:
                 try:
                     page = await context.new_page()
                     page._eduprog_quiz_binding = (
-                        request.course_id, request.cmid, request.expected_attempt_id,
+                        request.course_id,
+                        request.cmid,
+                        request.expected_attempt_id,
                     )
                     trace("browser_ready")
                     first_slot = min(per_slot, key=int)
@@ -3389,21 +3797,26 @@ class MoodleBrowserService:
                                     )
                                 changed |= not same
                             if changed:
-                                await self._save_quiz_question_page(
-                                    page, context, item, question
-                                )
+                                await self._save_quiz_question_page(page, context, item, question)
                             if not request.finalize:
                                 # A periodic checkpoint has no final bundle
                                 # verification below, so verify its page now.
                                 for index, slot in enumerate(page_slots):
                                     item = per_slot[slot]
                                     returned = await self._read_quiz_question(
-                                        page, context, item, questions[slot],
+                                        page,
+                                        context,
+                                        item,
+                                        questions[slot],
                                         reuse_current_page=index > 0,
                                     )
                                     if not await self._quiz_answer_matches(
-                                        page, item, returned, artifacts[slot],
-                                        allow_named_attachment=True, require_verified_match=True,
+                                        page,
+                                        item,
+                                        returned,
+                                        artifacts[slot],
+                                        allow_named_attachment=True,
+                                        require_verified_match=True,
                                     ):
                                         raise MoodleProtocolError(
                                             "Moodle did not preserve a Quiz answer"
@@ -3420,12 +3833,19 @@ class MoodleBrowserService:
                                 for index, slot in enumerate(pages[page_number]):
                                     item = per_slot[slot]
                                     question = await self._read_quiz_question(
-                                        page, context, item, questions[slot],
+                                        page,
+                                        context,
+                                        item,
+                                        questions[slot],
                                         reuse_current_page=index > 0,
                                     )
                                     if not await self._quiz_answer_matches(
-                                        page, item, question, artifacts[slot],
-                                        allow_named_attachment=True, require_verified_match=True,
+                                        page,
+                                        item,
+                                        question,
+                                        artifacts[slot],
+                                        allow_named_attachment=True,
+                                        require_verified_match=True,
                                     ):
                                         raise MoodleProtocolError(
                                             "Moodle Quiz answer changed before finalization"
@@ -3486,7 +3906,7 @@ class MoodleBrowserService:
                     ) from exc
                 finally:
                     trace("browser_complete" if browser_succeeded else "interrupted")
-                    await context.close()
+                    await self._close_student_context(context)
             response = QuizAnswersSyncResponse.model_validate(
                 {
                     "status": "FINALIZED" if request.finalize else "DRAFT_SAVED",
@@ -3880,7 +4300,7 @@ class MoodleBrowserService:
                         )
                     state = await self._state(context)
                 finally:
-                    await context.close()
+                    await self._close_student_context(context)
             return QuizEssayPrepareResponse.model_validate(
                 {
                     "status": "READY",
@@ -3969,13 +4389,31 @@ class MoodleBrowserService:
                 "Moodle Assignment submission form is not available to this student"
             ) from exc
         try:
-            return parse_assignment_edit_page(
+            submission = parse_assignment_edit_page(
                 html,
                 page.url,
                 base_url=self.settings.base_url,
                 course_id=request.course_id,
                 cmid=request.cmid,
             )
+            if (
+                "ASSIGN_FILE" in submission.available_transports
+                and getattr(context, "_eduprog_assignment_native_upload", False) is True
+            ):
+                draft = parse_assignment_draft(
+                    html,
+                    base_url=self.settings.base_url,
+                    cmid=request.cmid,
+                )
+                # File-manager DOM is populated by JS in Moodle. Its native
+                # bootstrap is already authoritative before that JS executes.
+                submission = replace(
+                    submission,
+                    existing_filenames=tuple(name for name, _ in draft.files),
+                    attachment_urls=draft.files,
+                    effective_max_bytes=draft.maxbytes if draft.maxbytes > 0 else None,
+                )
+            return submission
         except MoodleMarkupError as exc:
             raise MoodleProtocolError(str(exc)) from exc
 
@@ -4005,7 +4443,9 @@ class MoodleBrowserService:
             if await editors.count() > 1:
                 raise MoodleProtocolError("Moodle assignment online-text editor is ambiguous")
             if await textarea.is_visible() and await editors.count() == 0:
-                await textarea.fill(source)
+                formats = page.locator("form.mform [name='onlinetext_editor[format]']")
+                html_format = await formats.count() == 1 and await formats.input_value() == "1"
+                await textarea.fill(f"<pre>{html.escape(source)}</pre>" if html_format else source)
             else:
                 html_source = f"<pre>{html.escape(source)}</pre>"
                 if await editors.count() == 1:
@@ -4083,6 +4523,18 @@ class MoodleBrowserService:
         previous_managed_filename: str | None = None,
         previous_managed_sha256: str | None = None,
     ) -> None:
+        if (
+            getattr(getattr(page, "context", None), "_eduprog_assignment_native_upload", False)
+            is True
+        ):
+            await self._upload_assignment_draft(
+                page,
+                filename=filename,
+                artifact=artifact,
+                previous_managed_filename=previous_managed_filename,
+                previous_managed_sha256=previous_managed_sha256,
+            )
+            return
         try:
             managers = page.locator(ASSIGNMENT_FILEMANAGER_SELECTOR)
             if await managers.count() != 1:
@@ -4215,6 +4667,153 @@ class MoodleBrowserService:
             raise
         except (PlaywrightTimeoutError, PlaywrightError) as exc:
             raise BrowserUnavailable("Moodle Assignment artifact upload failed") from exc
+
+    async def _upload_assignment_draft(
+        self,
+        page: Page,
+        *,
+        filename: str,
+        artifact: bytes,
+        previous_managed_filename: str | None,
+        previous_managed_sha256: str | None,
+    ) -> None:
+        """Use a fresh native draft contract instead of waiting for filepicker JS."""
+        stage = "draft_contract"
+        try:
+            binding = getattr(page, "_eduprog_assignment_binding", None)
+            if not isinstance(binding, tuple) or len(binding) != 2:
+                raise MoodleProtocolError("Moodle native upload has no bound Assignment")
+            course_id, cmid = binding
+            markup = await page.content()
+            parse_assignment_edit_page(
+                markup,
+                page.url,
+                base_url=self.settings.base_url,
+                course_id=course_id,
+                cmid=cmid,
+            )
+            draft = parse_assignment_draft(markup, base_url=self.settings.base_url, cmid=cmid)
+            names = tuple(name for name, _ in draft.files)
+            digest = hashlib.sha256(artifact).hexdigest()
+            target_matches = False
+            if filename in names:
+                # Retry after a successful Save with a lost acknowledgement:
+                # matching exact bytes needs no ownership claim or rewrite.
+                stage = "verify_current_draft"
+                try:
+                    await self._verify_assignment_managed_file(
+                        page,
+                        filename=filename,
+                        expected_sha256=digest,
+                        attachment_urls=draft.files,
+                    )
+                    target_matches = True
+                except MoodleProtocolError:
+                    pass
+            old_present = previous_managed_filename in names
+            overwrite = False
+            if not target_matches:
+                overwrite = _managed_target_replace_existing(
+                    names,
+                    filename,
+                    previous_managed_filename,
+                )
+            if old_present and (not target_matches or previous_managed_filename != filename):
+                if not previous_managed_filename or not previous_managed_sha256:
+                    raise MoodleProtocolError("Moodle previous artifact ownership is unproven")
+                stage = "verify_previous_draft"
+                await self._verify_assignment_managed_file(
+                    page,
+                    filename=previous_managed_filename,
+                    expected_sha256=previous_managed_sha256,
+                    attachment_urls=draft.files,
+                )
+            if not target_matches:
+                stage = "upload_draft"
+                result = await draft_request(
+                    page.request,
+                    base_url=self.settings.base_url,
+                    draft=draft,
+                    action="upload",
+                    filename=filename,
+                    artifact=artifact,
+                    mime_type=self._artifact_mime_type(filename),
+                    overwrite=overwrite,
+                    timeout_ms=self.settings.navigation_timeout_ms,
+                )
+                stage = "verify_uploaded_draft"
+                await self._verify_assignment_managed_file(
+                    page,
+                    filename=filename,
+                    expected_sha256=digest,
+                    attachment_urls=((filename, result["url"]),),
+                )
+            if old_present and previous_managed_filename != filename:
+                stage = "remove_previous_draft"
+                await draft_request(
+                    page.request,
+                    base_url=self.settings.base_url,
+                    draft=draft,
+                    action="delete",
+                    filename=previous_managed_filename,
+                    timeout_ms=self.settings.navigation_timeout_ms,
+                )
+        except DraftSessionExpired as exc:
+            raise MoodleSessionExpired(str(exc)) from exc
+        except MoodleMarkupError as exc:
+            raise MoodleProtocolError(str(exc)) from exc
+        except (DraftUnavailable, PlaywrightError, PlaywrightTimeoutError) as exc:
+            raise BrowserUnavailable(
+                f"Moodle Assignment artifact upload failed: stage={stage}"
+            ) from exc
+
+    async def _verify_final_assignment_file(
+        self,
+        page: Page,
+        context: BrowserContext,
+        request: AssignmentSubmissionSyncRequest,
+    ) -> None:
+        """A terminal status alone never proves delivery of this local snapshot."""
+        markup = await page.content()
+        await self._require_authenticated_page(context, markup)
+        try:
+            view = parse_assignment_view_page(
+                markup,
+                page.url,
+                base_url=self.settings.base_url,
+                course_id=request.course_id,
+                cmid=request.cmid,
+            )
+        except MoodleMarkupError as exc:
+            raise MoodleProtocolError(str(exc)) from exc
+        if view.status != "FINALIZED":
+            raise MoodleProtocolError("Moodle Assignment has no confirmed terminal response")
+        urls: set[tuple[str, str]] = set()
+        for anchor in BeautifulSoup(markup, "html.parser").select(
+            ".submissionstatustable a[href], .assignsubmission_file a[href], "
+            ".fileuploadsubmission a[href]"
+        ):
+            url = urljoin(self.settings.base_url + "/", str(anchor.get("href", "")))
+            target = urlsplit(url)
+            path = unquote(target.path)
+            if (
+                f"{target.scheme}://{target.netloc}" == self.settings.base_url
+                and not target.username
+                and not target.password
+                and not target.fragment
+                and re.fullmatch(
+                    r"/pluginfile\.php/[1-9][0-9]*/assignsubmission_file/submission_files/"
+                    r"(?:[1-9][0-9]*/)?" + re.escape(request.artifact.filename),
+                    path,
+                )
+            ):
+                urls.add((request.artifact.filename, url))
+        await self._verify_assignment_managed_file(
+            page,
+            filename=request.artifact.filename,
+            expected_sha256=request.artifact.sha256,
+            attachment_urls=tuple(sorted(urls)),
+        )
 
     async def _verify_assignment_managed_file(
         self,
@@ -4440,6 +5039,13 @@ class MoodleBrowserService:
         if request.answer_transport == "ASSIGN_FILE":
             if request.artifact.filename not in returned.existing_filenames:
                 raise MoodleProtocolError("Moodle did not preserve the Assignment artifact")
+            if getattr(context, "_eduprog_assignment_native_upload", False) is True:
+                await self._verify_assignment_managed_file(
+                    page,
+                    filename=request.artifact.filename,
+                    expected_sha256=request.artifact.sha256,
+                    attachment_urls=returned.attachment_urls,
+                )
         else:
             try:
                 expected = artifact.decode("utf-8")
@@ -4894,8 +5500,11 @@ class MoodleBrowserService:
         maximum_bytes = 2 * 1024 * 1024
         result = await page.evaluate(
             _LOGIN_ROLE_FETCH_SCRIPT,
-            {"url": url, "timeoutMs": self.settings.navigation_timeout_ms,
-             "maxBytes": maximum_bytes},
+            {
+                "url": url,
+                "timeoutMs": self.settings.navigation_timeout_ms,
+                "maxBytes": maximum_bytes,
+            },
         )
         if not isinstance(result, dict) or result.get("error"):
             raise BrowserUnavailable("Moodle Quiz question metadata is unavailable")
@@ -4903,7 +5512,9 @@ class MoodleBrowserService:
         if isinstance(status, int) and status >= 500:
             raise BrowserUnavailable("Moodle returned a server error")
         if (
-            status != 200 or result.get("url") != url or result.get("tooLarge")
+            status != 200
+            or result.get("url") != url
+            or result.get("tooLarge")
             or not isinstance(result.get("html"), str)
             or len(result["html"].encode("utf-8")) > maximum_bytes
         ):
@@ -4978,10 +5589,14 @@ class MoodleBrowserService:
             raise MoodleProtocolError("Moodle question response identity changed")
         if native_upload and "ESSAY_ATTACHMENT" in result.available_transports:
             draft = parse_essay_draft(
-                markup, base_url=self.settings.base_url, cmid=request.cmid, question=result,
+                markup,
+                base_url=self.settings.base_url,
+                cmid=request.cmid,
+                question=result,
             )
             result = replace(
-                result, existing_filenames=tuple(name for name, _ in draft.files),
+                result,
+                existing_filenames=tuple(name for name, _ in draft.files),
                 attachment_urls=draft.files,
             )
         return result
@@ -5065,7 +5680,9 @@ class MoodleBrowserService:
                 raise MoodleProtocolError("Moodle essay online-text editor is ambiguous")
 
             if await textarea.is_visible() and editor_count == 0:
-                await textarea.fill(source)
+                formats = essay.locator(f"[name='{control_name}format']")
+                html_format = await formats.count() == 1 and await formats.input_value() == "1"
+                await textarea.fill(f"<pre>{html.escape(source)}</pre>" if html_format else source)
             else:
                 # Rich-text Moodle editors keep an HTML value in the hidden
                 # textarea. A single <pre> preserves every tab and leading
@@ -5130,8 +5747,14 @@ class MoodleBrowserService:
         return False
 
     async def _upload_quiz_draft(
-        self, page: Page, *, filename: str, artifact: bytes, question_slot: str | None,
-        previous_managed_filename: str | None, previous_managed_sha256: str | None,
+        self,
+        page: Page,
+        *,
+        filename: str,
+        artifact: bytes,
+        question_slot: str | None,
+        previous_managed_filename: str | None,
+        previous_managed_sha256: str | None,
     ) -> None:
         """Upload through the exact Essay's native student draft-file endpoint.
 
@@ -5148,17 +5771,26 @@ class MoodleBrowserService:
             course_id, cmid, attempt_id = binding
             markup = await page.content()
             question = parse_attempt_page(
-                markup, page.url, base_url=self.settings.base_url,
-                course_id=course_id, cmid=cmid, question_slot=question_slot,
+                markup,
+                page.url,
+                base_url=self.settings.base_url,
+                course_id=course_id,
+                cmid=cmid,
+                question_slot=question_slot,
             )
             if question.attempt_id != attempt_id:
                 raise MoodleProtocolError("Moodle native upload attempt changed")
             draft = parse_essay_draft(
-                markup, base_url=self.settings.base_url, cmid=cmid, question=question,
+                markup,
+                base_url=self.settings.base_url,
+                cmid=cmid,
+                question=question,
             )
             names = tuple(name for name, _ in draft.files)
             overwrite = _managed_target_replace_existing(
-                names, filename, previous_managed_filename,
+                names,
+                filename,
+                previous_managed_filename,
             )
             old_present = previous_managed_filename in names
             stage = "verify_previous_draft"
@@ -5166,19 +5798,28 @@ class MoodleBrowserService:
                 if not previous_managed_sha256 or not previous_managed_filename:
                     raise MoodleProtocolError("Moodle previous artifact ownership is unproven")
                 await self._verify_quiz_managed_file_if_exposed(
-                    page, filename=previous_managed_filename,
-                    expected_sha256=previous_managed_sha256, attachment_urls=draft.files,
+                    page,
+                    filename=previous_managed_filename,
+                    expected_sha256=previous_managed_sha256,
+                    attachment_urls=draft.files,
                 )
             stage = "upload_draft"
             result = await draft_request(
-                page.request, base_url=self.settings.base_url, draft=draft,
-                action="upload", filename=filename, artifact=artifact,
-                mime_type=self._artifact_mime_type(filename), overwrite=overwrite,
+                page.request,
+                base_url=self.settings.base_url,
+                draft=draft,
+                action="upload",
+                filename=filename,
+                artifact=artifact,
+                mime_type=self._artifact_mime_type(filename),
+                overwrite=overwrite,
                 timeout_ms=self.settings.navigation_timeout_ms,
             )
             stage = "verify_uploaded_draft"
             await self._verify_quiz_managed_file_if_exposed(
-                page, filename=filename, expected_sha256=hashlib.sha256(artifact).hexdigest(),
+                page,
+                filename=filename,
+                expected_sha256=hashlib.sha256(artifact).hexdigest(),
                 attachment_urls=((filename, result["url"]),),
             )
             if old_present and previous_managed_filename != filename:
@@ -5186,8 +5827,11 @@ class MoodleBrowserService:
                 # is uploaded and verified. Never clear a whole draft area.
                 stage = "remove_previous_draft"
                 await draft_request(
-                    page.request, base_url=self.settings.base_url, draft=draft,
-                    action="delete", filename=previous_managed_filename,
+                    page.request,
+                    base_url=self.settings.base_url,
+                    draft=draft,
+                    action="delete",
+                    filename=previous_managed_filename,
                     timeout_ms=self.settings.navigation_timeout_ms,
                 )
         except DraftSessionExpired as exc:
@@ -5198,7 +5842,8 @@ class MoodleBrowserService:
             _LOGGER.warning(
                 "Moodle artifact upload interrupted transport=native "
                 "stage=%s slot=%s elapsed_ms=%d",
-                stage, question_slot,
+                stage,
+                question_slot,
                 round((asyncio.get_running_loop().time() - started) * 1_000),
             )
             raise BrowserUnavailable(f"Moodle artifact upload failed: stage={stage}") from exc
@@ -5218,7 +5863,10 @@ class MoodleBrowserService:
     ) -> None:
         if getattr(getattr(page, "context", None), "_eduprog_quiz_native_upload", False) is True:
             await self._upload_quiz_draft(
-                page, filename=filename, artifact=artifact, question_slot=question_slot,
+                page,
+                filename=filename,
+                artifact=artifact,
+                question_slot=question_slot,
                 previous_managed_filename=previous_managed_filename,
                 previous_managed_sha256=previous_managed_sha256,
             )
@@ -5227,9 +5875,7 @@ class MoodleBrowserService:
         stage = "file_manager"
         try:
             if not artifact:
-                raise MoodleProtocolError(
-                    "Moodle upload rejected: upload_error_invalid_file"
-                )
+                raise MoodleProtocolError("Moodle upload rejected: upload_error_invalid_file")
             selector = essay_slot_selector(question_slot) if question_slot else ESSAY_SELECTOR
             essays = page.locator(selector)
             managers = page.locator(f"{selector} .filemanager")
@@ -5248,7 +5894,9 @@ class MoodleBrowserService:
                     await manager.get_by_text(
                         previous_managed_filename,
                         exact=True,
-                    ).filter(visible=True).count()
+                    )
+                    .filter(visible=True)
+                    .count()
                     > 0
                     or await manager.locator(
                         f'[data-filename="{previous_managed_filename}"]:visible, '
@@ -5407,7 +6055,8 @@ class MoodleBrowserService:
             # student filenames, private URLs and session identifiers.
             _LOGGER.warning(
                 "Moodle artifact upload interrupted slot=%s stage=%s elapsed_ms=%d",
-                question_slot, stage,
+                question_slot,
+                stage,
                 round((asyncio.get_running_loop().time() - started) * 1_000),
             )
             raise BrowserUnavailable(f"Moodle artifact upload failed: stage={stage}") from exc
@@ -5423,7 +6072,9 @@ class MoodleBrowserService:
         """
         repository = page.get_by_text(re.compile(r"^(?:Upload a file|Загрузить файл)$", re.I))
         upload_repository = await self._wait_for_unique_locator(
-            repository, detail="Moodle upload repository is ambiguous", visible=True,
+            repository,
+            detail="Moodle upload repository is ambiguous",
+            visible=True,
         )
         loading = page.locator(
             ".file-picker:visible .fp-content-loading, "
@@ -5433,7 +6084,8 @@ class MoodleBrowserService:
         # Moodle initially hides the loading indicator. Waiting for 'hidden'
         # can return early; only removal proves rendering finished.
         await loading.first.wait_for(
-            state="detached", timeout=self.settings.navigation_timeout_ms,
+            state="detached",
+            timeout=self.settings.navigation_timeout_ms,
         )
         selected = await upload_repository.evaluate("""element => {
             const repository = element.closest('.fp-repo');
@@ -5443,7 +6095,8 @@ class MoodleBrowserService:
         if not selected:
             await upload_repository.click()
             await loading.first.wait_for(
-                state="detached", timeout=self.settings.navigation_timeout_ms,
+                state="detached",
+                timeout=self.settings.navigation_timeout_ms,
             )
 
     async def _upload_repository_file(self, page: Page, button: Locator) -> bool:
@@ -5454,6 +6107,7 @@ class MoodleBrowserService:
         Waiting only for the filename hides that error for a full timeout and
         repeats the same rejected upload on every delivery retry.
         """
+
         def is_upload(response: Any) -> bool:
             target = urlsplit(response.url)
             return (
@@ -5480,8 +6134,13 @@ class MoodleBrowserService:
             # Never include the raw Moodle error HTML, URLs or debug trace.
             code = result.get("errorcode")
             if code not in {
-                "upload_error_invalid_file", "invalidfiletype", "maxbytesfile",
-                "maxareabytes", "nofile", "uploadproblem", "invalidsesskey",
+                "upload_error_invalid_file",
+                "invalidfiletype",
+                "maxbytesfile",
+                "maxareabytes",
+                "nofile",
+                "uploadproblem",
+                "invalidsesskey",
             }:
                 code = "repository_error"
             raise MoodleProtocolError(f"Moodle upload rejected: {code}")
@@ -5513,7 +6172,9 @@ class MoodleBrowserService:
             if target:
                 attachment_urls = (*attachment_urls, (filename, target))
         if not await self._verify_quiz_managed_file_if_exposed(
-            page, filename=filename, expected_sha256=expected_sha256,
+            page,
+            filename=filename,
+            expected_sha256=expected_sha256,
             attachment_urls=attachment_urls,
         ):
             raise MoodleProtocolError("Moodle previous artifact bytes could not be verified")
@@ -5525,7 +6186,8 @@ class MoodleBrowserService:
         await label.click()
         dialogue = await self._wait_for_unique_locator(
             page.locator(".moodle-dialogue:visible"),
-            detail="Moodle previous artifact dialogue is ambiguous", visible=True,
+            detail="Moodle previous artifact dialogue is ambiguous",
+            visible=True,
         )
         name_control = dialogue.locator(".fp-saveas input")
         path_control = dialogue.locator(".fp-path select")
@@ -5538,7 +6200,8 @@ class MoodleBrowserService:
             raise MoodleProtocolError("Moodle previous artifact is not the managed root file")
         delete = await self._wait_for_unique_locator(
             dialogue.locator(".fp-file-delete"),
-            detail="Moodle previous artifact delete control is ambiguous", visible=True,
+            detail="Moodle previous artifact delete control is ambiguous",
+            visible=True,
         )
         await delete.click()
         confirm = await self._wait_for_unique_locator(
@@ -5546,7 +6209,8 @@ class MoodleBrowserService:
                 "[role='dialog']:visible [data-action='save'], "
                 ".moodle-dialogue:visible .fp-dlg-butconfirm"
             ),
-            detail="Moodle previous artifact delete confirmation is ambiguous", visible=True,
+            detail="Moodle previous artifact delete confirmation is ambiguous",
+            visible=True,
         )
         await confirm.click()
         # Moodle retains hidden file-view DOM nodes after a refresh; detachment

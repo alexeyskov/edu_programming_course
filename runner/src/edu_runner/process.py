@@ -7,11 +7,19 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from .profiles import ResourceLimits
+
+
+MAX_PENDING_INTERACTIVE_INPUT_BYTES = 1024 * 1024
+
+
+class InteractiveInputBackpressure(BufferError):
+    """The program is not consuming its bounded queued input fast enough."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +92,9 @@ def _kill_process_tree(process: subprocess.Popen[bytes]) -> None:
     except ProcessLookupError:
         return
     except OSError:
-        process.kill()
+        # The leader may exit between killpg and this fallback.
+        with suppress(ProcessLookupError):
+            process.kill()
 
 
 def _limited_command(command: Sequence[str], limits: ResourceLimits) -> list[str]:
@@ -251,6 +261,7 @@ class InteractiveProcess:
         self._lock = threading.Lock()
         self._input_lock = threading.Lock()
         self._input_closed = False
+        self._pending_input = bytearray()
         self._budget = _OutputBudget(limits.output_bytes)
         self._stdout = _StreamCapture(self._budget)
         self._stderr = _StreamCapture(self._budget)
@@ -284,6 +295,10 @@ class InteractiveProcess:
 
         assert self.process.stdout is not None
         assert self.process.stderr is not None
+        assert self.process.stdin is not None
+        # A program is allowed not to read stdin. Never let its full pipe block
+        # an HTTP worker (or the state/EOF requests sharing _input_lock).
+        os.set_blocking(self.process.stdin.fileno(), False)
         self._readers = [
             threading.Thread(
                 target=self._stdout.read, args=(self.process.stdout,), daemon=True
@@ -305,33 +320,51 @@ class InteractiveProcess:
         data = f"{text}\n".encode("utf-8")
         with self._input_lock:
             process = self.process
-            if process is None or process.poll() is not None or process.stdin is None:
+            if (
+                process is None or process.poll() is not None or process.stdin is None
+                or self._input_closed
+            ):
                 return False
-            try:
-                process.stdin.write(data)
-                process.stdin.flush()
-                return True
-            except (BrokenPipeError, OSError, ValueError):
-                return False
+            if len(self._pending_input) + len(data) > MAX_PENDING_INTERACTIVE_INPUT_BYTES:
+                raise InteractiveInputBackpressure("interactive input queue is full")
+            self._pending_input.extend(data)
+            return True
 
     def close_input(self) -> bool:
         """Deliver EOF without terminating the process itself.
 
-        Closing the pipe is deliberately separate from ``stop``: programs that
-        read until EOF must be able to finish normally and flush their output.
-        The input lock serializes EOF with concurrent line submissions.
+        EOF is delivered after all accepted input, without blocking the caller
+        if the program has not read its pipe yet. New input is rejected as soon
+        as EOF is requested.
         """
 
         with self._input_lock:
             process = self.process
-            if process is None or process.poll() is not None or process.stdin is None:
+            if (
+                process is None or process.poll() is not None or process.stdin is None
+                or self._input_closed
+            ):
                 return False
+            self._input_closed = True
+            return True
+
+    def _drain_input(self) -> None:
+        """Move queued bytes into a nonblocking pipe from the monitor thread."""
+        with self._input_lock:
+            process = self.process
+            if process is None or process.stdin is None or process.stdin.closed:
+                return
             try:
-                process.stdin.close()
-                self._input_closed = True
-                return True
+                if self._pending_input:
+                    written = os.write(process.stdin.fileno(), self._pending_input)
+                    del self._pending_input[:written]
+                if self._input_closed and not self._pending_input:
+                    process.stdin.close()
+            except (BlockingIOError, InterruptedError):
+                return
             except (BrokenPipeError, OSError, ValueError):
-                return False
+                self._pending_input.clear()
+                self._input_closed = True
 
     def stop(self) -> None:
         process = self.process
@@ -378,6 +411,7 @@ class InteractiveProcess:
         next_workspace_check = self.started
         try:
             while process.poll() is None:
+                self._drain_input()
                 if self._budget.exceeded.is_set():
                     with self._lock:
                         self._output_limited = True
@@ -399,27 +433,38 @@ class InteractiveProcess:
                     _kill_process_tree(process)
                     break
                 time.sleep(0.01)
+        except Exception as exc:
+            # A workspace can change permissions/disappear while it is being
+            # measured. A monitor failure is infrastructure failure, never a
+            # successful process completion. Do not expose filesystem paths.
+            with self._lock:
+                self._launch_error = f"Interactive monitor failed: {type(exc).__name__}"
+        finally:
+            # Run this even when monitoring or draining input raised. Otherwise
+            # finished/on_finish would release the runner slot while the child
+            # still ran and kept stdin/stdout/stderr alive indefinitely.
+            try:
+                _kill_process_tree(process)
+            except OSError as exc:
+                with self._lock:
+                    self._launch_error = f"Interactive cleanup failed: {type(exc).__name__}"
             try:
                 process.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                _kill_process_tree(process)
-                process.wait(timeout=1)
-            _kill_process_tree(process)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                with self._lock:
+                    self._launch_error = f"Interactive cleanup failed: {type(exc).__name__}"
             with self._input_lock:
+                self._pending_input.clear()
+                self._input_closed = True
                 if process.stdin is not None:
-                    try:
+                    with suppress(BrokenPipeError, OSError, ValueError):
                         process.stdin.close()
-                        self._input_closed = True
-                    except (BrokenPipeError, OSError, ValueError):
-                        pass
             for thread in self._readers:
                 thread.join(timeout=1)
             with self._lock:
                 self._output_limited = (
                     self._output_limited or self._budget.exceeded.is_set()
                 )
-        finally:
-            with self._lock:
                 self._ended = time.monotonic()
             self._finished.set()
             if self._on_finish is not None:

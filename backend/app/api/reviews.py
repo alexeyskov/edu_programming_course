@@ -1855,6 +1855,7 @@ async def interactive_experiment_state(
         db, experiment=experiment, teacher_id=auth.principal_id, session_id=session_id
     )
     settings: Settings = request.app.state.settings
+    await db.commit()  # Release the read-only connection before runner I/O.
     try:
         async with httpx.AsyncClient() as client:
             raw = await RunnerAdapter(settings, client).interactive_state(
@@ -1892,6 +1893,7 @@ async def interactive_experiment_input(
     if run.status != RunStatus.RUNNING.value:
         raise DomainError(409, "INTERACTIVE_SESSION_FINISHED", "Interactive program is not running")
     settings: Settings = request.app.state.settings
+    await db.commit()  # Release the read-only connection before runner I/O.
     try:
         async with httpx.AsyncClient() as client:
             raw = await RunnerAdapter(settings, client).interactive_input(
@@ -1930,6 +1932,7 @@ async def interactive_experiment_eof(
     if run.status != RunStatus.RUNNING.value:
         raise DomainError(409, "INTERACTIVE_SESSION_FINISHED", "Interactive program is not running")
     settings: Settings = request.app.state.settings
+    await db.commit()  # Release the read-only connection before runner I/O.
     try:
         async with httpx.AsyncClient() as client:
             raw = await RunnerAdapter(settings, client).interactive_eof(
@@ -1964,6 +1967,7 @@ async def stop_interactive_experiment(
         db, experiment=experiment, teacher_id=auth.principal_id, session_id=session_id
     )
     settings: Settings = request.app.state.settings
+    await db.commit()  # Release the read-only connection before runner I/O.
     try:
         async with httpx.AsyncClient() as client:
             raw = await RunnerAdapter(settings, client).interactive_stop(

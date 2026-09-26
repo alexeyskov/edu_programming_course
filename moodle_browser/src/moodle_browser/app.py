@@ -187,7 +187,8 @@ def create_app(
         )
 
     @application.exception_handler(BrowserBusy)
-    async def browser_busy(_request: Request, _exc: BrowserBusy) -> JSONResponse:
+    async def browser_busy(request: Request, exc: BrowserBusy) -> JSONResponse:
+        logger.warning("Moodle browser busy operation=%s detail=%s", request.url.path, exc)
         return JSONResponse(
             {"detail": "Moodle browser is busy"},
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -299,8 +300,17 @@ def create_app(
     )
     async def discover_historical_submissions(
         payload: HistoricalSubmissionsRequest,
-    ) -> HistoricalSubmissionsResponse:
-        return await actual_service.discover_historical_submissions(payload)
+    ) -> Response:
+        result = await actual_service.discover_historical_submissions(payload)
+
+        def serialize_history() -> bytes:
+            # Avoid FastAPI's intermediate dict/json encoder copies for large
+            # base64 archives. Validate even when the service is a test double.
+            validated = HistoricalSubmissionsResponse.model_validate(result)
+            return validated.model_dump_json().encode("utf-8")
+
+        body = await asyncio.to_thread(serialize_history)
+        return Response(content=body, media_type="application/json")
 
     @application.post(
         "/internal/v1/moodle/assignment/grade",

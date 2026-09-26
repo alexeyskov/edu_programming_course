@@ -1,13 +1,14 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ToastProvider } from '../components/ui';
-import type { Submission } from '../types';
+import type { MoodleHistoryImportEvent, Submission } from '../types';
 import { SubmissionsPage } from './SubmissionsPage';
 
 const mocks = vi.hoisted(() => ({
   getSubmissions: vi.fn(),
   getMoodleHistoryImportEvents: vi.fn(),
+  dismissMoodleHistoryWarnings: vi.fn(),
   retryMoodleHistoryImport: vi.fn(),
   claimSubmission: vi.fn(),
 }));
@@ -15,6 +16,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock('../lib/api', () => ({ api: {
   getSubmissions: mocks.getSubmissions,
   getMoodleHistoryImportEvents: mocks.getMoodleHistoryImportEvents,
+  dismissMoodleHistoryWarnings: mocks.dismissMoodleHistoryWarnings,
   retryMoodleHistoryImport: mocks.retryMoodleHistoryImport,
   claimSubmission: mocks.claimSubmission,
 } }));
@@ -50,12 +52,242 @@ function rowFor(studentName: string) {
 beforeEach(() => {
   mocks.getSubmissions.mockReset().mockResolvedValue(items);
   mocks.getMoodleHistoryImportEvents.mockReset().mockResolvedValue([]);
+  mocks.dismissMoodleHistoryWarnings.mockReset().mockImplementation(async (_assessment, ids) => ids);
   mocks.retryMoodleHistoryImport.mockReset();
   mocks.claimSubmission.mockReset().mockResolvedValue({ id: 'new-claim', ownerId: 'teacher', ownerName: 'Коваленко А.', expiresAt: '2026-08-25T12:00:00Z', mine: true });
 });
 afterEach(cleanup);
 
+const importWarning: MoodleHistoryImportEvent = {
+  id: 'import-1', aggregateId: 'assessment-1', assessmentTitle: 'Самостоятельная №1',
+  state: 'PARTIAL', createdAt: '', updatedAt: '', receipt: {},
+  errorCode: 'ARCHIVE_SOURCE_OMITTED', lastError: 'Не удалось загрузить исходники.',
+  warnings: [{
+    id: 'a'.repeat(64), code: 'ARCHIVE_SOURCE_OMITTED', studentName: 'Иван Иванов',
+    attemptId: '142195', responseLabel: 'Задание 2', submissionId: 'partial-answer',
+    moodleUrl: 'https://moodle.test/mod/quiz/review.php?attempt=142195&cmid=31529',
+    message: 'В архиве нет поддерживаемых исходников C/C++.',
+  }],
+};
+
+describe('import warning details and persistent acknowledgement', () => {
+  it.each(['PARTIAL', 'FAILED'])('does not show foreign student problems or a false empty-state error (%s)', async (state) => {
+    mocks.getSubmissions.mockResolvedValue([]);
+    mocks.getMoodleHistoryImportEvents.mockResolvedValue([{
+      ...importWarning, state, warnings: [], warningsDismissed: false,
+    }]);
+    renderPage();
+    expect(await screen.findByText('Сданных работ пока нет')).toBeInTheDocument();
+    expect(screen.queryByText('Синхронизация завершена с предупреждениями')).not.toBeInTheDocument();
+    expect(screen.queryByText('Часть прошлых сдач не загрузилась')).not.toBeInTheDocument();
+    expect(screen.queryByText('Общие данные синхронизации')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Скрыть предупреждение' })).not.toBeInTheDocument();
+  });
+
+  it('lists affected students and opens the exact answer or Moodle attempt without claiming', async () => {
+    mocks.getMoodleHistoryImportEvents.mockResolvedValue([importWarning]);
+    renderPage('/submissions?view=pending');
+    const list = await screen.findByRole('list', { name: 'Ответы с проблемами синхронизации' });
+    expect(list).toHaveTextContent('Иван Иванов');
+    expect(list).toHaveTextContent('Попытка 142195 · Задание 2');
+    expect(list).toHaveTextContent('В архиве нет поддерживаемых исходников');
+    expect(within(list).getByRole('link', { name: 'Ответ в системе' })).toHaveAttribute('href', '/review/partial-answer?view=pending');
+    const external = within(list).getByRole('link', { name: 'Открыть в Moodle' });
+    expect(external).toHaveAttribute('href', importWarning.warnings![0].moodleUrl);
+    expect(external).toHaveAttribute('target', '_blank');
+    expect(external).toHaveAttribute('rel', 'noopener noreferrer');
+    expect(mocks.claimSubmission).not.toHaveBeenCalled();
+  });
+
+  it('keeps names and Moodle links when a submission was not imported at all', async () => {
+    mocks.getMoodleHistoryImportEvents.mockResolvedValue([{
+      ...importWarning, state: 'FAILED',
+      warnings: [{ ...importWarning.warnings![0], submissionId: undefined }],
+    }]);
+    renderPage();
+    expect(await screen.findByRole('alert')).toHaveTextContent('Иван Иванов');
+    expect(screen.getByRole('link', { name: 'Открыть в Moodle' })).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Ответ в системе' })).not.toBeInTheDocument();
+  });
+
+  it('saves acknowledgement on the server and does not resurrect it after a stale poll or reload', async () => {
+    mocks.getMoodleHistoryImportEvents.mockResolvedValue([importWarning]);
+    const page = renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Скрыть предупреждение' }));
+    await waitFor(() => expect(screen.queryByText('Синхронизация завершена с предупреждениями')).not.toBeInTheDocument());
+    expect(mocks.dismissMoodleHistoryWarnings).toHaveBeenCalledWith('assessment-1', ['a'.repeat(64)]);
+    fireEvent(document, new Event('visibilitychange'));
+    await waitFor(() => expect(mocks.getMoodleHistoryImportEvents).toHaveBeenCalledTimes(3));
+    expect(screen.queryByText('Иван Иванов')).not.toBeInTheDocument();
+    expect(screen.getByText('Мария Воронова')).toBeInTheDocument();
+    page.unmount();
+    mocks.getMoodleHistoryImportEvents.mockResolvedValue([{ ...importWarning, warnings: [], warningsDismissed: true }]);
+    renderPage();
+    await screen.findByText('Мария Воронова');
+    expect(screen.queryByText('Синхронизация завершена с предупреждениями')).not.toBeInTheDocument();
+    expect(mocks.retryMoodleHistoryImport).not.toHaveBeenCalled();
+  });
+
+  it('keeps a new warning arriving while a hide request is pending', async () => {
+    let finish: (ids: string[]) => void = () => {};
+    mocks.dismissMoodleHistoryWarnings.mockReturnValue(new Promise<string[]>((resolve) => { finish = resolve; }));
+    mocks.getMoodleHistoryImportEvents.mockResolvedValue([importWarning]);
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Скрыть предупреждение' }));
+    expect(screen.getByRole('button', { name: 'Скрыть предупреждение' })).toBeDisabled();
+    mocks.getMoodleHistoryImportEvents.mockResolvedValue([{
+      ...importWarning, warnings: [...importWarning.warnings!, {
+        ...importWarning.warnings![0], id: 'b'.repeat(64), studentName: 'Пётр Петров', attemptId: '142196',
+      }],
+    }]);
+    fireEvent(document, new Event('visibilitychange'));
+    await screen.findByText('Пётр Петров');
+    await act(async () => { finish(['a'.repeat(64)]); });
+    await waitFor(() => expect(screen.queryByText('Иван Иванов')).not.toBeInTheDocument());
+    expect(screen.getByText('Пётр Петров')).toBeInTheDocument();
+    expect(screen.getByText('Синхронизация завершена с предупреждениями')).toBeInTheDocument();
+  });
+
+  it('does not hide or acknowledge a warning when saving fails', async () => {
+    mocks.getMoodleHistoryImportEvents.mockResolvedValue([importWarning]);
+    mocks.dismissMoodleHistoryWarnings.mockRejectedValue(new Error('network timeout'));
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Скрыть предупреждение' }));
+    expect(await screen.findByText('Не удалось скрыть предупреждение')).toBeInTheDocument();
+    expect(screen.getByText('Иван Иванов')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Скрыть предупреждение' })).toBeEnabled();
+  });
+
+  it('shows all affected assessments and keeps an honest empty state after hiding warnings', async () => {
+    mocks.getSubmissions.mockResolvedValue([]);
+    mocks.getMoodleHistoryImportEvents.mockResolvedValue(Array.from({ length: 7 }, (_, index) => ({
+      ...importWarning, id: `import-${index}`, aggregateId: `assessment-${index}`, assessmentTitle: `Работа ${index}`,
+    })));
+    const page = renderPage();
+    expect(await screen.findByRole('region', { name: 'Работа 6' })).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: 'Скрыть предупреждение' })).toHaveLength(7);
+    page.unmount();
+    mocks.getMoodleHistoryImportEvents.mockResolvedValue([{ ...importWarning, warnings: [], warningsDismissed: true }]);
+    renderPage();
+    expect(await screen.findByText('Список сдач пока не получен')).toBeInTheDocument();
+    expect(screen.queryByText('Сданных работ пока нет')).not.toBeInTheDocument();
+  });
+});
+
 describe('student submissions views', () => {
+  it('shows and opens imported answers without waiting for the import status request', async () => {
+    mocks.getMoodleHistoryImportEvents.mockReturnValue(new Promise(() => {}));
+    renderPage();
+    expect(await screen.findByText('Мария Воронова')).toBeInTheDocument();
+    expect(screen.queryByText('Собираем сданные работы…')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Открыть следующую' }));
+    expect(await screen.findByText('Экран проверки')).toBeInTheDocument();
+    expect(mocks.claimSubmission).toHaveBeenCalledWith('ungraded');
+  });
+
+  it('continues fetching new answers while a status request remains pending', async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.getMoodleHistoryImportEvents.mockReturnValue(new Promise(() => {}));
+      mocks.getSubmissions.mockResolvedValueOnce([]).mockResolvedValue(items);
+      renderPage();
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      expect(screen.queryByText('Мария Воронова')).not.toBeInTheDocument();
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+      expect(screen.getByText('Мария Воронова')).toBeInTheDocument();
+      expect(mocks.getSubmissions).toHaveBeenCalledTimes(2);
+      expect(mocks.getMoodleHistoryImportEvents).toHaveBeenCalledTimes(1);
+    } finally {
+      cleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['PROCESSING', 'FAILED'])('lets the teacher check an imported answer while the rest is %s', async (state) => {
+    mocks.getSubmissions.mockResolvedValue([items[0]]);
+    mocks.getMoodleHistoryImportEvents.mockResolvedValue([{
+      id: 'partial-import', aggregateId: items[0].assessmentId, state, createdAt: '', updatedAt: '',
+    }]);
+    renderPage();
+    await screen.findByText('Мария Воронова');
+    expect(screen.getByText(/Уже загруженные сдачи доступны для проверки/)).toBeInTheDocument();
+    fireEvent.click(within(rowFor('Мария Воронова')).getByRole('button', { name: /^Открыть$/ }));
+    expect(await screen.findByText('Экран проверки')).toBeInTheDocument();
+    expect(mocks.claimSubmission).toHaveBeenCalledWith('ungraded');
+  });
+
+  it('distinguishes delivered answers with warnings from a failed import and permits review', async () => {
+    mocks.getSubmissions.mockResolvedValue([items[0]]);
+    mocks.getMoodleHistoryImportEvents.mockResolvedValue([{
+      id: 'partial-import', aggregateId: items[0].assessmentId, state: 'PARTIAL',
+      errorCode: 'ARTIFACT_OMITTED', lastError: 'Часть файлов ответов не удалось скачать из Moodle.',
+      createdAt: '', updatedAt: '',
+    }]);
+    renderPage();
+    await screen.findByText('Мария Воронова');
+    const warning = screen.getByText('Синхронизация завершена с предупреждениями').closest('[role="status"]');
+    expect(warning).toHaveTextContent('ARTIFACT_OMITTED');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Открыть следующую' }));
+    expect(await screen.findByText('Экран проверки')).toBeInTheDocument();
+  });
+
+  it('makes each newly imported answer reviewable before the manual import finishes', async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.getSubmissions.mockResolvedValueOnce([]).mockResolvedValue([items[0]]);
+      mocks.getMoodleHistoryImportEvents.mockResolvedValue([{
+        id: 'partial-import', aggregateId: items[0].assessmentId, state: 'PROCESSING', createdAt: '', updatedAt: '',
+      }]);
+      renderPage();
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      expect(screen.getByText('Сдачи ещё загружаются')).toBeInTheDocument();
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+      expect(screen.getByText('Мария Воронова')).toBeInTheDocument();
+      expect(screen.getByText('Загружаем прошлые сдачи из Moodle')).toBeInTheDocument();
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Открыть следующую' }));
+      });
+      expect(screen.getByTestId('location')).toHaveTextContent('/review/ungraded');
+    } finally {
+      cleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it('preserves the last loaded answers after a failed refresh and can recover', async () => {
+    renderPage();
+    await screen.findByText('Мария Воронова');
+    mocks.getSubmissions.mockRejectedValueOnce(new Error('Временная ошибка сети'));
+    fireEvent(document, new Event('visibilitychange'));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Не удалось обновить список работ');
+    expect(screen.getByText('Мария Воронова')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Открыть следующую' })).toBeEnabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Обновить список' }));
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+    expect(mocks.getSubmissions).toHaveBeenCalledTimes(3);
+  });
+
+  it('keeps refreshing a nonempty list after import finishes and removes deleted rows', async () => {
+    vi.useFakeTimers();
+    try {
+      renderPage();
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      expect(screen.getByText('Мария Воронова')).toBeInTheDocument();
+      mocks.getSubmissions.mockResolvedValue([items[1]]);
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+      expect(mocks.getSubmissions).toHaveBeenCalledTimes(2);
+      expect(screen.queryByText('Мария Воронова')).not.toBeInTheDocument();
+      expect(screen.getByText('Илья Морозов')).toBeInTheDocument();
+      mocks.getSubmissions.mockResolvedValue(items);
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+      expect(screen.getByText('Мария Воронова')).toBeInTheDocument();
+    } finally {
+      cleanup();
+      vi.useRealTimers();
+    }
+  });
+
   it('groups pending and reviewed work into URL-backed tabs and keeps search in the query', async () => {
     renderPage('/submissions?view=pending');
 
@@ -165,16 +397,17 @@ describe('student submissions views', () => {
     expect(within(row).getByRole('button', { name: /^Открыть$/ })).toBeInTheDocument();
   });
 
-  it('explains background Moodle history import and refreshes an empty list explicitly', async () => {
+  it('explains manual per-work Moodle sync and refreshes only the local empty list', async () => {
     mocks.getSubmissions.mockResolvedValue([]);
     renderPage('/submissions?view=reviewed');
 
     expect(await screen.findByText('Проверенных работ пока нет')).toBeInTheDocument();
-    expect(screen.getByText(/Исторические сдачи и оценки Moodle импортируются в фоне после синхронизации LMS/)).toBeInTheDocument();
+    expect(screen.getByText(/вручную синхронизируйте нужную работу/)).toBeInTheDocument();
     expect(screen.queryByText(/автоматически не переносятся/)).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: /Обновить список/ }));
     await waitFor(() => expect(mocks.getSubmissions).toHaveBeenCalledTimes(2));
+    expect(mocks.retryMoodleHistoryImport).not.toHaveBeenCalled();
   });
 
   it.each([false, true])('does not treat zero submissions as a sync error (completed import: %s)', async (completed) => {
@@ -255,7 +488,7 @@ describe('student submissions views', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Часть прошлых сдач не загрузилась');
     expect(screen.getByText('Список сдач пока не получен')).toBeInTheDocument();
     expect(screen.queryByText('Сданных работ пока нет')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Повторить загрузку' })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'К синхронизации работ' })).toHaveAttribute('href', '/courses');
   });
 
   it('does not hide an unavailable import status behind an empty list, and can recover', async () => {
@@ -313,21 +546,17 @@ describe('student submissions views', () => {
     expect(screen.queryByText(/UNEXPECTED_|LMS_REAUTH_REQUIRED/)).not.toBeInTheDocument();
   });
 
-  it('restarts a failed Moodle history job instead of only re-reading the same error', async () => {
+  it('directs a failed import to explicit per-work synchronization rather than bulk retry', async () => {
     const failed = {
       id: 'event-failed', aggregateId: 'assessment-1', actorKey: 'teacher-1', state: 'FAILED' as const,
       createdAt: '2026-09-03T01:00:00Z', updatedAt: '2026-09-03T01:01:00Z', receipt: {},
     };
-    const retrying = { ...failed, state: 'RETRY' as const, updatedAt: '2026-09-03T02:00:00Z' };
     mocks.getSubmissions.mockResolvedValue([]);
     mocks.getMoodleHistoryImportEvents.mockResolvedValue([failed]);
-    mocks.retryMoodleHistoryImport.mockResolvedValue(retrying);
     renderPage('/submissions');
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Повторить загрузку' }));
-
-    await waitFor(() => expect(mocks.retryMoodleHistoryImport).toHaveBeenCalledWith('event-failed'));
-    expect(await screen.findByText('Загружаем прошлые сдачи из Moodle')).toBeInTheDocument();
-    expect(screen.queryByText('Часть прошлых сдач не загрузилась')).not.toBeInTheDocument();
+    expect(await screen.findByRole('link', { name: 'К синхронизации работ' })).toHaveAttribute('href', '/courses');
+    expect(screen.queryByRole('button', { name: 'Повторить загрузку' })).not.toBeInTheDocument();
+    expect(mocks.retryMoodleHistoryImport).not.toHaveBeenCalled();
   });
 });

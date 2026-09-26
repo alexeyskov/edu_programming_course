@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 
@@ -65,3 +67,61 @@ async def test_timeout_remains_a_distinct_safe_error() -> None:
     assert str(caught.value) == "External service timed out"
     assert isinstance(caught.value.__cause__, httpx.ReadTimeout)
     assert "secret" not in str(caught.value)
+
+
+async def test_total_deadline_bounds_a_response_that_keeps_streaming():
+    class SlowBody(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self):
+            for _ in range(100):
+                await asyncio.sleep(0.005)
+                yield b" "
+            yield b"{}"
+
+        async def aclose(self):
+            self.closed = True
+
+    stream = SlowBody()
+
+    async def handler(_request):
+        return httpx.Response(200, stream=stream)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(IntegrationTimeout):
+            await asyncio.wait_for(request_json_limited(
+                client, "GET", _SECRET_URL, timeout_seconds=0.03, response_limit=1024,
+            ), timeout=1)
+    assert stream.closed
+
+
+async def test_total_deadline_bounds_waiting_for_headers():
+    cancelled = asyncio.Event()
+
+    async def handler(_request):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(IntegrationTimeout):
+            await asyncio.wait_for(request_json_limited(
+                client, "GET", _SECRET_URL, timeout_seconds=0.03, response_limit=1024,
+            ), timeout=1)
+    assert cancelled.is_set()
+
+
+async def test_caller_cancellation_is_not_misreported_as_an_external_timeout():
+    started = asyncio.Event()
+
+    async def handler(_request):
+        started.set()
+        await asyncio.Event().wait()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        task = asyncio.create_task(_request(client))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task

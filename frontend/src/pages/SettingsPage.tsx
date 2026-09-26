@@ -207,6 +207,7 @@ export function SettingsPage() {
   const [courseUrl, setCourseUrl] = useState('');
   const [courseUrlError, setCourseUrlError] = useState<string | null>(null);
   const [courseAdding, setCourseAdding] = useState(false);
+  const courseAddingRef = useRef(false);
   const [courseToRemove, setCourseToRemove] = useState<CourseCatalogEntry | null>(null);
   const [removingCourseId, setRemovingCourseId] = useState<string | null>(null);
   const [syncErrorCourse, setSyncErrorCourse] = useState<CourseCatalogEntry | null>(null);
@@ -452,6 +453,7 @@ export function SettingsPage() {
 
   async function addCourse(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (courseAddingRef.current) return;
     const requestEpoch = accessEpochRef.current;
     const url = courseUrl.trim();
     const validationError = validateCourseUrl(url);
@@ -459,6 +461,7 @@ export function SettingsPage() {
       setCourseUrlError(validationError);
       return;
     }
+    courseAddingRef.current = true;
     setCourseAdding(true);
     setCourseUrlError(null);
     try {
@@ -472,7 +475,7 @@ export function SettingsPage() {
         setCatalogError(null);
       }
       setCourseUrl('');
-      toast.push('success', 'Курс добавлен в систему', `${title} теперь учитывается при входе пользователей.`);
+      toast.push('success', 'Курс добавлен в систему', `${title}: загружаются список работ и участники. Ответы синхронизируются вручную у каждой работы.`);
       await loadCatalog(requestEpoch, { background: Boolean(optimistic), preserve: optimistic ?? undefined });
       await refresh();
     } catch (caught) {
@@ -480,6 +483,7 @@ export function SettingsPage() {
         toast.push('error', 'Курс не добавлен', caught instanceof Error ? caught.message : undefined);
       }
     } finally {
+      courseAddingRef.current = false;
       setCourseAdding(false);
     }
   }
@@ -732,7 +736,7 @@ export function SettingsPage() {
               className={courseUrlError ? 'system-course-form__message field__error' : 'system-course-form__message field__hint'}
               role={courseUrlError ? 'alert' : undefined}
             >
-              {courseUrlError ?? 'Курс будет проанализирован через вашу текущую LMS-сессию'}
+              {courseUrlError ?? (courseAdding ? 'Читаем курс из Moodle. Другие курсы не блокируются; повторно нажимать не нужно.' : 'Однократно загрузятся список работ, студенты и преподаватели. Ответы и последующие изменения синхронизируются вручную на странице «Курсы и работы».')}
             </span>
           </form>
 

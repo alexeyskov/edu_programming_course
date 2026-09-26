@@ -1,7 +1,7 @@
 import { ArrowRight, BookOpen, CheckCircle2, Clock3, Cloud, FileCheck2, RefreshCw, ShieldAlert, Users } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Badge, Button, Card, EmptyState, InlineError, PageLoader } from '../components/ui';
+import { Badge, Card, EmptyState, InlineError, PageLoader } from '../components/ui';
 import { useAuth } from '../context/AuthContext';
 import { api } from '../lib/api';
 import { formatDate, formatGreetingName, kindLabel, statusLabel } from '../lib/utils';
@@ -54,8 +54,6 @@ function TeacherDashboard({ courses, assessments, onReload }: { courses: Course[
   const knownSubmissionCounts = assessments.filter((item) => item.submissionsCount !== undefined);
   const submissions = knownSubmissionCounts.reduce((sum, item) => sum + (item.submissionsCount ?? 0), 0);
   const syncIssues = courses.filter((item) => item.syncStatus === 'STALE' || item.syncStatus === 'ERROR').length;
-  const [syncing, setSyncing] = useState(false);
-  const [syncError, setSyncError] = useState<string | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
   const syncingCourseIds = courses
     .filter((course) => course.syncStatus === 'SYNCING')
@@ -87,10 +85,6 @@ function TeacherDashboard({ courses, assessments, onReload }: { courses: Course[
           return;
         }
         settled = true;
-        const failed = statuses.find((status) => status.syncStatus === 'ERROR');
-        if (failed) {
-          setSyncError(failed.syncError?.message || 'Синхронизация Moodle завершилась с ошибкой.');
-        }
         await onReload();
       } catch (caught) {
         if (cancelled || settled) return;
@@ -111,19 +105,10 @@ function TeacherDashboard({ courses, assessments, onReload }: { courses: Course[
     };
   }, [onReload, syncingCourseKey]);
 
-  async function synchronize() {
-    setSyncing(true); setSyncError(null);
-    try { for (const course of courses) await api.syncCourse(course.id); await onReload(); }
-    catch (caught) {
-      setSyncError(caught instanceof Error ? caught.message : 'Синхронизация не выполнена');
-      await onReload().catch(() => undefined);
-    }
-    finally { setSyncing(false); }
-  }
   return <div className="content-width dashboard">
-    <div className="page-heading"><div><span className="eyebrow">Режим преподавателя</span><h1>Рабочий обзор</h1><p>{remoteSyncing ? 'Синхронизация продолжается на сервере. Страница обновится автоматически.' : 'Показатели рассчитаны по синхронизированным данным добавленных курсов.'}</p></div><Button variant="secondary" loading={syncing || remoteSyncing} disabled={!courses.length || syncing || remoteSyncing} onClick={() => void synchronize()}>{!syncing && !remoteSyncing && <RefreshCw size={16} />} {remoteSyncing ? 'Синхронизируется Moodle' : syncing ? 'Запускаем синхронизацию' : 'Синхронизировать Moodle'}</Button></div>
+    <div className="page-heading"><div><span className="eyebrow">Режим преподавателя</span><h1>Обзор курсов</h1><p>{remoteSyncing ? 'Запущенная синхронизация продолжается на сервере. Другие курсы доступны для ручного обновления.' : 'Показатели рассчитаны по данным системы. Списки курсов и ответы отдельных работ обновляются вручную.'}</p></div><Link className="button button--secondary button--md dashboard-sync-link" to="/courses"><RefreshCw size={16} /> Синхронизация курсов и работ</Link></div>
     {statusError && <InlineError title="Не удалось проверить состояние синхронизации" message={statusError} />}
-    {(syncError || persistedSyncError) && <InlineError message={syncError ?? persistedSyncError?.message ?? 'Синхронизация Moodle завершилась с ошибкой.'} retry={remoteSyncing ? undefined : () => void synchronize()} />}
+    {persistedSyncError && <InlineError message={`${persistedSyncError.message || 'Синхронизация Moodle завершилась с ошибкой.'} Повторите синхронизацию нужного курса на странице «Курсы и работы».`} />}
     <div className="metric-grid"><Card className="metric"><span className="metric__icon metric__icon--amber"><FileCheck2 /></span><div><small>Ждут проверки</small><strong>{knownUnchecked.length ? unchecked : '—'}</strong><em>{knownUnchecked.length ? 'по данным добавленных курсов' : 'данные пока не получены'}</em></div></Card><Card className="metric"><span className="metric__icon metric__icon--green"><Users /></span><div><small>Работы в системе</small><strong>{workCount}</strong><em>{draftCount ? `${draftCount} ещё не включены для групп` : 'все работы распределены'}</em></div></Card><Card className="metric"><span className="metric__icon metric__icon--blue"><CheckCircle2 /></span><div><small>Сдачи</small><strong>{knownSubmissionCounts.length ? submissions : '—'}</strong><em>{knownSubmissionCounts.length ? 'по данным работ' : 'данные пока не получены'}</em></div></Card><Card className="metric"><span className="metric__icon metric__icon--purple"><ShieldAlert /></span><div><small>{remoteSyncing && !syncIssues ? 'Курсы синхронизируются' : 'Курсы требуют внимания'}</small><strong>{remoteSyncing && !syncIssues ? syncingCourseIds.length : syncIssues}</strong><em>{remoteSyncing && !syncIssues ? 'обновляются на сервере' : syncIssues ? 'нужно повторить синхронизацию' : 'все курсы актуальны'}</em></div></Card></div>
     <div className="dashboard-columns"><section><div className="section-heading"><div><h2>Курсы</h2><p>Данные доступных курсов</p></div><Link to="/courses">Все курсы</Link></div><Card className="list-card">{courses.length ? courses.map((course) => <Link to={`/courses/${course.id}`} className="course-list-item" key={course.id}><span className="course-avatar">{course.shortName.slice(0, 2)}</span><span><strong>{course.title}</strong><small>{course.term || 'Период не указан'}{course.activeCount !== undefined ? ` · ${course.activeCount} работ` : ''}</small></span><Badge tone={course.syncStatus === 'SYNCED' ? 'success' : course.syncStatus === 'SYNCING' ? 'info' : course.syncStatus === 'ERROR' ? 'danger' : 'warning'}>{course.syncStatus === 'SYNCED' ? 'Синхронизирован' : course.syncStatus === 'SYNCING' ? 'Синхронизируется' : course.syncStatus === 'ERROR' ? 'Ошибка синхронизации' : 'Нужна синхронизация'}</Badge><ArrowRight /></Link>) : <EmptyState icon={<BookOpen />} title="Курсов пока нет" text="Добавьте курс в настройках системы и выполните синхронизацию LMS." />}</Card></section>
       <section><div className="section-heading"><div><h2>Ближайшие события</h2><p>Контрольные и экзамены</p></div></div><Card className="timeline-card">{assessments.some((item) => ['CONTROL', 'EXAM'].includes(item.kind)) ? assessments.filter((item) => ['CONTROL', 'EXAM'].includes(item.kind)).slice(0, 3).map((item) => <div className="timeline-event" key={item.id}><div><strong>{item.startsAt ? new Date(item.startsAt).getDate() : '—'}</strong><small>{item.startsAt ? new Intl.DateTimeFormat('ru', { month: 'short' }).format(new Date(item.startsAt)) : ''}</small></div><span><strong>{item.title}</strong><small>{item.durationMinutes} мин · {item.standard}</small></span><Badge tone="neutral">{statusLabel[item.status]}</Badge></div>) : <EmptyState icon={<Clock3 />} title="Событий пока нет" text="Опубликованные контрольные и экзамены появятся здесь." />}</Card></section></div>

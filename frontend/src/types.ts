@@ -56,6 +56,17 @@ export interface CourseSyncStatus {
   syncError?: LmsSyncDiagnostic;
 }
 
+export interface AssessmentSyncStatus {
+  assessmentId: string;
+  assessmentTitle?: string;
+  status: 'IDLE' | 'SYNCING' | 'COMPLETED' | 'PARTIAL' | 'FAILED';
+  lastError?: string;
+  errorCode?: string;
+  updatedAt?: string;
+  warnings?: MoodleHistoryImportWarning[];
+  warningsDismissed?: boolean;
+}
+
 export interface CourseCatalogEntry {
   id: string;
   connectionId: string;
@@ -490,17 +501,31 @@ export interface CourseImportJob {
   error?: string;
 }
 
+export interface MoodleHistoryImportWarning {
+  id: string;
+  code: string;
+  message: string;
+  studentName?: string;
+  attemptId?: string;
+  responseLabel?: string;
+  submissionId?: string;
+  moodleUrl?: string;
+}
+
 export interface MoodleHistoryImportEvent {
   id: string;
   courseId?: string;
   aggregateId: string;
   assessmentTitle?: string;
   lastError?: string;
+  errorCode?: string;
   actorKey?: string;
-  state: 'PENDING' | 'PROCESSING' | 'RETRY' | 'DELIVERED' | 'FAILED' | 'BLOCKED';
+  state: 'PENDING' | 'PROCESSING' | 'RETRY' | 'DELIVERED' | 'PARTIAL' | 'FAILED' | 'BLOCKED';
   createdAt: string;
   updatedAt: string;
   receipt: Record<string, unknown>;
+  warnings?: MoodleHistoryImportWarning[];
+  warningsDismissed?: boolean;
 }
 
 export interface TaskBankItem {

@@ -4,6 +4,7 @@ import base64
 import hashlib
 from pathlib import Path
 
+import httpx
 import pytest
 
 from moodle_browser.config import Settings
@@ -26,6 +27,31 @@ from moodle_browser.service import (
 
 FIXTURES = Path(__file__).parent / "fixtures"
 BASE_URL = "https://edu.mmcs.sfedu.ru"
+
+
+def test_history_revision_uses_validated_digest_without_copying_archive_base64(monkeypatch):
+    from moodle_browser import historical
+
+    original_hash = historical.canonical_hash
+    observed = []
+
+    def hash_projection(value):
+        observed.append(value)
+        return original_hash(value)
+
+    monkeypatch.setattr(historical, "canonical_hash", hash_projection)
+    artifact = {"sha256": "a" * 64, "size_bytes": 100, "content_base64": "payload"}
+    item = {
+        "module": "quiz", "cmid": 1, "attempt_id": "1",
+        "responses": [{"artifacts": [artifact]}],
+    }
+    first = finalize_historical_submission(item)
+    assert "content_base64" not in observed[0]["responses"][0]["artifacts"][0]
+    assert first["responses"][0]["artifacts"][0]["content_base64"] == "payload"
+    assert artifact["content_base64"] == "payload"
+    artifact["sha256"] = "b" * 64
+    second = finalize_historical_submission(item)
+    assert first["external_revision"] != second["external_revision"]
 
 
 def fixture(name: str) -> str:
@@ -650,21 +676,32 @@ def test_quiz_review_recognizes_7z_as_the_essay_attachment() -> None:
 
 
 @pytest.mark.asyncio
-async def test_historical_artifact_download_keeps_7z_bytes_bounded() -> None:
+async def test_historical_artifact_download_keeps_7z_bytes_bounded(monkeypatch) -> None:
     content = b"7z\xbc\xaf'\x1c" + b"bounded-archive"
     encoded = base64.b64encode(content).decode("ascii")
 
+    def download(request):
+        assert str(request.url) == (
+            f"{BASE_URL}/pluginfile.php/123/question/response_attachments/1/SAM4.7z"
+        )
+        return httpx.Response(
+            200,
+            stream=httpx.ByteStream(content),
+            headers={"content-type": "application/x-7z-compressed"},
+        )
+
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "moodle_browser.service.httpx.AsyncClient",
+        lambda **kwargs: original_client(transport=httpx.MockTransport(download), **kwargs),
+    )
+
+    class FakeContext:
+        async def cookies(self, _url):
+            return []
+
     class FakePage:
-        async def evaluate(self, _script: str, payload: dict[str, object]):
-            assert payload["url"] == (
-                f"{BASE_URL}/pluginfile.php/123/question/response_attachments/1/SAM4.7z"
-            )
-            assert payload["maxBytes"] == 1_024
-            return {
-                "size": len(content),
-                "contentType": "application/x-7z-compressed",
-                "contentBase64": encoded,
-            }
+        context = FakeContext()
 
     service = MoodleBrowserService(Settings(shared_secret=b"x" * 32))
     artifact, consumed = await service._historical_artifact(
@@ -685,32 +722,33 @@ async def test_historical_artifact_download_keeps_7z_bytes_bounded() -> None:
 
 
 @pytest.mark.asyncio
-async def test_historical_artifact_uses_authenticated_browser_request_context() -> None:
+async def test_historical_artifact_streams_with_url_scoped_browser_cookies(monkeypatch) -> None:
     content = b"7z\xbc\xaf'\x1c" + b"authenticated-download"
+    url = f"{BASE_URL}/pluginfile.php/123/question/response_attachments/1/SAM4.7z"
 
-    class FakeResponse:
-        url = f"{BASE_URL}/pluginfile.php/123/question/response_attachments/1/SAM4.7z"
-        ok = True
-        status = 200
-        headers = {
-            "content-type": "application/x-7z-compressed",
-            "content-length": str(len(content)),
-        }
+    def download(request):
+        assert str(request.url) == url
+        assert request.headers["cookie"] == "MoodleSession=test-session"
+        assert request.headers["accept-encoding"] == "identity"
+        return httpx.Response(
+            200,
+            stream=httpx.ByteStream(content),
+            headers={"content-type": "application/x-7z-compressed"},
+        )
 
-        async def body(self) -> bytes:
-            return content
+    original_client = httpx.AsyncClient
 
-        async def dispose(self) -> None:
-            return None
+    def client(**kwargs):
+        assert kwargs["trust_env"] is False
+        assert kwargs["follow_redirects"] is False
+        return original_client(transport=httpx.MockTransport(download), **kwargs)
 
-    class FakeRequest:
-        async def get(self, url: str, *, timeout: int):
-            assert url == FakeResponse.url
-            assert timeout == 10_000
-            return FakeResponse()
+    monkeypatch.setattr("moodle_browser.service.httpx.AsyncClient", client)
 
     class FakeContext:
-        request = FakeRequest()
+        async def cookies(self, target):
+            assert target == url
+            return [{"name": "MoodleSession", "value": "test-session"}]
 
     class FakePage:
         context = FakeContext()
@@ -724,7 +762,7 @@ async def test_historical_artifact_uses_authenticated_browser_request_context() 
         {
             "external_id": "b" * 64,
             "filename": "SAM4.7z",
-            "url": FakeResponse.url,
+            "url": url,
         },
         maximum_bytes=1_024,
     )

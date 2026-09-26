@@ -62,7 +62,8 @@ def test_login_intersects_catalog_with_the_users_moodle_dashboard() -> None:
         ("quiz", "Exam 1", "General", True),
         ("quiz", "Самостоятельная работа №1", "АРХИВ", False),
         ("assign", "Archive lab", "General", False),
-        ("quiz", "Индивидуальное задание", "Индивидуальные", False),
+        ("quiz", "Индивидуальное задание", "Индивидуальные", True),
+        ("assign", "Задание 1", "Общее", True),
         ("resource", "Лабораторная работа", "Лабораторные", False),
     ],
 )
@@ -82,7 +83,7 @@ def test_activity_detail_selection_matches_materialized_assessment_families(
 
 
 @pytest.mark.asyncio
-async def test_course_enrichment_skips_details_for_archived_and_unclassified_activities() -> None:
+async def test_activity_enrichment_accepts_generic_titles_but_skips_archives() -> None:
     class EnrichmentService(MoodleBrowserService):
         def __init__(self) -> None:
             super().__init__(Settings(shared_secret=b"x" * 32))
@@ -133,8 +134,9 @@ async def test_course_enrichment_skips_details_for_archived_and_unclassified_act
         object(), object(), "549", course, participant_ids=frozenset()
     )
 
-    assert len(service.urls) == 2
-    assert all("30354" in url for url in service.urls)
+    assert len(service.urls) == 3
+    assert service.urls[0].endswith("/course/modedit.php?update=2&return=1")
+    assert all("30354" in url for url in service.urls[1:])
     assert [
         activity["cmid"] for section in enriched["sections"] for activity in section["activities"]
     ] == [1, 2, 30354]

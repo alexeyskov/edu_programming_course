@@ -19,11 +19,11 @@ def test_documented_lms_worker_environment_aliases() -> None:
         APP_SECRET_KEY="test-secret-key-with-more-than-thirty-two-characters",
         LMS_CHECKPOINT_MAX_FILES=77,
         LMS_SYNC_RECEIPT_MAX_BYTES=70_000,
-        LMS_SYNC_COURSE_INTERVAL_SECONDS=123,
     )
     assert settings.sync_checkpoint_max_files == 77
     assert settings.sync_receipt_max_bytes == 70_000
-    assert settings.sync_course_interval_seconds == 123
+    assert not hasattr(settings, "sync_course_interval_seconds")
+    assert "sync_course_interval_seconds" not in Settings.model_fields
 
 
 async def _teacher_login(

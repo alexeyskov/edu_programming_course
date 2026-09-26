@@ -60,13 +60,24 @@ def _name_words(value: str) -> list[str]:
     return [word.replace("ё", "е").casefold() for word in _NAME_WORD_RE.findall(value)]
 
 
-def _without_redundant_compact_initials(words: list[str]) -> list[str]:
+def _without_redundant_compact_initials(
+    words: list[str], *, allow_reversed_avatar: bool = False,
+) -> list[str]:
     """Drop UI-style leading initials only when the remaining name proves them."""
 
     if len(words) < 3 or not (1 <= len(words[0]) <= 3):
         return words
     remaining_initials = "".join(word[0] for word in words[1:] if word)
-    return words[1:] if words[0] == remaining_initials[: len(words[0])] else words
+    # Some Moodle themes generate the two-letter avatar surname-first while
+    # displaying the full name given-name-first ("КА Алексей Коваленко").
+    # Strip only a marker proved by both full-name initials, never an arbitrary
+    # short word: the remaining surname/initial checks still control access.
+    reversed_avatar = (
+        allow_reversed_avatar and len(words) == 3 and words[0] == remaining_initials[::-1]
+    )
+    if words[0] == remaining_initials[: len(words[0])] or reversed_avatar:
+        return words[1:]
+    return words
 
 
 def legacy_subgroup_is_assigned_to_teacher(group_name: str, teacher_display_name: str) -> bool:
@@ -83,7 +94,11 @@ def legacy_subgroup_is_assigned_to_teacher(group_name: str, teacher_display_name
     # Moodle group labels sometimes append unrelated metadata after a delimiter.
     assigned_label = re.split(r"[;,|/]", match.group(1), maxsplit=1)[0]
     assigned = _name_words(assigned_label)
-    teacher = _without_redundant_compact_initials(_name_words(teacher_display_name))
+    raw_words = teacher_display_name.split()
+    teacher = _without_redundant_compact_initials(
+        _name_words(teacher_display_name),
+        allow_reversed_avatar=bool(raw_words and raw_words[0].isupper()),
+    )
     if len(assigned) < 2 or len(teacher) < 2:
         return False
     surname, qualifiers = assigned[0], assigned[1:]
@@ -123,6 +138,7 @@ async def _ordinary_review_assignments(
     *,
     principal_id: uuid.UUID,
     assessment_id: uuid.UUID | None = None,
+    course_id: uuid.UUID | None = None,
 ) -> dict[uuid.UUID, set[uuid.UUID]]:
     """Return student principals visible to a token-authorized teacher per course."""
 
@@ -145,6 +161,8 @@ async def _ordinary_review_assignments(
             LMSConnection.enabled.is_(True),
         )
     )
+    if course_id is not None:
+        teacher_statement = teacher_statement.where(CourseMembership.course_id == course_id)
     teacher_memberships = list((await db.scalars(teacher_statement)).all())
     if assessment_id is not None:
         assessment = await db.get(Assessment, assessment_id)
@@ -234,6 +252,16 @@ async def _ordinary_review_assignments(
                 student_membership.principal_id
             )
     return allowed
+
+
+async def review_student_ids_for_course(
+    db: AsyncSession, *, principal_id: uuid.UUID, course_id: uuid.UUID,
+) -> set[uuid.UUID]:
+    """The same group scope for diagnostics, including not-yet-imported answers."""
+    assignments = await _ordinary_review_assignments(
+        db, principal_id=principal_id, course_id=course_id,
+    )
+    return assignments.get(course_id, set())
 
 
 async def publication_group_ids_for_teacher(

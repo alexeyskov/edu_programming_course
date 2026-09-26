@@ -200,6 +200,69 @@ class MoodleBrowserHistoricalSubmissionsResult:
     complete: bool
     warnings: tuple[str, ...]
     storage_state: dict[str, Any]
+    deleted_attempt_ids: tuple[str, ...] = ()
+    scan_only: bool = False
+    candidates: tuple[dict[str, Any], ...] = ()
+    activity_metadata: dict[str, Any] | None = None
+
+
+def normalize_history_attempt_refs(
+    values: object,
+    module: str,
+    *,
+    maximum: int,
+) -> list[dict[str, Any]]:
+    """Validate the small report-only contract before persisting/replaying it."""
+    if not isinstance(values, list) or len(values) > maximum:
+        raise IntegrationProtocolError("Moodle historical attempt references are invalid")
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, dict):
+            raise IntegrationProtocolError("Moodle historical attempt reference is invalid")
+        user = value.get("user_id")
+        attempt = value.get("attempt_id")
+        name = value.get("display_name")
+        epoch = value.get("submitted_at_epoch", 0)
+        state = value.get("state")
+        if (
+            not isinstance(user, str)
+            or not re.fullmatch(r"[1-9][0-9]{0,19}", user)
+            or not isinstance(attempt, str)
+            or not re.fullmatch(
+                r"[1-9][0-9]{0,19}" if module == "quiz" else rf"user-{user}-attempt-[0-9]{{1,7}}",
+                attempt,
+            )
+            or attempt in seen
+            or not isinstance(name, str)
+            or not name.strip()
+            or len(name) > 255
+            or type(epoch) is not int
+            or not 0 <= epoch < 2**63
+            or state not in {"IN_PROGRESS", "SUBMITTED", "GRADED", "UNKNOWN"}
+        ):
+            raise IntegrationProtocolError("Moodle historical attempt reference is invalid")
+        item = {
+            "user_id": user,
+            "attempt_id": attempt,
+            "display_name": name.strip(),
+            "submitted_at_epoch": epoch,
+            "state": state,
+        }
+        for field in ("grade", "grade_max"):
+            number = value.get(field)
+            if number is not None and (
+                type(number) not in {int, float}
+                or not math.isfinite(number)
+                or number < 0
+                or number > 1_000_000
+                or (field == "grade_max" and number == 0)
+            ):
+                raise IntegrationProtocolError("Moodle historical report grade is invalid")
+            item[field] = number
+        seen.add(attempt)
+        result.append(item)
+    return result
 
 
 class MoodleBrowserClient:
@@ -252,11 +315,16 @@ class MoodleBrowserClient:
         self.response_limit = int(
             getattr(settings, "moodle_browser_max_response_bytes", 4 * 1024 * 1024)
         )
+        self.history_response_limit = int(
+            getattr(settings, "moodle_browser_history_max_response_bytes", 160 * 1024 * 1024)
+        )
         self.storage_state_limit = int(
             getattr(settings, "moodle_browser_storage_state_max_bytes", 256 * 1024)
         )
         if self.request_limit < 1024 or self.response_limit < 1024:
             raise IntegrationConfigurationError("Moodle browser transport size limits are invalid")
+        if not 16 * 1024 <= self.history_response_limit <= 160 * 1024 * 1024:
+            raise IntegrationConfigurationError("Moodle browser history size limit is invalid")
         if not 16 * 1024 <= self.storage_state_limit <= min(self.request_limit, 1024 * 1024):
             raise IntegrationConfigurationError("Moodle browser state size limit is invalid")
         if bool(getattr(client, "follow_redirects", False)):
@@ -997,6 +1065,12 @@ class MoodleBrowserClient:
         cursor: str = "0:0",
         limit: int = 10,
         priority_only: bool = False,
+        known_attempt_ids: tuple[str, ...] | list[str] = (),
+        scan_only: bool = False,
+        attempt_refs: list[dict[str, Any]] | None = None,
+        include_activity_metadata: bool = False,
+        probe_only: bool = False,
+        attachment_delivery: Literal["inline", "reference"] = "inline",
     ) -> MoodleBrowserHistoricalSubmissionsResult:
         normalized_course = self._positive_id(course_id, "Moodle course id")
         actor_id = self._positive_id(actor_external_subject, "Moodle actor external subject")
@@ -1010,9 +1084,43 @@ class MoodleBrowserClient:
             raise IntegrationProtocolError("Moodle historical page size is invalid")
         if not isinstance(priority_only, bool):
             raise IntegrationProtocolError("Moodle historical priority flag is invalid")
+        if not isinstance(scan_only, bool) or (scan_only and attempt_refs):
+            raise IntegrationProtocolError("Moodle historical scan mode is invalid")
+        if not isinstance(include_activity_metadata, bool) or (
+            include_activity_metadata and (not scan_only or cursor != "0:0")
+        ):
+            raise IntegrationProtocolError("Moodle activity metadata requires initial inventory")
+        if not isinstance(probe_only, bool) or (
+            probe_only
+            and (
+                not scan_only
+                or normalized_module != "quiz"
+                or not known_attempt_ids
+                or attempt_refs
+                or include_activity_metadata
+            )
+        ):
+            raise IntegrationProtocolError("Moodle deletion-only request is invalid")
+        refs = normalize_history_attempt_refs(attempt_refs or [], normalized_module, maximum=5)
+        if attachment_delivery not in {"inline", "reference"}:
+            raise IntegrationProtocolError("Moodle attachment delivery mode is invalid")
+        if (
+            not isinstance(known_attempt_ids, list | tuple)
+            or len(known_attempt_ids) > 5
+            or (known_attempt_ids and normalized_module != "quiz")
+        ):
+            raise IntegrationProtocolError("Moodle attempt deletion probe is invalid")
+        probe_ids = [
+            self._positive_id(value, "Moodle known attempt id") for value in known_attempt_ids
+        ]
+        if len(set(probe_ids)) != len(probe_ids):
+            raise IntegrationProtocolError(
+                "Moodle attempt deletion probe has duplicate identifiers"
+            )
         result = await self._call(
             "discover_historical_submissions",
             {
+                "attachment_delivery": attachment_delivery,
                 "schema_version": "1.0",
                 "base_url": self.base_url,
                 "course_id": normalized_course,
@@ -1021,6 +1129,11 @@ class MoodleBrowserClient:
                 "cursor": cursor,
                 "limit": limit,
                 "priority_only": priority_only,
+                **({"scan_only": True} if scan_only else {}),
+                **({"include_activity_metadata": True} if include_activity_metadata else {}),
+                **({"probe_only": True} if probe_only else {}),
+                **({"attempt_refs": refs} if refs else {}),
+                **({"known_attempt_ids": probe_ids} if probe_ids else {}),
                 "storage_state": self._required_storage_state(),
             },
         )
@@ -1035,6 +1148,25 @@ class MoodleBrowserClient:
         response_cmid = self._positive_int(activity.get("cmid"), "Moodle activity id")
         if response_module != normalized_module or response_cmid != normalized_cmid:
             raise IntegrationProtocolError("Moodle historical response identifies another activity")
+        activity_metadata = result.get("activity_metadata")
+        if activity_metadata is not None:
+            if (
+                not include_activity_metadata
+                or not isinstance(activity_metadata, dict)
+                or activity_metadata.get("module") != normalized_module
+                or self._positive_int(activity_metadata.get("cmid"), "Moodle activity id")
+                != normalized_cmid
+            ):
+                raise IntegrationProtocolError("Moodle activity metadata identifies another target")
+            try:
+                canonical_json(activity_metadata)
+            except (TypeError, ValueError) as exc:
+                raise IntegrationProtocolError(
+                    "Moodle activity metadata is not finite JSON"
+                ) from exc
+            activity_metadata = dict(activity_metadata)
+        elif include_activity_metadata:
+            raise IntegrationProtocolError("Moodle activity metadata is missing")
         raw_items = result.get("items")
         if not isinstance(raw_items, list) or len(raw_items) > limit:
             raise IntegrationProtocolError("Moodle historical submissions have an invalid shape")
@@ -1067,6 +1199,23 @@ class MoodleBrowserClient:
                     "user_id": user_id,
                 }
             )
+        if result.get("scan_only", False) is not scan_only:
+            raise IntegrationProtocolError("Moodle historical scan mode changed")
+        candidates = normalize_history_attempt_refs(
+            result.get("candidates", []),
+            normalized_module,
+            maximum=500 if scan_only else 0,
+        )
+        if scan_only and items:
+            raise IntegrationProtocolError("Moodle inventory unexpectedly contains answer files")
+        if probe_only and (candidates or result.get("next_cursor") is not None):
+            raise IntegrationProtocolError("Moodle deletion-only response contains inventory")
+        if refs:
+            expected = {(item["attempt_id"], item["user_id"]) for item in refs}
+            if any((item.get("attempt_id"), item["user_id"]) not in expected for item in items):
+                raise IntegrationProtocolError(
+                    "Moodle historical detail identifies another attempt"
+                )
         next_cursor_raw = result.get("next_cursor")
         next_cursor = None
         if next_cursor_raw is not None:
@@ -1080,6 +1229,19 @@ class MoodleBrowserClient:
         warnings = tuple(
             self._required_text(value, 500, "Moodle historical warning") for value in raw_warnings
         )
+        raw_deleted = result.get("deleted_attempt_ids", [])
+        if not isinstance(raw_deleted, list) or len(raw_deleted) > len(probe_ids):
+            raise IntegrationProtocolError("Moodle deleted attempt identifiers are invalid")
+        deleted_ids = tuple(
+            self._positive_id(value, "Moodle deleted attempt id") for value in raw_deleted
+        )
+        present_ids = {str(item.get("attempt_id", "")) for item in [*items, *candidates]}
+        if (
+            len(set(deleted_ids)) != len(deleted_ids)
+            or not set(deleted_ids).issubset(probe_ids)
+            or set(deleted_ids).intersection(present_ids)
+        ):
+            raise IntegrationProtocolError("Moodle deleted attempt proof has another target")
         refreshed_state = self._response_storage_state(result)
         self._storage_state = refreshed_state
         return MoodleBrowserHistoricalSubmissionsResult(
@@ -1091,6 +1253,10 @@ class MoodleBrowserClient:
             complete=complete,
             warnings=warnings,
             storage_state=self.storage_state or {},
+            deleted_attempt_ids=deleted_ids,
+            scan_only=scan_only,
+            candidates=tuple(candidates),
+            activity_metadata=activity_metadata,
         )
 
     async def _call(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1125,7 +1291,11 @@ class MoodleBrowserClient:
                 "POST",
                 f"{self.service_url}{path}",
                 timeout_seconds=self.timeout_seconds,
-                response_limit=self.response_limit,
+                response_limit=(
+                    self.history_response_limit
+                    if operation == "discover_historical_submissions"
+                    else self.response_limit
+                ),
                 headers={
                     "Content-Type": "application/json",
                     "Accept": "application/json",
@@ -1134,6 +1304,7 @@ class MoodleBrowserClient:
                     "X-Moodle-Signature": f"v1={signature}",
                 },
                 content=body,
+                offload_json=operation == "discover_historical_submissions",
             )
         except IntegrationUnavailable as exc:
             cause = exc.__cause__
@@ -1162,9 +1333,13 @@ class MoodleBrowserClient:
             if status_code == 503 and isinstance(cause, httpx.HTTPStatusError):
                 diagnostic = cause.response.headers.get("X-Moodle-Error-Code")
                 if diagnostic in {
-                    "MOODLE_RESPONSE_TIMEOUT", "MOODLE_DOCUMENT_TIMEOUT",
-                    "MOODLE_DNS_ERROR", "MOODLE_CONNECTION_ERROR", "MOODLE_TLS_ERROR",
-                    "MOODLE_HTTP_ERROR", "MOODLE_NAVIGATION_ERROR",
+                    "MOODLE_RESPONSE_TIMEOUT",
+                    "MOODLE_DOCUMENT_TIMEOUT",
+                    "MOODLE_DNS_ERROR",
+                    "MOODLE_CONNECTION_ERROR",
+                    "MOODLE_TLS_ERROR",
+                    "MOODLE_HTTP_ERROR",
+                    "MOODLE_NAVIGATION_ERROR",
                 }:
                     # Keep the cause in durable outbox diagnostics while
                     # preserving retries. Never relay arbitrary headers/bodies.
@@ -1218,13 +1393,16 @@ class MoodleBrowserClient:
                 # transport. Accept only known codes from the internal service.
                 diagnostic = cause.response.headers.get("X-Moodle-Error-Code")
                 if operation == "discover_historical_submissions" and diagnostic in (
-                    "ASSIGN_TABLE_NOT_FOUND", "QUIZ_TABLE_NOT_FOUND"
+                    "ASSIGN_TABLE_NOT_FOUND",
+                    "QUIZ_TABLE_NOT_FOUND",
                 ):
                     raise IntegrationProtocolError(
                         f"{diagnostic}: Moodle submissions table was not recognized"
                     ) from exc
                 if diagnostic in {
-                    "UPLOAD_INVALID_FILE", "UPLOAD_INVALID_TYPE", "UPLOAD_TOO_LARGE",
+                    "UPLOAD_INVALID_FILE",
+                    "UPLOAD_INVALID_TYPE",
+                    "UPLOAD_TOO_LARGE",
                     "UPLOAD_REJECTED",
                 }:
                     raise IntegrationProtocolError(
@@ -1525,6 +1703,18 @@ class MoodleBrowserClient:
             role = self._optional_text(raw.get("role"), 32).upper()
             if role not in {"STUDENT", "TEACHER"}:
                 raise IntegrationProtocolError("Moodle browser participant role is invalid")
+            roles = raw.get("roles", [role])
+            if (
+                not isinstance(roles, list)
+                or not 1 <= len(roles) <= 2
+                or any(
+                    not isinstance(item, str) or item not in {"STUDENT", "TEACHER"}
+                    for item in roles
+                )
+                or len(set(roles)) != len(roles)
+                or role != ("TEACHER" if "TEACHER" in roles else "STUDENT")
+            ):
+                raise IntegrationProtocolError("Moodle browser participant roles are invalid")
             raw_groups = raw.get("groups", [])
             if not isinstance(raw_groups, list) or len(raw_groups) > _MAX_GROUPS_PER_PARTICIPANT:
                 raise IntegrationProtocolError("Moodle browser participant groups are invalid")
@@ -1545,7 +1735,7 @@ class MoodleBrowserClient:
                     "email": self._optional_text(raw.get("email"), 320),
                     "suspended": self._bool(raw.get("suspended"), default=False),
                     "role": role,
-                    "roles": [role],
+                    "roles": list(roles),
                     "groups": groups,
                 }
             )

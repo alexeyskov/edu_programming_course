@@ -3,11 +3,11 @@ import {
   Search, ShieldQuestion, UserCheck,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
+import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { Badge, Button, Card, EmptyState, InlineError, PageLoader, useToast } from '../components/ui';
 import { api } from '../lib/api';
 import { formatDate } from '../lib/utils';
-import type { MoodleHistoryImportEvent, Submission } from '../types';
+import type { MoodleHistoryImportEvent, MoodleHistoryImportWarning, Submission } from '../types';
 
 type SubmissionView = 'all' | 'pending' | 'reviewed';
 
@@ -18,6 +18,11 @@ const views: Array<{ id: SubmissionView; label: string }> = [
 ];
 
 function historyFailureMessage(event: MoodleHistoryImportEvent): string {
+  if (event.errorCode && event.lastError) {
+    // The manual-status endpoint returns a localized, sanitized explanation,
+    // not a raw connector exception or a Moodle response body.
+    return `${event.lastError} Код: ${event.errorCode}.`;
+  }
   if (/^INVALID_RESPONSE: (ASSIGN|QUIZ)_TABLE_NOT_FOUND:/.test(event.lastError ?? '')) {
     return 'Не распознана таблица сдач Moodle. Требуется проверка совместимости коннектора; это не означает отсутствие работ.';
   }
@@ -34,41 +39,94 @@ function historyFailureMessage(event: MoodleHistoryImportEvent): string {
   return 'Импорт этой работы завершился с ошибкой. Повторите загрузку; если ошибка повторится, сообщите администратору.';
 }
 
+function HistoryImportProblems({ event, warnings, dismissing, onDismiss, reviewSearch }: {
+  event: MoodleHistoryImportEvent;
+  warnings: MoodleHistoryImportWarning[];
+  dismissing: boolean;
+  onDismiss(): void;
+  reviewSearch: string;
+}) {
+  return <section className="history-import-problems" aria-label={event.assessmentTitle ?? 'Проблемы синхронизации'}>
+    <small>{event.assessmentTitle && <b>{event.assessmentTitle}: </b>}{warnings.length ? 'Ответы, требующие внимания:' : historyFailureMessage(event)}</small>
+    {warnings.length > 0 && <ul className="history-import-problems__list" aria-label="Ответы с проблемами синхронизации">
+      {warnings.map((warning) => <li key={warning.id}>
+        <div>
+          <strong>{warning.studentName ?? 'Общие данные синхронизации'}</strong>
+          {(warning.attemptId || warning.responseLabel) && <small>{[warning.attemptId && `Попытка ${warning.attemptId}`, warning.responseLabel].filter(Boolean).join(' · ')}</small>}
+          <small>{warning.message} Код: {warning.code}.</small>
+        </div>
+        <div className="history-import-problems__links">
+          {warning.submissionId && <Link to={`/review/${warning.submissionId}${reviewSearch}`} target="_blank" rel="noopener noreferrer">Ответ в системе</Link>}
+          {warning.moodleUrl && <a href={warning.moodleUrl} target="_blank" rel="noopener noreferrer">Открыть в Moodle</a>}
+          {!warning.studentName && <small>Подробности по отдельным студентам недоступны.</small>}
+        </div>
+      </li>)}
+    </ul>}
+    {warnings.length > 0 && <div className="history-import-problems__dismiss">
+      <Button size="sm" variant="secondary" loading={dismissing} onClick={onDismiss}>Скрыть предупреждение</Button>
+      <small>Скрывается только для вас. Новые проблемы появятся отдельно.</small>
+    </div>}
+  </section>;
+}
+
 export function SubmissionsPage() {
   const [items, setItems] = useState<Submission[]>([]);
   const [historyImports, setHistoryImports] = useState<MoodleHistoryImportEvent[]>([]);
   const [historyStatusError, setHistoryStatusError] = useState(false);
+  const [dismissedWarningIds, setDismissedWarningIds] = useState<Set<string>>(() => new Set());
+  const [dismissingWarnings, setDismissingWarnings] = useState<Set<string>>(() => new Set());
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [historyRefreshing, setHistoryRefreshing] = useState(false);
+  const hasLoadedSubmissions = useRef(false);
+  const submissionsInFlight = useRef(false);
+  const historyInFlight = useRef(false);
   const [claiming, setClaiming] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [searchParams, setSearchParams] = useSearchParams();
   const location = useLocation();
   const navigate = useNavigate();
   const toast = useToast();
-  const autoRefreshAttempts = useRef(0);
   const requestedView = searchParams.get('view');
   const view: SubmissionView = requestedView === 'pending' || requestedView === 'reviewed' ? requestedView : 'all';
   const query = searchParams.get('q') ?? '';
 
-  const load = useCallback(async (silent = false) => {
-    if (silent) setRefreshing(true); else setLoading(true);
+  const loadSubmissions = useCallback(async () => {
+    if (submissionsInFlight.current) return;
+    submissionsInFlight.current = true;
+    if (hasLoadedSubmissions.current) setRefreshing(true); else setLoading(true);
     try {
-      const [submissions, imports] = await Promise.allSettled([
-        api.getSubmissions(),
-        api.getMoodleHistoryImportEvents(),
-      ]);
-      if (submissions.status === 'rejected') throw submissions.reason;
-      setItems(submissions.value);
-      if (imports.status === 'fulfilled') setHistoryImports(imports.value);
-      setHistoryStatusError(imports.status === 'rejected');
+      setItems(await api.getSubmissions());
+      hasLoadedSubmissions.current = true;
       setError(null);
     }
     catch (caught) { setError(caught instanceof Error ? caught.message : 'Не удалось получить работы'); }
     finally {
-      if (silent) setRefreshing(false); else setLoading(false);
+      submissionsInFlight.current = false;
+      setRefreshing(false);
+      setLoading(false);
     }
   }, []);
+  const loadHistoryStatus = useCallback(async () => {
+    if (historyInFlight.current) return;
+    historyInFlight.current = true;
+    setHistoryRefreshing(true);
+    try {
+      setHistoryImports(await api.getMoodleHistoryImportEvents());
+      setHistoryStatusError(false);
+    } catch { setHistoryStatusError(true); }
+    finally {
+      historyInFlight.current = false;
+      setHistoryRefreshing(false);
+    }
+  }, []);
+  const load = useCallback(() => {
+    // Reviewable answers must not wait for the status of every course. These
+    // requests also have independent in-flight guards so a slow status read
+    // cannot stop the list from refreshing as more answers are committed.
+    void loadSubmissions();
+    void loadHistoryStatus();
+  }, [loadSubmissions, loadHistoryStatus]);
   const latestHistoryImports = useMemo(() => {
     const result = new Map<string, MoodleHistoryImportEvent>();
     [...historyImports]
@@ -82,18 +140,28 @@ export function SubmissionsPage() {
     return [...result.values()];
   }, [historyImports]);
   const historyImportActive = latestHistoryImports.some((item) => ['PENDING', 'PROCESSING', 'RETRY'].includes(item.state));
-  const failedHistoryImports = latestHistoryImports.filter((item) => ['FAILED', 'BLOCKED'].includes(item.state));
+  // An explicit empty list without acknowledgement means no problems in this
+  // teacher's review scope. It must not produce a banner or an empty-list error.
+  const problemApplies = (item: MoodleHistoryImportEvent) => item.warnings === undefined || item.warnings.length > 0 || item.warningsDismissed === true;
+  const failedHistoryImports = latestHistoryImports.filter((item) => ['FAILED', 'BLOCKED'].includes(item.state) && problemApplies(item));
+  const partialHistoryImports = latestHistoryImports.filter((item) => item.state === 'PARTIAL' && problemApplies(item));
   const historyImportFailed = failedHistoryImports.length > 0;
+  const remainingWarnings = (item: MoodleHistoryImportEvent) => (item.warnings ?? []).filter((warning) => !dismissedWarningIds.has(warning.id));
+  const warningVisible = (item: MoodleHistoryImportEvent) => !item.warningsDismissed && (!item.warnings?.length || remainingWarnings(item).length > 0);
+  const visiblePartialImports = partialHistoryImports.filter(warningVisible);
+  const visibleFailedImports = failedHistoryImports.filter(warningVisible);
   useEffect(() => { void load(); }, [load]);
   useEffect(() => {
-    if (loading || refreshing || error || (!historyImportActive && items.length)
-      || (!historyImportActive && autoRefreshAttempts.current >= 20)) return undefined;
-    const timer = window.setTimeout(() => {
-      autoRefreshAttempts.current += 1;
-      void load(true);
-    }, historyImportActive ? 10_000 : 15_000);
-    return () => window.clearTimeout(timer);
-  }, [error, historyImportActive, items.length, load, loading, refreshing]);
+    // These reads update the local list after student deliveries or explicitly
+    // started teacher jobs; they never initiate synchronization with Moodle.
+    const refreshVisible = () => { if (!document.hidden) load(); };
+    const timer = window.setInterval(refreshVisible, historyImportActive ? 10_000 : 30_000);
+    document.addEventListener('visibilitychange', refreshVisible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', refreshVisible);
+    };
+  }, [historyImportActive, load]);
 
   const counts = useMemo(() => ({
     all: items.length,
@@ -132,35 +200,33 @@ export function SubmissionsPage() {
     } finally { setClaiming(null); }
   }
 
-  async function retryFailedHistoryImports() {
-    if (refreshing || !failedHistoryImports.length) return;
-    setRefreshing(true);
-    const results = await Promise.allSettled(
-      failedHistoryImports.map((item) => api.retryMoodleHistoryImport(item.id)),
-    );
-    const retried = results
-      .filter((result): result is PromiseFulfilledResult<MoodleHistoryImportEvent> => result.status === 'fulfilled')
-      .map((result) => result.value);
-    if (retried.length) {
-      const retriedIds = new Set(retried.map((item) => item.id));
-      setHistoryImports((current) => [...retried, ...current.filter((item) => !retriedIds.has(item.id))]);
-      autoRefreshAttempts.current = 0;
-      toast.push('info', 'Повторная загрузка запущена', 'Статус и список работ обновятся автоматически.');
+  async function dismissWarnings(item: MoodleHistoryImportEvent) {
+    if (dismissingWarnings.has(item.id)) return;
+    const ids = remainingWarnings(item).map((warning) => warning.id);
+    setDismissingWarnings((current) => new Set(current).add(item.id));
+    try {
+      for (let offset = 0; offset < ids.length; offset += 1000) {
+        const acknowledged = await api.dismissMoodleHistoryWarnings(item.aggregateId, ids.slice(offset, offset + 1000));
+        // Only server-confirmed ids are hidden. A slow poll or another import
+        // finishing during this click cannot hide a new problem or undo it.
+        setDismissedWarningIds((current) => new Set([...current, ...acknowledged]));
+      }
+      void loadHistoryStatus();
+    } catch {
+      toast.push('error', 'Не удалось скрыть предупреждение', 'Скрытие не сохранено. Попробуйте ещё раз.');
+    } finally {
+      setDismissingWarnings((current) => { const next = new Set(current); next.delete(item.id); return next; });
     }
-    if (retried.length !== results.length) {
-      toast.push('error', 'Не все задачи удалось перезапустить', 'Проверьте LMS-сессию и повторите попытку.');
-    }
-    setRefreshing(false);
   }
 
   if (loading) return <PageLoader label="Собираем сданные работы…" />;
-  if (error) return <InlineError message={error} retry={() => void load()} />;
+  if (error && !hasLoadedSubmissions.current) return <InlineError message={error} retry={load} />;
   const nextSubmission = items.find((item) => item.status === 'UNGRADED' && item.canReview !== false);
-  const historyUnavailable = historyStatusError || historyImportFailed;
+  const historyUnavailable = historyStatusError || historyImportFailed || partialHistoryImports.length > 0;
   const emptyState = !items.length && historyUnavailable
     ? { title: 'Список сдач пока не получен', text: 'Не удалось подтвердить загрузку сдач из Moodle. Пустой список не означает, что студенты ничего не сдали.' }
     : !items.length && historyImportActive
-      ? { title: 'Сдачи ещё загружаются', text: 'Дождитесь завершения импорта из Moodle. Список обновится автоматически.' }
+      ? { title: 'Сдачи ещё загружаются', text: 'Работы появятся по мере загрузки. Можно начинать проверку, не дожидаясь завершения всего импорта.' }
       : { title: emptyTitle(view), text: emptyText(view, items.length) };
   return <div className="content-width submissions-page">
     <div className="page-heading"><div><span className="eyebrow">Проверка</span><h1>Работы студентов</h1><p>Все сданные работы, ожидающие решения преподавателя, и уже утверждённые результаты.</p></div><Button disabled={!nextSubmission} onClick={() => { if (nextSubmission) void claimAndOpen(nextSubmission); }}><UserCheck size={17} /> Открыть следующую</Button></div>
@@ -169,9 +235,11 @@ export function SubmissionsPage() {
       {views.map((item) => <button key={item.id} type="button" role="tab" aria-selected={view === item.id} className={view === item.id ? 'is-active' : ''} onClick={() => setParam('view', item.id)}><span>{item.label}</span><strong>{counts[item.id]}</strong></button>)}
     </div>
 
-    {historyStatusError && <div className="history-import-status history-import-status--error" role="alert"><AlertTriangle size={17} /><span><strong>Не удалось проверить синхронизацию Moodle</strong><small>Статус импорта недоступен. Уже загруженные работы можно просматривать.</small></span><Button size="sm" variant="secondary" loading={refreshing} onClick={() => void load(true)}>Проверить статус</Button></div>}
-    {!historyStatusError && historyImportActive && <div className="history-import-status history-import-status--active" role="status"><RotateCcw className="spin" size={17} /><span><strong>Загружаем прошлые сдачи из Moodle</strong><small>Код, файлы, оценки и комментарии появляются постранично. Список обновится автоматически.</small></span></div>}
-    {!historyStatusError && historyImportFailed && <div className="history-import-status history-import-status--error" role="alert"><AlertTriangle size={17} /><span><strong>Часть прошлых сдач не загрузилась</strong>{failedHistoryImports.slice(0, 5).map((item) => <small key={item.id}>{item.assessmentTitle && <b>{item.assessmentTitle}: </b>}{historyFailureMessage(item)}</small>)}{failedHistoryImports.length > 5 && <small>Ещё работ с ошибками: {failedHistoryImports.length - 5}.</small>}{historyImportActive && <small>Другие работы продолжают загружаться. Уже загруженные сдачи доступны для проверки.</small>}</span><Button size="sm" variant="secondary" loading={refreshing} onClick={() => void retryFailedHistoryImports()}>Повторить загрузку</Button></div>}
+    {error && <div className="history-import-status history-import-status--error" role="alert"><AlertTriangle size={17} /><span><strong>Не удалось обновить список работ</strong><small>{error} Показан последний загруженный список.</small></span><Button size="sm" variant="secondary" loading={refreshing} onClick={() => void loadSubmissions()}>Обновить список</Button></div>}
+    {historyStatusError && <div className="history-import-status history-import-status--error" role="alert"><AlertTriangle size={17} /><span><strong>Не удалось проверить синхронизацию Moodle</strong><small>Статус импорта недоступен. Уже загруженные работы можно проверять.</small></span><Button size="sm" variant="secondary" loading={historyRefreshing} onClick={() => void loadHistoryStatus()}>Проверить статус</Button></div>}
+    {!historyStatusError && historyImportActive && <div className="history-import-status history-import-status--active" role="status"><RotateCcw className="spin" size={17} /><span><strong>Загружаем прошлые сдачи из Moodle</strong><small>Работы появляются по мере загрузки. Уже загруженные сдачи доступны для проверки — ждать завершения всего импорта не нужно.</small></span></div>}
+    {!historyStatusError && visiblePartialImports.length > 0 && <div className="history-import-status history-import-status--warning history-import-status--details" role="status"><AlertTriangle size={17} /><div className="history-import-status__content"><strong>Синхронизация завершена с предупреждениями</strong>{visiblePartialImports.map((item) => <HistoryImportProblems key={item.id} event={item} warnings={remainingWarnings(item)} dismissing={dismissingWarnings.has(item.id)} onDismiss={() => void dismissWarnings(item)} reviewSearch={location.search} />)}<small>Уже загруженные сдачи доступны для проверки. Чтобы дочитать недостающие данные, повторите синхронизацию нужной работы.</small></div><Link className="button button--secondary button--sm" to="/courses">К синхронизации работ</Link></div>}
+    {!historyStatusError && visibleFailedImports.length > 0 && <div className="history-import-status history-import-status--error history-import-status--details" role="alert"><AlertTriangle size={17} /><div className="history-import-status__content"><strong>Часть прошлых сдач не загрузилась</strong>{visibleFailedImports.map((item) => <HistoryImportProblems key={item.id} event={item} warnings={remainingWarnings(item)} dismissing={dismissingWarnings.has(item.id)} onDismiss={() => void dismissWarnings(item)} reviewSearch={location.search} />)}{historyImportActive && <small>Другие работы продолжают загружаться.</small>}<small>Уже загруженные сдачи доступны для проверки. Повторите синхронизацию нужной работы на странице «Курсы и работы».</small></div><Link className="button button--secondary button--sm" to="/courses">К синхронизации работ</Link></div>}
 
     <div className="filter-bar"><div className="search-input"><Search size={17} /><input value={query} onChange={(event) => setParam('q', event.target.value)} placeholder="Студент, группа, курс или работа" aria-label="Поиск по работам" /></div></div>
     {filtered.length ? <Card className="submission-table"><div className="submission-table__head"><span>Студент</span><span>Работа</span><span>Проверки</span><span>Статус</span><span>Действия</span></div>{filtered.map((item) => <div className="submission-row" key={item.id}>
@@ -180,7 +248,7 @@ export function SubmissionsPage() {
       <span className="evidence-cell"><Badge tone={item.risk === 'HIGH' ? 'danger' : item.risk === 'MEDIUM' ? 'warning' : item.risk === 'LOW' ? 'success' : 'neutral'}>{item.risk === 'HIGH' ? <AlertTriangle size={12} /> : <ShieldQuestion size={12} />} {riskLabel(item.risk)}</Badge></span>
       <span>{item.reviewRequired === false ? <Badge>Проверка не требуется</Badge> : item.status === 'CLAIMED' && item.claim ? <span className="claim-owner"><LockKeyhole size={14} /><span><strong>{item.claim.mine ? 'Вы проверяете' : item.claim.ownerName}</strong><small>до {formatDate(item.claim.expiresAt, { hour: '2-digit', minute: '2-digit' })}</small></span></span> : item.status === 'GRADED' ? <Badge tone="success"><CheckCircle2 size={12} /> {item.score}/{item.maxScore}</Badge> : item.status === 'CONFLICT' ? <Badge tone="danger">Конфликт LMS</Badge> : <Badge>Не проверено</Badge>}</span>
       <span className="submission-actions">{item.status === 'UNGRADED' && item.canReview !== false ? <Button size="sm" loading={claiming === item.id} onClick={() => void claimAndOpen(item)}><UserCheck size={14} /> Открыть</Button> : item.status === 'CLAIMED' ? <Button size="sm" variant={item.claim?.mine ? 'primary' : 'secondary'} onClick={() => navigate(reviewUrl(item))}><ArrowRight size={14} /> {item.claim?.mine ? 'Продолжить' : 'Открыть'}</Button> : item.status === 'GRADED' ? <><Button size="sm" variant="secondary" onClick={() => navigate(reviewUrl(item))}><ArrowRight size={14} /> Открыть результат</Button>{item.canReview !== false && <Button size="sm" variant="ghost" loading={claiming === item.id} onClick={() => void claimAndOpen(item, true)}><RotateCcw size={14} /> Перепроверить</Button>}</> : <Button size="sm" variant="secondary" onClick={() => navigate(reviewUrl(item))}><ArrowRight size={14} /> Открыть</Button>}</span>
-    </div>)}</Card> : <Card className="submission-empty"><EmptyState icon={<Inbox />} title={viewItems.length ? 'По запросу ничего не найдено' : emptyState.title} text={viewItems.length ? 'Измените поисковый запрос.' : emptyState.text} action={!viewItems.length && !items.length ? <Button variant="secondary" loading={refreshing} onClick={() => { autoRefreshAttempts.current = 0; void load(true); }}><RotateCcw size={15} /> Обновить список</Button> : undefined} /></Card>}
+    </div>)}</Card> : <Card className="submission-empty"><EmptyState icon={<Inbox />} title={viewItems.length ? 'По запросу ничего не найдено' : emptyState.title} text={viewItems.length ? 'Измените поисковый запрос.' : emptyState.text} action={!viewItems.length && !items.length ? <Button variant="secondary" loading={refreshing} onClick={load}><RotateCcw size={15} /> Обновить список</Button> : undefined} /></Card>}
     <div className="table-footer"><span>Показано {filtered.length} из {viewItems.length}</span></div>
   </div>;
 }
@@ -195,5 +263,5 @@ function taskCountLabel(count: number) {
 function emptyTitle(view: SubmissionView) { return view === 'pending' ? 'Нет работ, ожидающих проверки' : view === 'reviewed' ? 'Проверенных работ пока нет' : 'Сданных работ пока нет'; }
 function emptyText(view: SubmissionView, total: number) {
   if (view !== 'all' && total) return 'Переключитесь на другую вкладку, чтобы увидеть остальные работы.';
-  return 'Новые сдачи появляются здесь сразу. Исторические сдачи и оценки Moodle импортируются в фоне после синхронизации LMS; для них будет явно указано, что история редактирования недоступна.';
+  return 'Сдачи из системы появляются здесь сразу. Чтобы загрузить ответы и оценки из Moodle, вручную синхронизируйте нужную работу на странице «Курсы и работы». Обновление этого списка не запускает синхронизацию Moodle.';
 }

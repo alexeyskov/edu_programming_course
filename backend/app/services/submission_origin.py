@@ -96,6 +96,18 @@ def historical_response_observations(item: dict[str, Any]) -> list[dict[str, Any
         for artifact in artifacts[:128]:
             if not isinstance(artifact, dict) or artifact.get("downloaded") is not True:
                 continue
+            # Digests produced while streaming the original bytes by our
+            # history worker. Archives have already been replaced by bounded
+            # source files, so re-decoding them here is neither needed nor possible.
+            if isinstance(artifact.get("_content_md5"), str):
+                md5, sha256 = artifact["_content_md5"], artifact["sha256"]
+                observations.append({
+                    "kind": "FILE", "filename": str(artifact.get("filename", ""))[:255],
+                    "size": artifact["size_bytes"], "md5": md5, "sha256": sha256,
+                    "comparison_md5": md5, "comparison_sha256": sha256,
+                    "canonicalization": BINARY_CANONICALIZATION,
+                })
+                continue
             encoded = artifact.get("content_base64")
             if not isinstance(encoded, str):
                 continue

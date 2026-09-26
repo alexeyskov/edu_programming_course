@@ -1046,18 +1046,21 @@ def parse_assignment_grader_page(
 
 
 def finalize_historical_submission(item: dict[str, Any]) -> dict[str, Any]:
-    def public_value(value: Any) -> Any:
+    def public_value(value: Any, *, fingerprint: bool = False) -> Any:
         if isinstance(value, dict):
             return {
-                key: public_value(child)
+                key: public_value(child, fingerprint=fingerprint)
                 for key, child in value.items()
                 if not str(key).startswith("_")
+                and not (fingerprint and key == "content_base64")
             }
         if isinstance(value, list):
-            return [public_value(child) for child in value]
+            return [public_value(child, fingerprint=fingerprint) for child in value]
         return value
 
     public = public_value(item)
     public["external_id"] = f"{public['module']}:{public['cmid']}:{public['attempt_id']}"
-    public["external_revision"] = canonical_hash(public)
+    # Attachment SHA256/size are validated by HistoricalArtifact. Including
+    # their base64 again would allocate/hash hundreds of MiB of duplicate JSON.
+    public["external_revision"] = canonical_hash(public_value(public, fingerprint=True))
     return public

@@ -31,9 +31,9 @@ async def run_sync_worker(
 
     Course discovery can legitimately spend several minutes reading Moodle.  A
     single sequential loop would keep student checkpoints queued for that whole
-    interval, so production reserves two additional lanes for final student
-    checkpoints beside the two general-purpose lanes. ``once`` deliberately
-    remains single-lane for deterministic maintenance commands and tests.
+    interval, so production reserves two lanes for final student checkpoints
+    and two for history inventories/answers beside the two general-purpose
+    lanes. ``once`` remains single-lane for deterministic maintenance/tests.
     """
 
     poll_seconds = max(0.1, float(getattr(settings, "sync_poll_seconds", 1)))
@@ -56,7 +56,12 @@ async def run_sync_worker(
         else httpx.AsyncClient(follow_redirects=False, trust_env=False)
     )
 
-    async def run_lane(terminal_only: bool = terminal_checkpoints_only) -> int:
+    async def run_lane(
+        terminal_only: bool = terminal_checkpoints_only,
+        *,
+        history_only: bool = False,
+        exclude_history: bool = False,
+    ) -> int:
         delivered_or_transitioned = 0
         while stop_event is None or not stop_event.is_set():
             try:
@@ -66,6 +71,8 @@ async def run_sync_worker(
                     bridge_factory=bridge_factory,
                     client=active_client,
                     terminal_checkpoints_only=terminal_only,
+                    **({"history_imports_only": True} if history_only else {}),
+                    **({"exclude_history_imports": True} if exclude_history else {}),
                 )
             except Exception:
                 # A row-level error is normally persisted by the service; this guards DB outages.
@@ -85,15 +92,24 @@ async def run_sync_worker(
             if once or terminal_checkpoints_only or concurrency is not None
             else int(getattr(settings, "sync_terminal_concurrency", 2))
         )
-        if lane_count == 1 and reserved == 0:
+        history_reserved = (
+            0
+            if once or terminal_checkpoints_only or concurrency is not None
+            else int(getattr(settings, "sync_history_concurrency", 2))
+        )
+        if lane_count == 1 and reserved == 0 and history_reserved == 0:
             return await run_lane()
         # Sorting the outbox cannot preempt an import already occupying a
         # lane. Reserve consumers that never claim course/history jobs, so a
         # whole class's final submissions do not wait minutes for those jobs.
         return sum(
             await asyncio.gather(
-                *(run_lane() for _ in range(lane_count)),
+                # With dedicated history lanes, general consumers must not
+                # also claim history: that doubles the configured concurrency
+                # and floods the connector's bounded read pool with retries.
+                *(run_lane(exclude_history=history_reserved > 0) for _ in range(lane_count)),
                 *(run_lane(True) for _ in range(reserved)),
+                *(run_lane(False, history_only=True) for _ in range(history_reserved)),
             )
         )
     finally:

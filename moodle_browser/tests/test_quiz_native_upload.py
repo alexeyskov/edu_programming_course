@@ -455,7 +455,7 @@ async def fixture_server(remote, tmp_path):
                 result = await remote.api_post(owner, url, multipart=fields, max_redirects=0)
                 content, status, extra = await result.body(), result.status, {}
                 content_type = "application/json"
-            elif target.startswith("/draftfile.php/"):
+            elif target.startswith(("/draftfile.php/", "/pluginfile.php/")):
                 result = await remote.api_get(owner, url, max_redirects=0)
                 content, status, extra = await result.body(), result.status, {}
                 content_type = "application/octet-stream"

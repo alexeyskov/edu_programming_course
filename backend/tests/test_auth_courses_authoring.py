@@ -927,9 +927,11 @@ async def test_moodle_callback_verifier_hmac_elevation_and_replay(app_bundle):
         assert callback.status_code == 303, callback.text
         current = await client.get("/api/v1/auth/session")
         assert current.status_code == 200
-        assert current.json()["roles"] == ["STUDENT"]
+        # The signed launch authenticates but does not import an unsynchronized
+        # course participant, even when Moodle claims a teacher role.
+        assert current.json()["roles"] == []
         assert current.json()["capabilities"] == ["SYSTEM_SETTINGS"]
-        assert current.json()["memberships"][0]["course_name"] == "C++"
+        assert current.json()["memberships"] == []
 
         replay = await client.post(
             "/api/v1/auth/moodle/callback",

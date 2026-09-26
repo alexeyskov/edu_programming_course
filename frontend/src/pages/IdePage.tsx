@@ -3,7 +3,7 @@ import {
   FileClock, FilePlus2, History, Info, MessageCircleQuestion, PanelBottomClose, PanelBottomOpen,
   PanelLeftClose, PanelLeftOpen, Play, Send, Square, TerminalSquare, Trash2, X,
 } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { CodeWorkspace, type CodeWorkspaceHandle } from '../components/CodeWorkspace';
 import { Badge, Button, Field, InlineError, Modal, PageLoader, useToast } from '../components/ui';
@@ -15,7 +15,12 @@ import type { Attempt, Diagnostic, HistoryEvent, InternalPasteRange, Interactive
 
 type BottomTab = 'output' | 'problems' | 'history';
 type SubmissionPhase = 'confirm' | 'preparing' | 'waiting' | 'error';
+type LmsClosureReason = 'LMS_ATTEMPT_FINALIZED' | 'LMS_ATTEMPT_DELETED';
 const SUBMISSION_SLOW_AFTER_MS = 12_000;
+
+function isLmsClosureReason(reason?: string): reason is LmsClosureReason {
+  return reason === 'LMS_ATTEMPT_FINALIZED' || reason === 'LMS_ATTEMPT_DELETED';
+}
 
 function canDeleteWorkspaceFile(
   file: WorkspaceFile,
@@ -48,6 +53,7 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
   const loadGenerationRef = useRef(0);
   const switchingQuestionRef = useRef(false);
   const leavingRef = useRef(false);
+  const submittingRef = useRef(false);
   const [leaving, setLeaving] = useState(false);
   const [switchingQuestionId, setSwitchingQuestionId] = useState<string | null>(null);
   const [attempt, setAttempt] = useState<Attempt | null>(null);
@@ -57,6 +63,8 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
   const [interactiveRun, setInteractiveRun] = useState<InteractiveRun | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [metadataError, setMetadataError] = useState(false);
+  const [metadataLoading, setMetadataLoading] = useState(false);
   const [saveState, setSaveState] = useState<'saved' | 'saving' | 'offline' | 'error' | 'closed'>('saved');
   const [bottomTab, setBottomTab] = useState<BottomTab>('problems');
   const [running, setRunning] = useState(false);
@@ -64,6 +72,7 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
   const [remaining, setRemaining] = useState('');
   const [now, setNow] = useState(Date.now());
   const [statementOpen, setStatementOpen] = useState(true);
+  const [filesPanelOpen, setFilesPanelOpen] = useState(true);
   const [bottomPanelOpen, setBottomPanelOpen] = useState(true);
   const [aiOpen, setAiOpen] = useState(false);
   const [submitOpen, setSubmitOpen] = useState(false);
@@ -78,6 +87,7 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
   const [courseId, setCourseId] = useState('');
   const [conflictOpen, setConflictOpen] = useState(false);
   const [lmsFinalizedOpen, setLmsFinalizedOpen] = useState(false);
+  const [lmsClosureReason, setLmsClosureReason] = useState<LmsClosureReason>('LMS_ATTEMPT_FINALIZED');
   const latestFiles = useRef(files);
   const interactiveRunRef = useRef<InteractiveRun | null>(null);
   const lmsFinalizedRef = useRef(false);
@@ -90,12 +100,13 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
     return () => { mountedRef.current = false; };
   }, []);
 
-  const closeForLmsFinalization = useCallback((reportedAttempt?: Attempt) => {
-    if (lmsFinalizedRef.current) {
+  const closeForLmsFinalization = useCallback((reportedAttempt?: Attempt, reason: LmsClosureReason = 'LMS_ATTEMPT_FINALIZED') => {
+    if (lmsFinalizedRef.current && reason !== 'LMS_ATTEMPT_DELETED') {
       setLmsFinalizedOpen(true);
       return;
     }
     lmsFinalizedRef.current = true;
+    setLmsClosureReason(reason);
     if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
     saveTimerRef.current = undefined;
     dirtyFilesRef.current = [];
@@ -108,7 +119,8 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
       const lockedAttempt = {
         ...currentAttempt,
         status: 'LOCKED' as const,
-        closureReason: 'LMS_ATTEMPT_FINALIZED',
+        closureReason: reason,
+        aiEnabled: false,
       };
       attemptRef.current = lockedAttempt;
       setAttempt(lockedAttempt);
@@ -125,12 +137,31 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
   }, []);
 
   const handleLmsFinalizedError = useCallback((caught: unknown): boolean => {
-    if (caught instanceof ApiError && caught.code === 'LMS_ATTEMPT_FINALIZED') {
-      closeForLmsFinalization();
+    if (caught instanceof ApiError && isLmsClosureReason(caught.code)) {
+      closeForLmsFinalization(undefined, caught.code);
       return true;
     }
     return false;
   }, [closeForLmsFinalization]);
+
+  const loadMetadata = useCallback(async (loaded: Attempt, generation: number) => {
+    setMetadataLoading(true);
+    const [loadedHistory, resolvedCourse] = await Promise.allSettled([
+      api.getHistory(loaded.id), api.resolveCourseId(loaded.assessmentId),
+    ]);
+    if (!mountedRef.current || generation !== loadGenerationRef.current) return;
+    if (loadedHistory.status === 'fulfilled') {
+      // Editing may have begun while history was loading. Keep those local
+      // events instead of replacing them with the older server response.
+      setHistory((current) => {
+        const ids = new Set(current.map((item) => item.id));
+        return [...current, ...loadedHistory.value.filter((item) => !ids.has(item.id))];
+      });
+    }
+    if (resolvedCourse.status === 'fulfilled') setCourseId(resolvedCourse.value);
+    setMetadataError(loadedHistory.status === 'rejected' || resolvedCourse.status === 'rejected');
+    setMetadataLoading(false);
+  }, []);
 
   const load = useCallback(async () => {
     const generation = ++loadGenerationRef.current;
@@ -138,23 +169,24 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
     if (attemptRef.current?.id !== attemptId) {
       lmsFinalizedRef.current = false;
       setLmsFinalizedOpen(false);
+      setLmsClosureReason('LMS_ATTEMPT_FINALIZED');
     }
     setLoading(true); setError(null);
     try {
       let loaded = await api.getAttempt(attemptId);
-      if (!isCurrent()) return;
+      if (!isCurrent() || lmsFinalizedRef.current) return;
       if (loaded.requiresLiveLmsPreparation) {
         if (loaded.quizSession) {
           throw new ApiError(409, 'MOODLE_RUNTIME_PREPARATION_REQUIRED', 'Не удалось открыть подготовленную задачу Moodle. Обновите страницу.');
         }
         const prepared = await api.startAttempt(loaded.assessmentId);
-        if (!isCurrent()) return;
+        if (!isCurrent() || lmsFinalizedRef.current) return;
         if (prepared.id !== attemptId) {
           navigate(`/ide/${prepared.id}`, { replace: true });
           return;
         }
         loaded = await api.getAttempt(attemptId);
-        if (!isCurrent()) return;
+        if (!isCurrent() || lmsFinalizedRef.current) return;
         if (loaded.requiresLiveLmsPreparation) {
           throw new ApiError(
             409,
@@ -163,14 +195,14 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
           );
         }
       }
-      const loadedHistory = await api.getHistory(attemptId);
-      if (!isCurrent()) return;
-      const resolvedCourseId = await api.resolveCourseId(loaded.assessmentId);
-      if (!isCurrent()) return;
       dirtyFilesRef.current = []; setConflictOpen(false);
-      attemptRef.current = loaded; setAttempt(loaded); setCourseId(resolvedCourseId); setFiles(loaded.files); setActiveFileId(restoredActiveFile(loaded)); setHistory(loadedHistory); setSaveState('saved');
+      attemptRef.current = loaded; setAttempt(loaded); setCourseId(''); setFiles(loaded.files); setActiveFileId(restoredActiveFile(loaded)); setHistory([]); setSaveState('saved');
+      setMetadataError(false);
+      // A slow or failed history/course lookup must not block the student's
+      // code, autosave or final submission. These are ancillary to the workspace.
+      void loadMetadata(loaded, generation);
       setInteractiveRun(null); setInteractiveInput('');
-      if (loaded.closureReason === 'LMS_ATTEMPT_FINALIZED') closeForLmsFinalization(loaded);
+      if (isLmsClosureReason(loaded.closureReason)) closeForLmsFinalization(loaded, loaded.closureReason);
       else if (loaded.status === 'SUBMITTED' && loaded.checkpointStatus !== 'SYNCED') {
         setSubmissionPhase(loaded.checkpointStatus === 'ERROR' ? 'error' : 'waiting');
         setSubmissionError(loaded.checkpointStatus === 'ERROR' ? 'Moodle не подтвердил получение ответа.' : '');
@@ -180,10 +212,10 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
         setSubmissionPhase('confirm'); setSubmissionError(''); setSubmissionSlow(false);
       }
       const storedSession = window.sessionStorage.getItem(interactiveStorageKey(loaded.id));
-      if (storedSession && loaded.closureReason !== 'LMS_ATTEMPT_FINALIZED') {
+      if (storedSession && !isLmsClosureReason(loaded.closureReason)) {
         try {
           const recovered = await api.getInteractiveAttempt(loaded.id, storedSession);
-          if (!isCurrent()) return;
+          if (!isCurrent() || lmsFinalizedRef.current) return;
           setInteractiveRun(recovered); setBottomTab('output'); setBottomPanelOpen(true);
         } catch {
           window.sessionStorage.removeItem(interactiveStorageKey(loaded.id));
@@ -194,7 +226,7 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
       if (!handleLmsFinalizedError(caught)) setError(caught instanceof Error ? caught.message : 'Не удалось открыть попытку');
     }
     finally { if (isCurrent()) setLoading(false); }
-  }, [attemptId, closeForLmsFinalization, handleLmsFinalizedError, navigate]);
+  }, [attemptId, closeForLmsFinalization, handleLmsFinalizedError, loadMetadata, navigate]);
   useEffect(() => { void load(); }, [load]);
 
   useEffect(() => {
@@ -212,12 +244,16 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
       polling = true;
       try {
         const current = await api.getAttemptStatus(attempt.id);
-        if (cancelled) return;
-        if (current.closureReason === 'LMS_ATTEMPT_FINALIZED') {
-          closeForLmsFinalization();
+        if (cancelled || lmsFinalizedRef.current) return;
+        if (isLmsClosureReason(current.closureReason)) {
+          closeForLmsFinalization(undefined, current.closureReason);
           return;
         }
-        setAttempt((value) => value?.id === current.id ? {
+        const value = attemptRef.current;
+        // A request begun before submission can return ACTIVE afterwards.
+        // State transitions are monotonic; that stale read must not reopen code.
+        if (!value || value.id !== current.id || (value.status !== 'ACTIVE' && current.status === 'ACTIVE')) return;
+        const updated = {
           ...value,
           status: current.status,
           closureReason: current.closureReason,
@@ -228,7 +264,9 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
           deadlineAt: current.deadlineAt ?? value.deadlineAt,
           expectedEndAt: current.expectedEndAt ?? value.expectedEndAt,
           moodleSyncTimeoutSeconds: current.moodleSyncTimeoutSeconds ?? value.moodleSyncTimeoutSeconds,
-        } : value);
+        };
+        attemptRef.current = updated;
+        setAttempt(updated);
         if (current.aiEnabled === false) setAiOpen(false);
         if (current.status === 'SUBMITTED') {
           // The deadline worker submits every solution even without an open
@@ -252,7 +290,7 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
   }, [attempt?.id, attempt?.status, closeForLmsFinalization, handleLmsFinalizedError]);
 
   useEffect(() => {
-    if (!attempt?.id || attempt.status !== 'SUBMITTED' || submissionPhase !== 'waiting') return;
+    if (!attempt?.id || attempt.status !== 'SUBMITTED' || !['waiting', 'error'].includes(submissionPhase)) return;
     let cancelled = false;
     let polling = false;
     const poll = async () => {
@@ -260,20 +298,24 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
       polling = true;
       try {
         const current = await api.getAttemptStatus(attempt.id);
-        if (cancelled) return;
-        if (current.closureReason === 'LMS_ATTEMPT_FINALIZED') {
-          closeForLmsFinalization();
+        if (cancelled || lmsFinalizedRef.current) return;
+        if (isLmsClosureReason(current.closureReason)) {
+          closeForLmsFinalization(undefined, current.closureReason);
           return;
         }
-        setAttempt((value) => value?.id === current.id ? {
+        const value = attemptRef.current;
+        if (!value || value.id !== current.id || current.status === 'ACTIVE') return;
+        const updated = {
           ...value,
           status: current.status,
           closureReason: current.closureReason,
           closedAt: current.closedAt,
           lastCheckpointAt: current.lastCheckpointAt,
           checkpointStatus: current.checkpointStatus,
-        } : value);
-        if (current.checkpointStatus === 'SYNCED') {
+        };
+        attemptRef.current = updated;
+        setAttempt(updated);
+        if (current.status === 'SUBMITTED' && current.checkpointStatus === 'SYNCED') {
           setSubmissionSlow(false);
           setSubmissionPhase('confirm');
           setSubmitOpen(false);
@@ -375,7 +417,7 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
   const interactiveActive = Boolean(interactiveRun && !interactiveRun.terminal);
 
   function changeFile(fileId: string, content: string, source: 'typing' | 'internal_paste', receiptId?: string, pasteRange?: InternalPasteRange) {
-    if (!mountedRef.current || locked || !attempt || lmsFinalizedRef.current || switchingQuestionRef.current || leavingRef.current) return;
+    if (!mountedRef.current || locked || !attempt || lmsFinalizedRef.current || switchingQuestionRef.current || leavingRef.current || submittingRef.current) return;
     const updated = latestFiles.current.map((file) => file.id === fileId ? { ...file, content } : file);
     const changedFile = updated.find((file) => file.id === fileId);
     if (!changedFile) return;
@@ -397,13 +439,19 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
       if (!currentAttempt) return 0;
       if (lmsFinalizedRef.current) return currentAttempt.acknowledgedRevision;
       while (dirtyFilesRef.current.length > 0 && !lmsFinalizedRef.current) {
+        if (currentAttempt.status !== 'ACTIVE') {
+          setSaveState('error');
+          throw new ApiError(409, 'ATTEMPT_READ_ONLY', 'Эта попытка уже завершена. Последние несохранённые правки остаются в редакторе.');
+        }
         const pending = dirtyFilesRef.current[0];
         setSaveState('saving');
         try {
           const result = await api.saveFile(currentAttempt.id, pending.file, currentAttempt.acknowledgedRevision, pending.source, pending.receiptId, pending.pasteRange);
           if (lmsFinalizedRef.current) return currentAttempt.acknowledgedRevision;
           if (dirtyFilesRef.current[0] === pending) dirtyFilesRef.current.shift();
-          currentAttempt = { ...currentAttempt, revision: result.revision, acknowledgedRevision: result.revision };
+          // Status polling may have observed the deadline/final submission
+          // while this save was in flight. Preserve its newer state.
+          currentAttempt = { ...(attemptRef.current ?? currentAttempt), revision: result.revision, acknowledgedRevision: result.revision };
           attemptRef.current = currentAttempt;
           setAttempt(currentAttempt);
         } catch (caught) {
@@ -425,6 +473,19 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
     if (!attemptRef.current) return 0;
     if (!dirtyFilesRef.current.length && !flushPromiseRef.current) return attemptRef.current.acknowledgedRevision;
     return flushDirtyFiles();
+  }
+
+  async function prepareAiContext(expectedAttemptId: string) {
+    const checkContext = () => {
+      if (!mountedRef.current || attemptRef.current?.id !== expectedAttemptId || switchingQuestionRef.current || lmsFinalizedRef.current) {
+        throw new Error('Открытая задача изменилась. Задайте вопрос в чате нужной задачи.');
+      }
+      if (!courseId) throw new Error('Данные курса для чата ещё не загружены. Дождитесь загрузки или повторите её над редактором.');
+    };
+    checkContext();
+    const revision = await ensureSaved();
+    checkContext();
+    return revision;
   }
 
   async function switchQuestion(targetAttemptId: string) {
@@ -468,7 +529,7 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
       await ensureSaved();
       const active = interactiveRunRef.current;
       if (active && !active.terminal) await api.stopInteractiveAttempt(attemptRef.current.id, active.sessionId);
-      if (mountedRef.current) navigate(`/assessments/${attemptRef.current.assessmentId}`);
+      if (mountedRef.current && !lmsFinalizedRef.current) navigate(`/assessments/${attemptRef.current.assessmentId}`);
     } catch (caught) {
       if (mountedRef.current && !handleLmsFinalizedError(caught)) {
         toast.push('error', 'Не удалось сохранить работу', 'Не закрывайте вкладку: дождитесь сохранения или повторите попытку.');
@@ -487,7 +548,7 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
       const currentAttempt = attemptRef.current;
       if (!currentAttempt || !mountedRef.current || lmsFinalizedRef.current) return;
       const result = await api.startInteractiveAttempt(currentAttempt.id, revision);
-      if (!mountedRef.current) {
+      if (!mountedRef.current || lmsFinalizedRef.current) {
         if (!result.terminal) void api.stopInteractiveAttempt(currentAttempt.id, result.sessionId).catch(() => undefined);
         return;
       }
@@ -508,6 +569,7 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
     const text = interactiveInput;
     try {
       const updated = await api.sendInteractiveAttemptInput(currentAttempt.id, active.sessionId, text);
+      if (!mountedRef.current || lmsFinalizedRef.current) return;
       setInteractiveInput(''); setInteractiveRun(updated);
     } catch (caught) {
       if (!handleLmsFinalizedError(caught)) toast.push('error', 'Ввод не передан программе', caught instanceof Error ? caught.message : undefined);
@@ -592,7 +654,8 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
   }
 
   async function submit() {
-    if (!attemptRef.current || switchingQuestionRef.current || lmsFinalizedRef.current) return;
+    if (!attemptRef.current || submittingRef.current || switchingQuestionRef.current || lmsFinalizedRef.current) return;
+    submittingRef.current = true;
     setSubmitting(true); setSubmissionPhase('preparing'); setSubmissionError(''); setSubmissionSlow(false);
     try {
       const active = interactiveRunRef.current;
@@ -601,27 +664,37 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
         setInteractiveRun(stopped);
       }
       const revision = await ensureSaved(); const current = attemptRef.current;
-      if (lmsFinalizedRef.current) return;
+      if (!mountedRef.current || lmsFinalizedRef.current) return;
       await api.submitAttempt(current.id, revision);
+      if (!mountedRef.current || lmsFinalizedRef.current) return;
       const submitted = { ...current, status: 'SUBMITTED' as const, revision, acknowledgedRevision: revision, checkpointStatus: 'PENDING' as const };
       attemptRef.current = submitted; setAttempt(submitted); setSubmissionPhase('waiting'); setSubmissionSlow(false);
       window.sessionStorage.removeItem(interactiveStorageKey(current.id));
     } catch (caught) {
+      if (!mountedRef.current) return;
       if (!handleLmsFinalizedError(caught)) {
+        // A lost POST response is not proof of failure: the independent status
+        // poll can already have confirmed that the server accepted the answer.
+        if (attemptRef.current?.status === 'SUBMITTED') {
+          setSubmissionPhase('waiting');
+          return;
+        }
         const message = caught instanceof Error ? caught.message : 'Не удалось завершить работу';
         setSubmissionError(message); setSubmissionPhase('confirm');
         toast.push('error', 'Не удалось завершить работу', message);
       }
     }
-    finally { setSubmitting(false); }
+    finally { submittingRef.current = false; if (mountedRef.current) setSubmitting(false); }
   }
 
   async function retrySubmission() {
     const current = attemptRef.current;
-    if (!current || lmsFinalizedRef.current) return;
+    if (!current || submittingRef.current || lmsFinalizedRef.current) return;
+    submittingRef.current = true;
     setSubmitting(true); setSubmissionError(''); setSubmissionSlow(false);
     try {
       await api.retryAttemptSubmission(current.id);
+      if (!mountedRef.current || lmsFinalizedRef.current) return;
       const queued = { ...current, checkpointStatus: 'PENDING' as const };
       attemptRef.current = queued; setAttempt(queued); setSubmissionPhase('waiting'); setSubmissionSlow(false);
     } catch (caught) {
@@ -630,17 +703,18 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
         setSubmissionError(message); setSubmissionPhase('error');
         toast.push('error', 'Повторная отправка не запущена', message);
       }
-    } finally { setSubmitting(false); }
+    } finally { submittingRef.current = false; if (mountedRef.current) setSubmitting(false); }
   }
 
-  const lmsFinalizedModal = <Modal open={lmsFinalizedOpen} title="Сеанс работы завершён через Moodle" onClose={() => navigate('/')} footer={<Button onClick={() => navigate('/')}>Вернуться к работам</Button>}><div className="conflict-copy"><AlertTriangle /><div><strong>Работа закрыта</strong><p>Ответ уже был завершён непосредственно в Moodle. Редактирование остановлено, и система не пыталась перезаписать ответ.</p></div></div></Modal>;
+  const lmsDeleted = lmsClosureReason === 'LMS_ATTEMPT_DELETED';
+  const lmsFinalizedModal = <Modal open={lmsFinalizedOpen} title={lmsDeleted ? 'Попытка удалена в Moodle' : 'Сеанс работы завершён через Moodle'} onClose={() => navigate('/')} footer={<Button onClick={() => navigate('/')}>Вернуться к работам</Button>}><div className="conflict-copy"><AlertTriangle /><div><strong>{lmsDeleted ? 'Эта попытка больше недоступна' : 'Работа закрыта'}</strong><p>{lmsDeleted ? 'Moodle подтвердил удаление попытки. Редактирование и повторная отправка остановлены. Сохранённый код остался в системе, но эта попытка больше не показывается среди сданных работ. Вернитесь к списку работ, чтобы открыть доступную попытку.' : 'Ответ уже был завершён непосредственно в Moodle. Редактирование остановлено, и система не пыталась перезаписать ответ.'}</p></div></div></Modal>;
 
   if (loading) return <PageLoader label="Открываем рабочую область…" />;
   if (!attempt && lmsFinalizedOpen) return lmsFinalizedModal;
   if (error || !attempt) return <InlineError message={error ?? 'Попытка не найдена'} retry={() => void load()} />;
   return <div className="ide-page">
-    <div className="ide-toolbar"><div className="ide-title">{!statementOpen && <button type="button" className="condition-toggle" aria-controls="attempt-condition" aria-expanded={false} onClick={() => setStatementOpen(true)}><PanelLeftOpen size={16} /><span>Показать условие</span></button>}<span><small>{locked ? 'Только чтение' : 'Активная попытка'}</small><strong>{attempt.title}</strong></span></div><div className="ide-status"><span className={cn('save-state', `save-state--${saveState}`)}><Cloud size={15} />{saveState === 'saved' ? `Сохранено · r${attempt.acknowledgedRevision}` : saveState === 'saving' ? 'Сохраняем…' : saveState === 'offline' ? 'Нет связи · очередь хранится в этой вкладке' : saveState === 'closed' ? 'Сеанс завершён в Moodle' : 'Ошибка сохранения'}</span>{untimed ? <span>Без таймера</span> : <span title={attempt.deadlineAt || attempt.expectedEndAt ? 'Примерное оставшееся время по текущей сессии Moodle' : 'Примерное время с начала сессии'}><Clock3 size={16} /><strong>{attempt.deadlineAt || attempt.expectedEndAt ? remaining : `В сессии · ${remaining}`}</strong></span>}<span className="server-time">На устройстве: {new Intl.DateTimeFormat('ru', { hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(now)}</span></div><div className="ide-actions">{!locked && <Button variant="ghost" loading={leaving} disabled={Boolean(switchingQuestionId) || submitting || running} onClick={() => void saveAndLeave()}>Сохранить и выйти</Button>}{attempt.aiEnabled && <Button variant="ghost" disabled={Boolean(switchingQuestionId)} onClick={() => setAiOpen(true)}><Bot size={17} /> Помощь ИИ</Button>}{interactiveActive ? <Button variant="secondary" loading={running} disabled={Boolean(switchingQuestionId)} onClick={() => void stopInteractive()}><Square size={15} fill="currentColor" /> Остановить</Button> : <Button variant="secondary" loading={running} disabled={editorReadOnly} onClick={() => void execute()}><Play size={16} fill="currentColor" /> Запустить</Button>}<Button onClick={() => setSubmitOpen(true)} disabled={editorReadOnly || running}><CircleStop size={16} /> {multiQuestion ? 'Завершить работу' : 'Завершить'}</Button></div></div>
-    {attempt.deadlineAt && (attempt.moodleSyncTimeoutSeconds ?? 0) > 0 && <div className="ide-deadline-notice" role="note"><Clock3 size={16} /><span>Резерв на отправку в Moodle: {attempt.moodleSyncTimeoutSeconds} с. Он уже вычтен из таймера. Когда время решения закончится, редактирование остановится и сохранённые ответы всех задач будут отправлены автоматически.</span></div>}
+    {metadataError && <div role="alert">Не удалось загрузить историю или данные курса. Код доступен для редактирования и сдачи. <Button variant="ghost" loading={metadataLoading} onClick={() => void loadMetadata(attempt, loadGenerationRef.current)}>Повторить загрузку дополнительных данных</Button></div>}
+    <div className="ide-toolbar"><div className="ide-title"><span><small>{locked ? 'Только чтение' : 'Активная попытка'}</small><strong>{attempt.title}</strong></span></div><div className="ide-status"><span className={cn('save-state', `save-state--${saveState}`)}><Cloud size={15} />{saveState === 'saved' ? `Сохранено · r${attempt.acknowledgedRevision}` : saveState === 'saving' ? 'Сохраняем…' : saveState === 'offline' ? 'Нет связи · очередь хранится в этой вкладке' : saveState === 'closed' ? 'Сеанс завершён в Moodle' : 'Ошибка сохранения'}</span>{untimed ? <span>Без таймера</span> : <span title={attempt.deadlineAt || attempt.expectedEndAt ? 'Примерное оставшееся время по текущей сессии Moodle' : 'Примерное время с начала сессии'}><Clock3 size={16} /><strong>{attempt.deadlineAt || attempt.expectedEndAt ? remaining : `В сессии · ${remaining}`}</strong></span>}<span className="server-time">На устройстве: {new Intl.DateTimeFormat('ru', { hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(now)}</span></div><div className="ide-actions">{!locked && <Button variant="ghost" loading={leaving} disabled={Boolean(switchingQuestionId) || submitting || running} onClick={() => void saveAndLeave()}>Сохранить и выйти</Button>}{attempt.aiEnabled && <Button variant="ghost" disabled={Boolean(switchingQuestionId)} onClick={() => setAiOpen(true)}><Bot size={17} /> Помощь ИИ</Button>}<Button onClick={() => setSubmitOpen(true)} disabled={editorReadOnly || running}><CircleStop size={16} /> {multiQuestion ? 'Завершить работу' : 'Завершить'}</Button></div></div>
     {multiQuestion && <nav className="ide-question-switcher" aria-label="Задачи работы" aria-busy={Boolean(switchingQuestionId)}>
       <span className="ide-question-switcher__label">{switchingQuestionId ? 'Сохраняем и переключаем…' : 'Задачи работы'}</span>
       <div className="ide-question-switcher__tabs" role="tablist" aria-label="Выбор задачи">
@@ -650,11 +724,20 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
       </div>
     </nav>}
     <div id={multiQuestion ? 'quiz-task-panel' : undefined} role={multiQuestion ? 'tabpanel' : undefined} aria-labelledby={multiQuestion ? `quiz-question-${attempt.id}` : undefined} className={cn('ide-layout', !statementOpen && 'ide-layout--condition-hidden')}>
-      {statementOpen && <aside id="attempt-condition" className="condition-panel"><header><div><span className="eyebrow">Условие</span><h2>{attempt.title}</h2></div><button type="button" className="condition-panel__toggle" aria-controls="attempt-condition" aria-expanded={true} onClick={() => setStatementOpen(false)}><PanelLeftClose size={14} /><span>Скрыть условие</span></button></header><div className="condition-body"><p>{attempt.statement || 'Текст условия пока не получен. Обновите страницу или сообщите преподавателю.'}</p><h3>Параметры рабочей области</h3><dl className="condition-facts"><div><dt>Файлы</dt><dd>{attempt.fileMode === 'MULTI' ? 'Многофайловый режим' : 'Один исходный файл'}</dd></div><div><dt>Срок</dt><dd>{untimed ? 'Без таймера' : attempt.deadlineAt || attempt.expectedEndAt ? `Около ${remaining}` : 'Контролируется Moodle'}</dd></div><div><dt>Помощник</dt><dd>{attempt.aiEnabled ? 'Доступен' : 'Отключён'}</dd></div></dl>{untimed && <p>Код сохраняется автоматически. Нажмите «Сохранить и выйти», чтобы продолжить позже. «Завершить» сдаёт работу.</p>}<div className="rules-card"><Info size={16} /><div><strong>Политика вставки</strong><p>{attempt.pastePolicy === 'STRICT' ? 'Копируйте код прямо из редактора. Его можно вставлять в другие файлы и задачи этой работы в рамках текущей попытки. Внешняя вставка запрещена.' : 'Вставка разрешена политикой этой работы.'}</p></div></div></div></aside>}
-      <section className={cn('ide-center', !bottomPanelOpen && 'ide-center--bottom-collapsed')}><div className="ide-editor"><CodeWorkspace ref={editorRef} files={files} activeFileId={activeFileId} onActiveFile={setActiveFileId} onChange={changeFile} onCreateFile={() => setCreateOpen(true)} onDeleteFile={setDeleteTarget} canDeleteFile={(file) => canDeleteWorkspaceFile(file, files, attempt.fileMode)} readOnly={editorReadOnly} strictPaste={attempt.pastePolicy === 'STRICT'} scopeId={attempt.id} clipboardScopeId={attempt.quizSession?.rootAttemptId ?? attempt.id} clipboardSession={clipboardSession} diagnostics={diagnostics} onPasteBlocked={() => { setHistory((items) => [{ id: createUuid(), type: 'paste_blocked', label: 'Неподтверждённая вставка заблокирована', at: new Date().toISOString(), revision: attempt.revision }, ...items]); toast.push('info', 'Вставка запрещена', 'Скопируйте фрагмент заново из редактора любой задачи этой работы (Ctrl/Cmd+C), затем вставьте (Ctrl/Cmd+V). Текст из других страниц и приложений не принимается.'); }} onInternalCopy={createInternalReceipt} /></div>
-        <BottomPanel open={bottomPanelOpen} onOpenChange={setBottomPanelOpen} active={bottomTab} setActive={setBottomTab} run={interactiveRun} diagnostics={diagnostics} history={history} input={interactiveInput} setInput={setInteractiveInput} starting={running && !interactiveActive} canInput={interactiveActive && !editorReadOnly && !interactiveRun?.inputClosed} onSend={() => void sendInteractiveInput()} onDiagnostic={(diagnostic) => editorRef.current?.openDiagnostic(diagnostic)} /></section>
+      <aside className={cn('condition-panel', !statementOpen && 'condition-panel--collapsed')}>
+        <header>
+          <button type="button" className="condition-panel__toggle" title={statementOpen ? 'Скрыть условие' : 'Показать условие'} aria-label={statementOpen ? 'Скрыть условие' : 'Показать условие'} aria-controls="attempt-condition" aria-expanded={statementOpen} onClick={() => setStatementOpen((value) => !value)}>{statementOpen ? <PanelLeftClose size={18} /> : <PanelLeftOpen size={18} />}</button>
+          {statementOpen && <div><span className="eyebrow">Условие</span><h2>{attempt.title}</h2></div>}
+        </header>
+        {!statementOpen && <span className="condition-panel__rail-label" aria-hidden="true">Задание</span>}
+        <div id="attempt-condition" className="condition-body" hidden={!statementOpen}><p className="condition-statement">{attempt.statement || 'Текст условия пока не получен. Обновите страницу или сообщите преподавателю.'}</p><h3>Параметры рабочей области</h3><dl className="condition-facts"><div><dt>Файлы</dt><dd>{attempt.fileMode === 'MULTI' ? 'Многофайловый режим' : 'Один исходный файл'}</dd></div><div><dt>Срок</dt><dd>{untimed ? 'Без таймера' : attempt.deadlineAt || attempt.expectedEndAt ? `Около ${remaining}` : 'Контролируется Moodle'}</dd></div><div><dt>Помощник</dt><dd>{attempt.aiEnabled ? 'Доступен' : 'Отключён'}</dd></div></dl>{untimed && <p>Код сохраняется автоматически. Нажмите «Сохранить и выйти», чтобы продолжить позже. «Завершить» сдаёт работу.</p>}<div className="rules-card"><Info size={16} /><div><strong>Политика вставки</strong><p>{attempt.pastePolicy === 'STRICT' ? 'Копируйте код прямо из редактора. Его можно вставлять в другие файлы и задачи этой работы в рамках текущей попытки. Внешняя вставка запрещена.' : 'Вставка разрешена политикой этой работы.'}</p></div></div></div>
+      </aside>
+      <section className={cn('ide-center', !bottomPanelOpen && 'ide-center--bottom-collapsed')}><div className="ide-editor">
+        <aside className="workspace-files-rail" aria-label="Управление панелью файлов"><button type="button" title={filesPanelOpen ? 'Скрыть файлы' : 'Показать файлы'} aria-label={filesPanelOpen ? 'Скрыть файлы' : 'Показать файлы'} aria-controls="student-file-explorer" aria-expanded={filesPanelOpen} onClick={() => setFilesPanelOpen((value) => !value)}>{filesPanelOpen ? <PanelLeftClose size={18} /> : <PanelLeftOpen size={18} />}</button><span aria-hidden="true">Файлы</span></aside>
+        <CodeWorkspace ref={editorRef} explorerId="student-file-explorer" explorerVisible={filesPanelOpen} files={files} activeFileId={activeFileId} onActiveFile={setActiveFileId} onChange={changeFile} onCreateFile={() => setCreateOpen(true)} onDeleteFile={setDeleteTarget} canDeleteFile={(file) => canDeleteWorkspaceFile(file, files, attempt.fileMode)} readOnly={editorReadOnly} strictPaste={attempt.pastePolicy === 'STRICT'} scopeId={attempt.id} clipboardScopeId={attempt.quizSession?.rootAttemptId ?? attempt.id} clipboardSession={clipboardSession} diagnostics={diagnostics} onPasteBlocked={() => { setHistory((items) => [{ id: createUuid(), type: 'paste_blocked', label: 'Неподтверждённая вставка заблокирована', at: new Date().toISOString(), revision: attempt.revision }, ...items]); toast.push('info', 'Вставка запрещена', 'Скопируйте фрагмент заново из редактора любой задачи этой работы (Ctrl/Cmd+C), затем вставьте (Ctrl/Cmd+V). Текст из других страниц и приложений не принимается.'); }} onInternalCopy={createInternalReceipt} /></div>
+        <BottomPanel runControl={interactiveActive ? <Button className="program-run-button" variant="secondary" loading={running} disabled={Boolean(switchingQuestionId)} onClick={() => void stopInteractive()}><Square size={15} fill="currentColor" /> Остановить</Button> : <Button className="program-run-button" variant="secondary" loading={running} disabled={editorReadOnly} onClick={() => void execute()}><Play size={16} fill="currentColor" /> Запустить</Button>} open={bottomPanelOpen} onOpenChange={setBottomPanelOpen} active={bottomTab} setActive={setBottomTab} run={interactiveRun} diagnostics={diagnostics} history={history} input={interactiveInput} setInput={setInteractiveInput} starting={running && !interactiveActive} canInput={interactiveActive && !editorReadOnly && !interactiveRun?.inputClosed} onSend={() => void sendInteractiveInput()} onDiagnostic={(diagnostic) => editorRef.current?.openDiagnostic(diagnostic)} /></section>
     </div>
-    <AiTutor open={aiOpen} onClose={() => setAiOpen(false)} attemptId={attempt.id} courseId={courseId} revision={attempt.acknowledgedRevision} />
+    <AiTutor key={attempt.id} open={aiOpen} onClose={() => setAiOpen(false)} attemptId={attempt.id} courseId={courseId} prepareContext={() => prepareAiContext(attempt.id)} />
     <Modal open={createOpen} title="Новый файл" onClose={() => setCreateOpen(false)} footer={<><Button variant="ghost" onClick={() => setCreateOpen(false)}>Отмена</Button><Button onClick={() => void createFile()} disabled={!newPath}><FilePlus2 size={16} /> Создать</Button></>}><Field label="Напишите имя файла" hint={attempt.fileMode === 'SINGLE' ? 'Можно добавить текстовый файл .txt с данными для программы' : 'Разрешены исходники, заголовки C/C++ и .txt'}><input autoFocus value={newPath} onChange={(event) => setNewPath(event.target.value)} placeholder={attempt.fileMode === 'SINGLE' ? 'input.txt' : 'solution.cpp'} /></Field></Modal>
     <Modal open={Boolean(deleteTarget)} title="Удалить файл?" onClose={() => !deleting && setDeleteTarget(null)} footer={<><Button variant="ghost" disabled={deleting} onClick={() => setDeleteTarget(null)}>Отмена</Button><Button variant="danger" loading={deleting} onClick={() => void deleteFile()}><Trash2 size={16} /> Удалить</Button></>}><p className="modal-copy">Файл <strong>{deleteTarget?.path}</strong> будет удалён из рабочей области отдельной серверной ревизией. Единственный исходный файл удалить нельзя.</p></Modal>
     <Modal open={submitOpen} title={submissionPhase === 'confirm' ? 'Завершить работу?' : submissionPhase === 'error' ? 'Moodle не подтвердил сдачу' : submissionSlow ? 'Сдача продолжается в фоне' : 'Передаём работу в Moodle…'} onClose={() => { if (submitting) return; if (submissionPhase === 'confirm') setSubmitOpen(false); else navigate('/'); }} footer={submissionPhase === 'confirm' ? <><Button variant="ghost" disabled={submitting} onClick={() => setSubmitOpen(false)}>Вернуться к коду</Button><Button loading={submitting} onClick={() => void submit()}>{multiQuestion ? 'Сдать все задачи' : `Сдать ревизию ${attempt.acknowledgedRevision}`}</Button></> : submissionPhase === 'error' ? <><Button variant="ghost" disabled={submitting} onClick={() => navigate('/')}>Вернуться к работам</Button><Button loading={submitting} onClick={() => void retrySubmission()}>Повторить отправку</Button></> : <Button variant={submissionSlow ? 'secondary' : 'ghost'} disabled={submitting} onClick={() => navigate('/')}>{submissionSlow ? 'Вернуться к работам' : 'Продолжить в фоне'}</Button>}>
@@ -667,37 +750,44 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
   </div>;
 }
 
-function BottomPanel({ open, onOpenChange, active, setActive, run, diagnostics, history, input, setInput, starting, canInput, onSend, onDiagnostic }: { open: boolean; onOpenChange(value: boolean): void; active: BottomTab; setActive(value: BottomTab): void; run: InteractiveRun | null; diagnostics: Diagnostic[]; history: HistoryEvent[]; input: string; setInput(value: string): void; starting: boolean; canInput: boolean; onSend(): void; onDiagnostic(value: Diagnostic): void }) {
+function BottomPanel({ runControl, open, onOpenChange, active, setActive, run, diagnostics, history, input, setInput, starting, canInput, onSend, onDiagnostic }: { runControl: ReactNode; open: boolean; onOpenChange(value: boolean): void; active: BottomTab; setActive(value: BottomTab): void; run: InteractiveRun | null; diagnostics: Diagnostic[]; history: HistoryEvent[]; input: string; setInput(value: string): void; starting: boolean; canInput: boolean; onSend(): void; onDiagnostic(value: Diagnostic): void }) {
   const tabs: Array<{ id: BottomTab; label: string; icon: typeof TerminalSquare; count?: number }> = [
     { id: 'output', label: 'Консоль', icon: TerminalSquare }, { id: 'problems', label: 'Проблемы', icon: AlertTriangle, count: diagnostics.length },
     { id: 'history', label: 'История', icon: History, count: history.length },
   ];
-  return <section className={cn('bottom-panel', !open && 'bottom-panel--collapsed')}><header>{open ? tabs.map(({ id, label, icon: Icon, count }) => <button key={id} type="button" className={cn(active === id && 'is-active')} role="tab" aria-selected={active === id} onClick={() => setActive(id)}><Icon size={14} />{label}{count !== undefined && <em>{count}</em>}</button>) : <strong className="bottom-panel__collapsed-label"><TerminalSquare size={14} /> Консоль скрыта</strong>}<span /><button type="button" className="bottom-panel__toggle" aria-controls="student-bottom-panel" aria-expanded={open} onClick={() => onOpenChange(!open)}>{open ? <PanelBottomClose size={13} /> : <PanelBottomOpen size={13} />}{open ? 'Закрыть' : 'Открыть консоль'}</button></header>{open && <div id="student-bottom-panel" className="bottom-panel__body">
+  return <section className={cn('bottom-panel', !open && 'bottom-panel--collapsed')}><header>{open ? <div className="bottom-panel__tabs" role="tablist" aria-label="Вывод программы и история">{tabs.map(({ id, label, icon: Icon, count }) => <button key={id} type="button" className={cn(active === id && 'is-active')} role="tab" aria-selected={active === id} onClick={() => setActive(id)}><Icon size={14} />{label}{count !== undefined && <em>{count}</em>}</button>)}</div> : <strong className="bottom-panel__collapsed-label"><TerminalSquare size={14} /> Консоль скрыта</strong>}<div className="bottom-panel__actions">{runControl}<button type="button" className="bottom-panel__toggle" aria-controls="student-bottom-panel" aria-expanded={open} onClick={() => onOpenChange(!open)}>{open ? <PanelBottomClose size={13} /> : <PanelBottomOpen size={13} />}{open ? 'Закрыть' : 'Открыть консоль'}</button></div></header>{open && <div id="student-bottom-panel" className="bottom-panel__body">
     {active === 'output' && <div className="student-console"><div className="student-console__output">{starting && <p>$ Компиляция и запуск…</p>}{run?.stdout && <pre>{run.stdout}</pre>}{run?.stderr && <pre className="terminal-error">{run.stderr}</pre>}{run?.outputTruncated && <p className="terminal-error">Вывод остановлен: достигнут установленный лимит.</p>}{!starting && !run && <p>$ Нажмите «Запустить». Если программа запросит данные, введите строку ниже и нажмите Enter.</p>}{run?.terminal && <p className={run.status === 'SUCCESS' ? 'terminal-success' : run.status === 'STOPPED' ? '' : 'terminal-error'}>{interactiveStatusLabel(run)} · {run.durationMs} мс</p>}</div><form className="student-console__form" onSubmit={(event) => { event.preventDefault(); onSend(); }}><input aria-label="Ввод программы" value={input} onChange={(event) => setInput(event.target.value)} disabled={!canInput} maxLength={65_536} autoComplete="off" spellCheck={false} placeholder={run?.terminal ? 'Программа завершена' : canInput ? 'Введите строку и нажмите Enter' : 'Сначала запустите программу'} /><button type="submit" aria-label="Передать строку программе" disabled={!canInput}><Send size={14} /> Отправить</button></form></div>}
     {active === 'problems' && <div className="problems-list">{diagnostics.length ? [...diagnostics].sort((a, b) => severityOrder(a.severity) - severityOrder(b.severity)).map((item) => <button key={item.id} onClick={() => onDiagnostic(item)}><span className={cn('problem-icon', `problem-icon--${item.severity}`)}>{item.severity === 'error' ? '×' : '!'}</span><span><strong>{item.message}</strong><small>{item.path ?? 'Сборка'}{item.line ? `:${item.line}:${item.column ?? 1}` : ''}{item.code ? ` · ${item.code}` : ''}</small>{item.notes?.map((note) => <em key={note}>{note}</em>)}</span><ChevronDown size={15} /></button>) : <div className="panel-empty"><CheckCircle2 size={20} /><span><strong>Проблем не найдено</strong><small>Запустите сборку для обновления диагностики.</small></span></div>}</div>}
     {active === 'history' && <div className="history-list">{history.slice(0, 15).map((item) => <div key={item.id}><span><FileClock size={14} /></span><p><strong>{item.label}</strong><small>{[item.detail ?? `Ревизия ${item.revision}`, formatClientContext(item.client), formatDate(item.at)].filter(Boolean).join(' · ')}</small></p></div>)}</div>}
   </div>}</section>;
 }
 
-function AiTutor({ open, onClose, attemptId, courseId, revision }: { open: boolean; onClose(): void; attemptId: string; courseId: string; revision: number }) {
+function AiTutor({ open, onClose, attemptId, courseId, prepareContext }: { open: boolean; onClose(): void; attemptId: string; courseId: string; prepareContext(): Promise<number> }) {
   const [message, setMessage] = useState('');
   const [sending, setSending] = useState(false);
   const threadIdRef = useRef<string>();
-  const [messages, setMessages] = useState<Array<{ from: 'ai' | 'user'; text: string; citations?: Array<{ title: string; url: string }> }>>([{ from: 'ai', text: 'Я помогу разобраться с концепцией или ошибкой, но не напишу готовое решение. Что сейчас вызывает затруднение?' }]);
+  const mountedRef = useRef(false);
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
+  const [messages, setMessages] = useState<Array<{ from: 'ai' | 'user'; text: string; citations?: Array<{ title: string; url: string }> }>>([]);
   async function sendMessage() {
     const content = message.trim();
     if (!content || sending) return;
     setMessage(''); setMessages((items) => [...items, { from: 'user', text: content }]); setSending(true);
     try {
+      const revision = await prepareContext();
+      if (!mountedRef.current) return;
       if (!threadIdRef.current) threadIdRef.current = (await api.createStudentAiThread(attemptId, courseId, revision)).id;
-      const response = await api.sendAiMessage(threadIdRef.current, content);
+      if (!mountedRef.current) return;
+      const response = await api.sendAiMessage(threadIdRef.current, content, { revision });
+      if (!mountedRef.current) return;
       setMessages((items) => [...items, { from: 'ai', text: response.content, citations: response.citations }]);
     } catch (caught) {
+      if (!mountedRef.current) return;
       setMessages((items) => [...items, { from: 'ai', text: caught instanceof Error ? `Помощник сейчас недоступен: ${caught.message}` : 'Помощник сейчас недоступен.' }]);
-    } finally { setSending(false); }
+    } finally { if (mountedRef.current) setSending(false); }
   }
   if (!open) return null;
-  return <aside className="ai-drawer"><header><span><Bot /><span><strong>Учебный помощник</strong><small>Привязан к ревизии {revision}</small></span></span><button onClick={onClose}><X /></button></header><div className="ai-policy"><ShieldAlertIcon /><p>Помощник объясняет подход и ссылается на документацию. Готовый код не выдаётся.</p></div><div className="ai-messages">{messages.map((item, index) => <div className={cn('ai-message', item.from === 'user' && 'ai-message--user')} key={index}>{item.text}{item.citations?.map((citation) => <a key={citation.url} href={citation.url} target="_blank" rel="noreferrer">{citation.title}</a>)}</div>)}{sending && <div className="ai-message ai-message--thinking">Помощник анализирует вопрос…</div>}</div><form onSubmit={(event) => { event.preventDefault(); void sendMessage(); }}><textarea value={message} disabled={sending} onChange={(event) => setMessage(event.target.value)} placeholder="Спросить о концепции или ошибке…" /><Button size="icon" loading={sending} disabled={!message.trim()} aria-label="Отправить"><Send size={17} /></Button></form><small className="ai-disclaimer">Ответы ИИ могут содержать ошибки — проверяйте документацию.</small></aside>;
+  return <aside className="ai-drawer"><header><span><Bot /><span><strong>Учебный помощник</strong><small>Условие и все файлы открытой задачи</small></span></span><button onClick={onClose}><X /></button></header><div className="ai-policy"><ShieldAlertIcon /><p>Только объяснения и ссылки на документацию по языку, без написания кода.</p></div><div className="ai-messages">{messages.map((item, index) => <div className={cn('ai-message', item.from === 'user' && 'ai-message--user')} key={index}>{item.text}{item.citations?.map((citation) => <a key={citation.url} href={citation.url} target="_blank" rel="noreferrer">{citation.title}</a>)}</div>)}{sending && <div className="ai-message ai-message--thinking">Сохраняем код и готовим ответ…</div>}</div><form onSubmit={(event) => { event.preventDefault(); void sendMessage(); }}><textarea value={message} disabled={sending} onChange={(event) => setMessage(event.target.value)} placeholder="Ваш вопрос…" /><Button size="icon" loading={sending} disabled={!message.trim()} aria-label="Отправить"><Send size={17} /></Button></form><small className="ai-disclaimer">Ответы ИИ могут содержать ошибки — проверяйте документацию.</small></aside>;
 }
 
 function ShieldAlertIcon() { return <MessageCircleQuestion size={17} />; }

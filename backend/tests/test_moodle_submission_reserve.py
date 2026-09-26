@@ -202,7 +202,10 @@ async def test_deadline_without_browser_locks_and_queues_all_solutions_once(
             client_request_id=f"answer-{index}",
         )
     deadline = started + timedelta(seconds=600)
-    assert root.deadline_at == deadline
+    # Locked reads now refresh the ORM row; SQLite returns UTC timestamps
+    # without tzinfo, unlike the aware production PostgreSQL representation.
+    assert root.deadline_at is not None
+    assert root.deadline_at.replace(tzinfo=UTC) == deadline
     monkeypatch.setattr("app.services.workspace.utcnow", lambda: deadline)
     for binding in questions:
         member = await db.get(Attempt, binding.attempt_id)

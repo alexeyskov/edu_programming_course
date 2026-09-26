@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -8,17 +9,19 @@ import re
 import uuid
 import zipfile
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, DecimalException, InvalidOperation
 from pathlib import PurePosixPath
 from typing import Any
 
 try:  # Kept optional so an old image reports the missing capability explicitly.
     import py7zr as _py7zr
+    from py7zr.exceptions import CrcError as _SevenZipCrcError
     from py7zr.io import Py7zIO as _Py7zIO
     from py7zr.io import WriterFactory as _WriterFactory
 except ImportError:  # pragma: no cover - exercised by the explicit fallback test
     _py7zr = None
+    _SevenZipCrcError = None  # type: ignore[assignment,misc]
     _Py7zIO = object  # type: ignore[assignment,misc]
     _WriterFactory = object  # type: ignore[assignment,misc]
 
@@ -42,6 +45,10 @@ from app.models.integration import ExternalMapping, SyncOutbox
 from app.models.review import ReviewDecision
 from app.models.tasks import Assessment, AssessmentItem, TaskBankItem, TaskVersion
 from app.services.common import canonical_hash, language_for_path, validate_source_path
+from app.services.moodle_attempt_reconciliation import (
+    deleted_quiz_attempt_ids,
+    known_quiz_attempt_ids,
+)
 from app.services.moodle_attempt_selection import observe_moodle_attempt
 from app.services.submission_origin import historical_response_observations
 from app.services.teacher_tokens import teacher_membership_is_authorized
@@ -66,7 +73,12 @@ _SOURCE_SUFFIXES = {
 _MAX_FILES = MAX_WORKSPACE_FILES
 _MAX_FILE_BYTES = MAX_SOURCE_FILE_BYTES
 _MAX_TOTAL_BYTES = MAX_WORKSPACE_BYTES
-_MAX_ARCHIVE_BYTES = 4 * 1024 * 1024
+# This bounds the compressed attachment, not the extracted source workspace.
+# Student IDE archives often contain large binaries alongside small C++ files.
+_MAX_ARCHIVE_BYTES = 100 * 1024 * 1024
+# Solid 7z archives also decompress skipped binaries before a selected source.
+# Bound that work separately from both compressed input and retained source.
+_MAX_ARCHIVE_EXPANDED_BYTES = 256 * 1024 * 1024
 _IMPORT_EVENT_STATES = {
     SyncOutboxState.PENDING.value,
     SyncOutboxState.PROCESSING.value,
@@ -74,11 +86,11 @@ _IMPORT_EVENT_STATES = {
 }
 _MAX_IMPORT_ACTORS = 128
 
-# Version 5 retries source materialization after attachment downloads moved
-# from page-level JavaScript fetches to the authenticated browser HTTP context.
+# Version 6 retries source materialization after increasing the compressed
+# attachment limit from 4 MiB to 100 MiB (without raising workspace limits).
 # Existing ``moodle-import.txt`` placeholders are therefore replaced on the
 # first successful synchronization even when Moodle's own attempt is unchanged.
-HISTORICAL_SOURCE_MATERIALIZATION_VERSION = 5
+HISTORICAL_SOURCE_MATERIALIZATION_VERSION = 6
 
 
 def _origin_receipt_fields(item: dict[str, Any]) -> dict[str, Any]:
@@ -111,6 +123,9 @@ def _historical_source_materialization_is_current(mapping: ExternalMapping) -> b
         isinstance(value, int)
         and not isinstance(value, bool)
         and value >= HISTORICAL_SOURCE_MATERIALIZATION_VERSION
+        # A retry must get another chance to fetch previously omitted files
+        # even if Moodle has not changed the attempt's own revision.
+        and metadata.get("source_complete") is True
     )
 
 
@@ -140,6 +155,18 @@ class MoodleHistoryImportStats:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _HistoricalSourceMaterialization:
+    files: list[dict[str, str]]
+    omissions: list[dict[str, str]]
+
+
+def _convert_historical_sources(item: dict[str, Any]) -> _HistoricalSourceMaterialization:
+    omissions: list[dict[str, str]] = []
+    files = historical_source_files(item, import_omissions=omissions)
+    return _HistoricalSourceMaterialization(files=files, omissions=omissions)
+
+
 def _safe_filename(value: object, fallback: str) -> str:
     raw = PurePosixPath(str(value or "").replace("\\", "/")).name.strip()
     raw = re.sub(r"[^0-9A-Za-zА-Яа-яЁё._ -]+", "_", raw)[:180]
@@ -166,13 +193,23 @@ def _decode_artifact(raw: dict[str, Any]) -> bytes | None:
     encoded = raw.get("content_base64")
     if not isinstance(encoded, str) or not encoded:
         return None
+    # Reject oversized input before b64decode allocates the decoded copy. The
+    # padding check handles the last base64 quartet at the exact byte boundary.
+    if len(encoded) > ((_MAX_ARCHIVE_BYTES + 2) // 3) * 4:
+        return None
+    padding = 2 if encoded.endswith("==") else int(encoded.endswith("="))
+    if (len(encoded) // 4) * 3 - padding > _MAX_ARCHIVE_BYTES:
+        return None
+    expected_size = raw.get("size_bytes")
+    if isinstance(expected_size, int) and not isinstance(expected_size, bool):
+        if expected_size < 0 or expected_size > _MAX_ARCHIVE_BYTES:
+            return None
     try:
         content = base64.b64decode(encoded, validate=True)
     except (ValueError, binascii.Error):
         return None
     if len(content) > _MAX_ARCHIVE_BYTES:
         return None
-    expected_size = raw.get("size_bytes")
     if isinstance(expected_size, int) and not isinstance(expected_size, bool):
         if expected_size != len(content):
             return None
@@ -336,10 +373,16 @@ def _seven_zip_sources(
 
     reserved = set(occupied)
     try:
-        with _py7zr.SevenZipFile(io.BytesIO(content), mode="r") as archive:
+        with _py7zr.SevenZipFile(
+            io.BytesIO(content), mode="r", max_extract_size=_MAX_ARCHIVE_EXPANDED_BYTES
+        ) as archive:
             members = list(archive.list())
             if len(members) > _MAX_FILES * 8:
                 return [], "ARCHIVE_MEMBER_LIMIT"
+            if sum(max(0, int(member.uncompressed or 0)) for member in members) > (
+                _MAX_ARCHIVE_EXPANDED_BYTES
+            ):
+                return [], "ARCHIVE_EXPANDED_SIZE_LIMIT"
             candidates: list[tuple[PurePosixPath, int]] = []
             seen_members: set[str] = set()
             total = 0
@@ -381,14 +424,40 @@ def _seven_zip_sources(
             # WriterFactory keeps every byte in bounded memory. Archive paths,
             # links and special-file metadata therefore never reach the host
             # filesystem, even before post-extraction validation.
-            archive.extract(targets=targets, factory=factory)
+            native_files = None
+            try:
+                archive.extract(targets=targets, factory=factory)
+            except Exception as exc:
+                if _SevenZipCrcError is None or not isinstance(exc, _SevenZipCrcError):
+                    raise
+                # Some real solid 7z archives fail in py7zr but decode correctly
+                # with libarchive. Verify independently, including source CRC;
+                # never accept data by disabling integrity checks.
+                from app.services.native_archive import NativeArchiveError, read_7z_members
+
+                checksums = {member.filename: getattr(member, "crc32", None) for member in members}
+                try:
+                    native_files = read_7z_members(
+                        content,
+                        {str(source): (size, checksums.get(str(source)))
+                         for source, size in candidates},
+                        max_file_bytes=_MAX_FILE_BYTES,
+                        max_source_bytes=_MAX_TOTAL_BYTES,
+                        max_expanded_bytes=_MAX_ARCHIVE_EXPANDED_BYTES,
+                        max_members=_MAX_FILES * 8,
+                    )
+                except NativeArchiveError as failure:
+                    return [], failure.code
             result: list[tuple[str, str]] = []
             actual_total = 0
             for source, declared_size in candidates:
-                extracted = factory.products.get(str(source))
-                if extracted is None or extracted.size() != declared_size:
-                    return [], "ARCHIVE_EXTRACTION_INCOMPLETE"
-                data = extracted.value()
+                if native_files is not None:
+                    data = native_files[str(source)]
+                else:
+                    extracted = factory.products.get(str(source))
+                    if extracted is None or extracted.size() != declared_size:
+                        return [], "ARCHIVE_EXTRACTION_INCOMPLETE"
+                    data = extracted.value()
                 actual_total += len(data)
                 if actual_total > _MAX_TOTAL_BYTES:
                     return [], "ARCHIVE_EXPANDED_SIZE_LIMIT"
@@ -397,7 +466,9 @@ def _seven_zip_sources(
                     continue
                 path = _unique_path(str(source), reserved)
                 result.append((path, text))
-    except Exception:
+    except Exception as exc:
+        if _SevenZipCrcError is not None and isinstance(exc, _SevenZipCrcError):
+            return [], "ARCHIVE_CHECKSUM_MISMATCH"
         return [], "ARCHIVE_INVALID_OR_ENCRYPTED"
     if not result:
         return [], "ARCHIVE_HAS_NO_READABLE_SOURCE_FILES"
@@ -442,6 +513,27 @@ def historical_source_files(
         if isinstance(artifacts, list):
             for artifact_index, raw_artifact in enumerate(artifacts, start=1):
                 if not isinstance(raw_artifact, dict):
+                    continue
+                # The worker already streamed and extracted this attachment.
+                # Keep only bounded text, never a page-sized collection of
+                # base64 archives. This key is generated locally, not by Moodle.
+                prepared = raw_artifact.get("_source_files")
+                if isinstance(prepared, list) and raw_artifact.get("downloaded") is True:
+                    if raw_artifact.get("_source_error"):
+                        archive_failures.append((
+                            _safe_filename(raw_artifact.get("filename"), "moodle-file"),
+                            str(raw_artifact["_source_error"]),
+                        ))
+                    for path, text in prepared:
+                        if (
+                            len(sources) >= _MAX_FILES
+                            or len(text.encode("utf-8")) > _MAX_FILE_BYTES
+                        ):
+                            return _unavailable_source_files()
+                        total += len(text.encode("utf-8"))
+                        if total > _MAX_TOTAL_BYTES:
+                            return _unavailable_source_files()
+                        sources.append((_unique_path(path, occupied), text))
                     continue
                 content = _decode_artifact(raw_artifact)
                 if content is None:
@@ -574,14 +666,19 @@ def _source_omissions(item: dict[str, Any]) -> list[dict[str, str]]:
         if not isinstance(artifacts, list):
             continue
         for artifact in artifacts:
-            if not isinstance(artifact, dict) or artifact.get("downloaded") is not False:
+            if not isinstance(artifact, dict):
+                continue
+            source_error = artifact.get("_source_error")
+            if artifact.get("downloaded") is not False and not source_error:
                 continue
             omissions.append(
                 {
-                    "kind": "ATTACHMENT",
+                    "kind": "ATTACHMENT_ARCHIVE" if source_error else "ATTACHMENT",
                     "response_id": response_id,
                     "filename": _safe_filename(artifact.get("filename"), "moodle-file"),
-                    "reason": str(artifact.get("omission_reason") or "UNAVAILABLE")[:255],
+                    "reason": str(
+                        source_error or artifact.get("omission_reason") or "UNAVAILABLE"
+                    )[:255],
                 }
             )
             if len(omissions) >= 128:
@@ -895,6 +992,39 @@ def _quiz_question_identity(cmid: int, response_id: str) -> tuple[str, str]:
     return f"quiz:{cmid}:essay:{digest[:24]}", digest
 
 
+def _quiz_response_revision_projection(response: dict[str, Any]) -> dict[str, Any]:
+    """Hash attachment identities without serializing their large base64 bodies."""
+
+    artifacts = response.get("artifacts")
+    if not isinstance(artifacts, list):
+        return response
+    projected_artifacts: list[Any] = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            projected_artifacts.append(artifact)
+            continue
+        projected = {
+            key: value for key, value in artifact.items()
+            if key not in {"content_base64", "download_url"} and not key.startswith("_")
+        }
+        digest = artifact.get("sha256")
+        if isinstance(digest, str) and re.fullmatch(r"[a-fA-F0-9]{64}", digest):
+            # The authenticated connector hashes the bytes and _decode_artifact
+            # verifies that digest before retaining any student source text.
+            projected["sha256"] = digest.lower()
+        elif isinstance(encoded := artifact.get("content_base64"), str):
+            # Legacy/test payloads may omit sha256. Retain change detection
+            # without constructing a second attachment-sized UTF-8/JSON copy.
+            encoded_digest = hashlib.sha256()
+            for offset in range(0, len(encoded), 256 * 1024):
+                encoded_digest.update(encoded[offset : offset + 256 * 1024].encode("utf-8"))
+            projected["content_base64_sha256"] = encoded_digest.hexdigest()
+        elif "content_base64" in artifact:
+            projected["content_base64"] = artifact["content_base64"]
+        projected_artifacts.append(projected)
+    return {**response, "artifacts": projected_artifacts}
+
+
 def _quiz_response_submission(
     item: dict[str, Any], response: dict[str, Any], *, position: int
 ) -> dict[str, Any]:
@@ -924,7 +1054,7 @@ def _quiz_response_submission(
         {
             "schema": "moodle-quiz-essay-split-v1",
             "parent_external_id": split["moodle_parent_external_id"],
-            "response": response,
+            "response": _quiz_response_revision_projection(response),
         }
     )
     return split
@@ -1592,6 +1722,7 @@ async def _materialize_flat_historical_submissions(
     actor_external_subject: str,
     items: list[dict[str, Any]],
     attached_version: TaskVersion | None = None,
+    prepared_sources: dict[str, _HistoricalSourceMaterialization] | None = None,
 ) -> MoodleHistoryImportStats:
     """Idempotently project read-only Moodle attempts into the review domain."""
 
@@ -1696,9 +1827,13 @@ async def _materialize_flat_historical_submissions(
                 )
             stats = stats.add("unchanged")
             continue
-        conversion_omissions: list[dict[str, str]] = []
-        files = historical_source_files(item, import_omissions=conversion_omissions)
-        source_omissions = [*_source_omissions(item), *conversion_omissions]
+        converted = (prepared_sources or {}).get(external_id)
+        if converted is None:
+            # Archive decoding/extraction must not stop the API/worker event
+            # loop while other students are submitting their work.
+            converted = await asyncio.to_thread(_convert_historical_sources, item)
+        files = converted.files
+        source_omissions = [*_source_omissions(item), *converted.omissions]
         if files and files[0]["path"] == "moodle-import.txt" and not source_omissions:
             source_omissions.append(
                 {
@@ -1859,6 +1994,28 @@ async def _materialize_flat_historical_submissions(
             if submission is None or attempt is None or workspace is None:
                 stats = stats.add("skipped")
                 continue
+            previous_receipt = dict(submission.external_receipt or {})
+            if source_omissions and previous_receipt.get("source_complete") is True:
+                # A failed retry or materialization-version upgrade must not
+                # replace already available code with an import placeholder.
+                # Keep the old mapping version/revision so a later manual
+                # synchronization can retry materialization successfully.
+                submission.external_receipt = {
+                    **previous_receipt,
+                    **_origin_receipt_fields(item),
+                    "source_refresh_complete": False,
+                    "source_refresh_omissions": source_omissions,
+                }
+                _record_import_actor(
+                    submission=submission,
+                    mapping=mapping,
+                    actor_external_subject=actor_external_subject,
+                )
+                await _sync_imported_decision(
+                    db, submission=submission, assessment=assessment, course=course, item=item
+                )
+                stats = stats.add("unchanged")
+                continue
             _reactivate_retired_quiz_response(
                 mapping=mapping,
                 submission=submission,
@@ -1941,6 +2098,8 @@ async def _materialize_flat_historical_submissions(
                     HISTORICAL_SOURCE_MATERIALIZATION_VERSION
                 ),
                 "source_omissions": source_omissions,
+                "source_refresh_complete": not source_omissions,
+                "source_refresh_omissions": source_omissions,
                 "state": item.get("state"),
             }
             mapping.external_revision = external_revision
@@ -1998,6 +2157,23 @@ async def materialize_historical_submissions(
     # appears in the report, even though an IN_PROGRESS row is not itself a
     # reviewable Submission.  Record that remote fact before the draft rows are
     # intentionally skipped by either flat or split materialization.
+    # A concurrent/older report page may still contain a deleted attempt. A
+    # durable, exact deletion proof wins over that stale page; it must not
+    # recreate the latest-attempt marker or resurrect a review row.
+    deleted_ids = await deleted_quiz_attempt_ids(db, course=course, assessment=assessment)
+    if deleted_ids:
+        items = [
+            item
+            for item in items
+            if not (
+                isinstance(item, dict)
+                and item.get("module") == "quiz"
+                and str(
+                    item.get("moodle_parent_attempt_id") or item.get("attempt_id") or ""
+                ).removeprefix("attempt:")
+                in deleted_ids
+            )
+        ]
     actor = actor_external_subject.strip()[:255]
     if actor:
         observed_principals: dict[str, ExternalPrincipal] = {}
@@ -2118,9 +2294,12 @@ async def materialize_historical_submissions(
                 stats = stats.add("skipped")
                 continue
             response_ids.append(response_id)
-            split_item = _quiz_response_submission(item, response, position=position)
+            split_item = await asyncio.to_thread(
+                _quiz_response_submission, item, response, position=position
+            )
             active_external_ids.add(str(split_item["external_id"]))
-            multi_file = len(historical_source_files(split_item)) > 1
+            converted = await asyncio.to_thread(_convert_historical_sources, split_item)
+            multi_file = len(converted.files) > 1
             child, version = await _ensure_quiz_question_context(
                 db,
                 course=course,
@@ -2148,6 +2327,7 @@ async def materialize_historical_submissions(
                     actor_external_subject=actor_external_subject,
                     items=[split_item],
                     attached_version=version,
+                    prepared_sources={str(split_item["external_id"]): converted},
                 )
             )
         if not legacy_adopted:
@@ -2176,12 +2356,14 @@ async def enqueue_historical_submission_imports(
     *,
     course: Course,
     actor_external_subject: str,
+    minimum_interval_seconds: int = 0,
+    assessment_id: uuid.UUID | None = None,
+    manual_run_id: str | None = None,
 ) -> int:
-    """Queue fast review-candidate scans for the teacher who synchronized the course.
+    """Queue selected report inventories, independently of slow answer hydration.
 
-    The exhaustive crawl is chained only after this priority pass completes.
-    That prevents dozens of old graded responses from delaying a newly
-    finished attempt which Moodle already marks as requiring manual grading.
+    Manual API callers hold the course admission lock and select exactly one
+    assessment. The optional selector also supports internal fixture helpers.
     """
 
     actor_external_subject = actor_external_subject.strip()[:255]
@@ -2223,6 +2405,7 @@ async def enqueue_historical_submission_imports(
                 select(ExternalMapping).where(
                     ExternalMapping.connection_id == course.connection_id,
                     ExternalMapping.local_type.in_(["Assessment", "core.assessment"]),
+                    *([ExternalMapping.local_id == assessment_id] if assessment_id else []),
                 )
             )
         ).all()
@@ -2238,26 +2421,38 @@ async def enqueue_historical_submission_imports(
             )
         ).all()
     )
-    active_chains = {
-        (
-            row.aggregate_id,
-            str((row.payload or {}).get("actor_external_subject", "")),
-            (row.payload or {}).get("priority_only") is True,
-        )
-        for row in active_rows
-    }
+    # Deduplication belongs to the work, not the teacher who clicked. Include
+    # detail jobs: a delivered inventory does not mean its answers are ready.
+    active_chains = {row.aggregate_id for row in active_rows}
+    recent_assessments: set[uuid.UUID] = set()
+    if minimum_interval_seconds:
+        recent_rows = (
+            await db.execute(
+                select(SyncOutbox.aggregate_id, SyncOutbox.payload).where(
+                    SyncOutbox.course_id == course.id,
+                    SyncOutbox.event_type == "moodle.history.import",
+                    SyncOutbox.created_at > utcnow() - timedelta(seconds=minimum_interval_seconds),
+                    SyncOutbox.payload["scan_only"].as_boolean().is_(True),
+                    SyncOutbox.payload["actor_external_subject"].as_string()
+                    == actor_external_subject,
+                )
+            )
+        ).all()
+        recent_assessments = {row[0] for row in recent_rows}
     queued = 0
     for mapping in mappings:
         assessment = await db.get(Assessment, mapping.local_id)
         if assessment is None or assessment.course_id != course.id:
             continue
         metadata = mapping.metadata_json if isinstance(mapping.metadata_json, dict) else {}
+        if metadata.get("sync_state") == "MISSING_IN_MOODLE":
+            continue
         module = str(metadata.get("module", mapping.external_type)).lower().removeprefix("mod_")
         cmid = metadata.get("cmid", mapping.external_id)
         if module not in {"quiz", "assign"} or isinstance(cmid, bool) or not str(cmid).isdigit():
             continue
-        chain_key = (assessment.id, actor_external_subject, True)
-        if chain_key in active_chains:
+        chain_key = assessment.id
+        if chain_key in active_chains or assessment.id in recent_assessments:
             continue
         actor_hash = hashlib.sha256(actor_external_subject.encode("utf-8")).hexdigest()[:12]
         event_id = uuid.uuid4().hex[:12]
@@ -2281,10 +2476,165 @@ async def enqueue_historical_submission_imports(
                     # reverse-proxy timeout even on the low-power N150 host.
                     "limit": 5,
                     "priority_only": True,
+                    "scan_only": True,
+                    **({"manual_run_id": manual_run_id} if manual_run_id else {}),
                 },
             )
         )
         active_chains.add(chain_key)
+        queued += 1
+        if manual_run_id and module == "quiz":
+            # No automatic tick remains to rotate deletion probes. Snapshot
+            # all known identities, then check independent bounded batches.
+            known_ids = await known_quiz_attempt_ids(
+                db,
+                course=course,
+                assessment=assessment,
+                cmid=int(cmid),
+            )
+            for offset in range(0, len(known_ids), 5):
+                db.add(
+                    SyncOutbox(
+                        connection_id=course.connection_id,
+                        course_id=course.id,
+                        event_type="moodle.history.import",
+                        aggregate_type="Assessment",
+                        aggregate_id=assessment.id,
+                        idempotency_key=f"history-probe:{manual_run_id}:{offset}",
+                        payload={
+                            "course_id": course.external_id,
+                            "actor_external_subject": actor_external_subject,
+                            "module": module,
+                            "cmid": int(cmid),
+                            "cursor": "0:0",
+                            "limit": 5,
+                            "priority_only": True,
+                            "scan_only": True,
+                            "probe_only": True,
+                            "known_attempt_ids": known_ids[offset : offset + 5],
+                            "manual_run_id": manual_run_id,
+                            "detail_key": f"probe:{offset}",
+                        },
+                    )
+                )
+    await db.flush()
+    return queued
+
+
+async def enqueue_historical_answer_reads(
+    db: AsyncSession,
+    *,
+    course: Course,
+    assessment: Assessment,
+    actor_external_subject: str,
+    module: str,
+    cmid: int,
+    candidates: list[dict[str, Any]],
+    scan_id: uuid.UUID,
+    manual_run_id: str | None = None,
+) -> int:
+    """Pin each latest report candidate to an independent, retryable detail job.
+
+    One bad file cannot block later students or later activities. Identical
+    completed details are refreshed every fifteen minutes (comments may change
+    without a report grade change), while new/changed attempts are immediate.
+    """
+    from app.integrations.moodle_browser import normalize_history_attempt_refs
+
+    candidates = normalize_history_attempt_refs(candidates, module, maximum=500)
+    now = utcnow()
+    recent = list(
+        (
+            await db.scalars(
+                select(SyncOutbox).where(
+                    SyncOutbox.course_id == course.id,
+                    SyncOutbox.aggregate_id == assessment.id,
+                    SyncOutbox.event_type == "moodle.history.import",
+                    SyncOutbox.payload["actor_external_subject"].as_string()
+                    == actor_external_subject,
+                    or_(
+                        SyncOutbox.state.in_(_IMPORT_EVENT_STATES),
+                        SyncOutbox.delivered_at > now - timedelta(minutes=15),
+                    ),
+                )
+            )
+        ).all()
+    )
+    existing: set[tuple[str, str]] = set()
+    for row in recent:
+        refs = (row.payload or {}).get("attempt_refs", [])
+        for ref in refs if isinstance(refs, list) else []:
+            if not isinstance(ref, dict):
+                continue
+            active = row.state in _IMPORT_EVENT_STATES
+            clean = (
+                row.state == "DELIVERED"
+                and not (row.receipt or {}).get("warning_count", 0)
+                # Explicit synchronization must re-read code and comments,
+                # even when Moodle's grade and timestamps did not change.
+                and (
+                    manual_run_id is None
+                    or (row.payload or {}).get("manual_run_id") == manual_run_id
+                )
+            )
+            if active or clean:
+                existing.add((str(ref.get("attempt_id")), "*" if active else canonical_hash(ref)))
+    deleted = (
+        await deleted_quiz_attempt_ids(db, course=course, assessment=assessment)
+        if module == "quiz"
+        else set()
+    )
+    queued = 0
+    for ref in candidates:
+        attempt_id = ref["attempt_id"]
+        if (
+            attempt_id in deleted
+            or (attempt_id, "*") in existing
+            or (attempt_id, canonical_hash(ref)) in existing
+        ):
+            continue
+        if module == "quiz" and ref["state"] == "IN_PROGRESS":
+            await materialize_historical_submissions(
+                db,
+                course=course,
+                assessment=assessment,
+                actor_external_subject=actor_external_subject,
+                items=[
+                    {
+                        **ref,
+                        "module": module,
+                        "cmid": cmid,
+                        "external_id": f"quiz:{cmid}:{attempt_id}",
+                        "external_revision": canonical_hash(ref),
+                        "responses": [],
+                        "responses_complete": False,
+                    }
+                ],
+            )
+            continue
+        digest = canonical_hash([attempt_id, ref["user_id"]])[:20]
+        db.add(
+            SyncOutbox(
+                connection_id=course.connection_id,
+                course_id=course.id,
+                event_type="moodle.history.import",
+                aggregate_type="Assessment",
+                aggregate_id=assessment.id,
+                idempotency_key=f"history-answer:{scan_id.hex}:{digest}",
+                payload={
+                    "course_id": course.external_id,
+                    "actor_external_subject": actor_external_subject,
+                    "module": module,
+                    "cmid": cmid,
+                    "cursor": "0:0",
+                    "limit": 1,
+                    "priority_only": False,
+                    "attempt_refs": [ref],
+                    "detail_key": attempt_id,
+                    **({"manual_run_id": manual_run_id} if manual_run_id else {}),
+                },
+            )
+        )
         queued += 1
     await db.flush()
     return queued

@@ -40,6 +40,7 @@ from app.services.moodle_quiz_runtime import (
     PreparedMoodleAssignment,
     PreparedMoodleQuizAttempt,
     apply_prepared_quiz_timer,
+    ensure_moodle_activity_not_missing,
     materialize_prepared_task_version,
     pinned_moodle_quiz_binding,
     prepared_binding_matches_attempt,
@@ -151,6 +152,12 @@ def _assert_idempotent_replay(prior: EditEvent, expected_hash: str) -> None:
 
 
 def ensure_attempt_not_finalized_in_moodle(attempt: Attempt) -> None:
+    if attempt.submission_source == "MOODLE_DELETED":
+        raise DomainError(
+            423,
+            "LMS_ATTEMPT_DELETED",
+            "The attempt was deleted in Moodle; this local copy is read-only",
+        )
     if attempt.submission_source == "MOODLE_FINALIZED":
         raise DomainError(
             423,
@@ -183,6 +190,10 @@ def _validate_workspace_size(*, file_count: int, total_bytes: int) -> None:
 
 
 async def _active_files(db: AsyncSession, workspace_id: uuid.UUID) -> list[WorkspaceFile]:
+    # Sessions deliberately disable autoflush/expiration. Persist this
+    # operation's pending edits before refreshing files loaded by an earlier
+    # request phase; otherwise snapshots can silently include stale source.
+    await db.flush()
     return list(
         (
             await db.scalars(
@@ -192,6 +203,7 @@ async def _active_files(db: AsyncSession, workspace_id: uuid.UUID) -> list[Works
                     WorkspaceFile.deleted_revision.is_(None),
                 )
                 .order_by(WorkspaceFile.path)
+                .execution_options(populate_existing=True)
             )
         ).all()
     )
@@ -391,8 +403,12 @@ async def start_attempt(
     moodle_sync_timeout: int = 300,
     client_context: dict[str, str] | None = None,
 ) -> Attempt:
+    await db.flush()
     assessment = await db.scalar(
-        select(Assessment).where(Assessment.id == assessment_id).with_for_update()
+        select(Assessment)
+        .where(Assessment.id == assessment_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if assessment is None:
         raise DomainError(404, "ASSESSMENT_NOT_FOUND", "Assessment was not found")
@@ -403,6 +419,7 @@ async def start_attempt(
         role=CourseRole.STUDENT,
     )
     effective_policy = await ensure_assessment_available(db, assessment, membership)
+    await ensure_moodle_activity_not_missing(db, assessment.id)
     assessment_policy = assessment.policy if isinstance(assessment.policy, dict) else {}
     moodle_managed = (
         assessment_policy.get("moodle_metadata_read_only") is True
@@ -419,6 +436,7 @@ async def start_attempt(
                 )
                 .order_by(Attempt.sequence)
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
         ).all()
     )
@@ -505,6 +523,7 @@ async def start_attempt(
                 expected_multi_file = prepared_moodle_quiz.answer_transport == "ESSAY_ATTACHMENT"
                 workspace = await db.scalar(
                     select(Workspace).where(Workspace.attempt_id == active.id).with_for_update()
+                    .execution_options(populate_existing=True)
                 )
                 if workspace is None:
                     raise DomainError(
@@ -587,6 +606,7 @@ async def start_attempt(
                     )
             workspace = await db.scalar(
                 select(Workspace).where(Workspace.attempt_id == active.id).with_for_update()
+                .execution_options(populate_existing=True)
             )
             if workspace is None:
                 raise DomainError(
@@ -853,12 +873,17 @@ async def _locked_workspace(
     require_active: bool = True,
     require_current_membership: bool = True,
 ) -> tuple[Attempt, Workspace]:
+    # A row lock serializes database writers but does not refresh SQLAlchemy's
+    # identity map. Another save/deadline worker may have committed since this
+    # session first loaded the attempt. Recheck the locked, current state.
+    await db.flush()
     relation = await quiz_question_for_attempt(db, attempt_id)
     if relation is not None:
         # All solution mutations lock the common root first. Finish-all can
         # then snapshot every sibling without interleaved writes or deadlocks.
         root = await db.scalar(
             select(Attempt).where(Attempt.id == relation.root_attempt_id).with_for_update()
+            .execution_options(populate_existing=True)
         )
         if root is None or root.principal_id != principal_id:
             raise DomainError(404, "ATTEMPT_NOT_FOUND", "Attempt was not found")
@@ -866,7 +891,10 @@ async def _locked_workspace(
             ensure_attempt_not_finalized_in_moodle(root)
             if root.state != AttemptState.ACTIVE.value:
                 raise DomainError(409, "ATTEMPT_READ_ONLY", "Attempt is read-only")
-    attempt = await db.scalar(select(Attempt).where(Attempt.id == attempt_id).with_for_update())
+    attempt = await db.scalar(
+        select(Attempt).where(Attempt.id == attempt_id).with_for_update()
+        .execution_options(populate_existing=True)
+    )
     if attempt is None or attempt.principal_id != principal_id:
         raise DomainError(404, "ATTEMPT_NOT_FOUND", "Attempt was not found")
     if require_current_membership:
@@ -881,6 +909,7 @@ async def _locked_workspace(
         )
     workspace = await db.scalar(
         select(Workspace).where(Workspace.attempt_id == attempt.id).with_for_update()
+        .execution_options(populate_existing=True)
     )
     if workspace is None:
         raise DomainError(500, "WORKSPACE_MISSING", "Attempt workspace is missing")
@@ -960,6 +989,7 @@ async def replace_file_content(
             WorkspaceFile.deleted_revision.is_(None),
         )
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if file is None:
         raise DomainError(404, "WORKSPACE_FILE_NOT_FOUND", "Workspace file was not found")
@@ -1020,6 +1050,7 @@ async def replace_file_content(
                 ClipboardReceipt.used_at.is_(None),
             )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if receipt is None or (receipt.text_hash, receipt.text_length) not in {
             (sha256_text(inserted_text), len(inserted_text)),  # legacy receipts
@@ -1383,6 +1414,7 @@ async def create_clipboard_receipt(
             WorkspaceFile.workspace_id == workspace.id,
             WorkspaceFile.deleted_revision.is_(None),
         )
+        .execution_options(populate_existing=True)
     )
     normalized_text = text.replace("\r\n", "\n")
     if source_file is None or normalized_text not in source_file.content.replace("\r\n", "\n"):

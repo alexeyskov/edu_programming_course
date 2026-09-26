@@ -13,6 +13,7 @@ from app.core.config import Settings
 from app.integrations.ai import AIProvider
 from app.integrations.authorship import AuthorshipTransport
 from app.integrations.errors import (
+    AIContextTooLarge,
     IntegrationProtocolError,
     IntegrationResponseTooLarge,
     IntegrationTimeout,
@@ -598,6 +599,103 @@ async def test_ai_bounds_history_and_filters_citations() -> None:
     assert answer.citations == [
         {"title": "vector", "url": "https://en.cppreference.com/w/cpp/container/vector"}
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api_style", ["chat", "responses", "ollama"])
+@pytest.mark.parametrize("mode", ["STUDENT", "TEACHER"])
+async def test_ai_passes_the_complete_task_and_all_source_files(api_style, mode):
+    context = {
+        "task": {"title": "Задача 2", "statement": "Проверьте свойства строки"},
+        "files": [
+            {"path": "main.cpp", "content": "// текст\n" * 500},
+            {"path": "helper.cpp", "content": "// весь файл\n" * 200},
+            {"path": "empty.h", "content": ""},
+        ],
+    }
+    if mode == "TEACHER":
+        context["teacher_comment"] = {"content": "Проверить границы"}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        prompt = payload["input" if api_style == "responses" else "messages"][-1]["content"]
+        serialized, question = prompt.split("\n\nUser question:\n")
+        assert json.loads(serialized.split("\n", 1)[1]) == context
+        assert question == "Объясни поведение"
+        system = (
+            payload["instructions"] if api_style == "responses"
+            else payload["messages"][0]["content"]
+        )
+        if mode == "STUDENT":
+            assert "Never write code" in system
+            assert "short snippet" in system
+        reply = "Проверьте свойства: https://en.cppreference.com/w/cpp/string"
+        result = (
+            {"choices": [{"message": {"content": reply}}]} if api_style == "chat"
+            else {"message": {"content": reply}} if api_style == "ollama"
+            else {"output_text": reply}
+        )
+        return httpx.Response(200, json=result)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        answer = await AIProvider(configured_settings(), client, api_style=api_style).answer(
+            mode=mode, question="Объясни поведение", context=context,
+        )
+    assert answer.safety_outcome == "ALLOWED"
+
+
+@pytest.mark.asyncio
+async def test_ai_never_calls_provider_with_truncated_context():
+    async def handler(_: httpx.Request) -> httpx.Response:
+        pytest.fail("Oversized context must not be sent")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = AIProvider(configured_settings(ai_max_context_bytes=1024), client)
+        with pytest.raises(AIContextTooLarge):
+            await provider.answer(
+                mode="TEACHER", question="Объясни поведение",
+                context={"files": [{"path": "main.cpp", "content": "я" * 1000}]},
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("snippet", [
+    "```cpp\nreturn 0;\n```", "```\nx ← 1\n```", "~~~python\nx = 1\n~~~",
+    "Исправьте на `return result;`", "int value = 0;", "value += 1;",
+    "items.push_back(value);", "if (value > 0)", "std::cout << result;",
+])
+async def test_student_ai_blocks_short_code_but_teacher_may_receive_it(snippet):
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"output_text": snippet})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = AIProvider(configured_settings(), client)
+        student = await provider.answer(mode="STUDENT", question="Объясни ошибку", context={})
+        teacher = await provider.answer(mode="TEACHER", question="Объясни ошибку", context={})
+    assert student.safety_outcome == "BLOCKED_SOLUTION"
+    assert snippet not in student.content
+    assert teacher.content == snippet
+    assert teacher.safety_outcome == "ALLOWED"
+
+
+@pytest.mark.asyncio
+async def test_student_ai_allows_prose_and_identifier_names_with_documentation():
+    content = (
+        "В файле helper.cpp на строке 4 проверьте тип переменной `result`. "
+        "Чем отличается `return` от `break`? Обратите внимание на границы `std::vector`: "
+        "https://en.cppreference.com/w/cpp/container/vector"
+    )
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"output_text": content})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        answer = await AIProvider(configured_settings(), client).answer(
+            mode="STUDENT", question="Что проверить?", context={},
+        )
+    assert answer.content == content
+    assert answer.safety_outcome == "ALLOWED"
+    assert len(answer.citations) == 1
 
 
 @pytest.mark.asyncio

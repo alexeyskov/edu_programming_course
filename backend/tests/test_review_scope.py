@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 from httpx import ASGITransport, AsyncClient
 from pydantic import SecretStr
 from sqlalchemy import select
@@ -263,6 +264,20 @@ def test_legacy_subgroup_matching_requires_exact_surname_and_initials() -> None:
     )
     assert not legacy_subgroup_is_assigned_to_teacher(
         "2.4 подгруппа Коваленко", "Алексей Коваленко"
+    )
+
+
+@pytest.mark.parametrize("marker", ["АК", "КА"])
+def test_teacher_avatar_initials_do_not_hide_their_assigned_subgroup(marker):
+    name = f"{marker} Алексей Коваленко"
+    assert legacy_subgroup_is_assigned_to_teacher("2.4 подгруппа Коваленко А.С.", name)
+    assert not legacy_subgroup_is_assigned_to_teacher("2.4 подгруппа Коваленко И.С.", name)
+    assert not legacy_subgroup_is_assigned_to_teacher("2.4 подгруппа Ковален А.С.", name)
+    assert not legacy_subgroup_is_assigned_to_teacher(
+        "2.4 подгруппа Коваленко А.С.", "КА Иван Коваленко",
+    )
+    assert not legacy_subgroup_is_assigned_to_teacher(
+        "2.4 подгруппа Коваленко А.С.", "Ка Алексей Коваленко",
     )
 
 

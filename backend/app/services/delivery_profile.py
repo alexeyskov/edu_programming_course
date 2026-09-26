@@ -14,6 +14,7 @@ from app.models.courses import Course
 from app.models.identity import LMSConnection
 from app.models.integration import ExternalMapping
 from app.models.tasks import Assessment
+from app.services.assessment_mappings import assessment_activity_mappings
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,16 +48,8 @@ async def resolve_assessment_workspace_delivery_profile(
     if context is None:
         return AssessmentWorkspaceDeliveryResolution(external=False, profile=None)
     course, connection = context
-    mappings = list(
-        (
-            await db.scalars(
-                select(ExternalMapping).where(
-                    ExternalMapping.connection_id == course.connection_id,
-                    ExternalMapping.local_id == assessment_id,
-                    ExternalMapping.local_type.in_(["Assessment", "core.assessment"]),
-                )
-            )
-        ).all()
+    mappings = await assessment_activity_mappings(
+        db, connection_id=course.connection_id, assessment_id=assessment_id,
     )
     if not mappings:
         # A local assessment in an LMS-backed course remains provider-neutral:

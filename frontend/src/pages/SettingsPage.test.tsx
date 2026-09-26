@@ -496,6 +496,22 @@ describe('administrator course catalog settings', () => {
     expect(mocks.refresh).toHaveBeenCalledOnce();
   });
 
+  it('does not enqueue the same course twice while discovery is waiting', async () => {
+    const pending = deferred<any>();
+    mocks.createCourseImport.mockReturnValue(pending.promise);
+    renderSettings();
+    const input = await screen.findByLabelText('Ссылка на курс Moodle');
+    fireEvent.change(input, { target: { value: 'https://edu.mmcs.sfedu.ru/course/view.php?id=549' } });
+    const button = screen.getByRole('button', { name: 'Добавить курс' });
+    fireEvent.click(button);
+    expect(button).toBeDisabled();
+    fireEvent.submit(input.closest('form')!);
+    fireEvent.click(button);
+    expect(mocks.createCourseImport).toHaveBeenCalledTimes(1);
+    pending.reject(new Error('Test connector offline'));
+    await waitFor(() => expect(button).not.toBeDisabled());
+  });
+
   it('rejects a URL that is not a Moodle course before calling the API', async () => {
     renderSettings();
 

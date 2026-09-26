@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from collections.abc import AsyncIterator, Mapping
@@ -57,9 +58,14 @@ async def request_json_limited(
     headers: Mapping[str, str] | None = None,
     content: bytes | None = None,
     data: Mapping[str, Any] | None = None,
+    offload_json: bool = False,
 ) -> Any:
     try:
-        async with client.stream(
+        # httpx's read timeout is reset for each chunk. A stalled/dribbling
+        # response could otherwise hold a worker and a Moodle session forever.
+        # Bound pool acquisition, connect, headers AND the complete body with
+        # one wall-clock deadline in addition to the per-I/O timeouts.
+        async with asyncio.timeout(timeout_seconds), client.stream(
             method,
             url,
             headers=headers,
@@ -71,7 +77,7 @@ async def request_json_limited(
             raw = await read_limited(response.aiter_bytes(), response_limit)
     except IntegrationResponseTooLarge:
         raise
-    except httpx.TimeoutException as exc:
+    except (httpx.TimeoutException, TimeoutError) as exc:
         raise IntegrationTimeout() from exc
     except httpx.HTTPStatusError as exc:
         # Keep the status useful for diagnostics while excluding the request URL,
@@ -87,7 +93,12 @@ async def request_json_limited(
     def reject_non_finite(value: str) -> None:
         raise ValueError(f"non-finite JSON constant: {value}")
 
-    try:
+    def decode_json() -> Any:
         return json.loads(raw.decode("utf-8"), parse_constant=reject_non_finite)
+
+    try:
+        # Historical archives can make a response larger than 100 MiB. Keep
+        # parsing off the event loop shared with student requests/heartbeats.
+        return await asyncio.to_thread(decode_json) if offload_json else decode_json()
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise IntegrationProtocolError("External service returned invalid JSON") from exc

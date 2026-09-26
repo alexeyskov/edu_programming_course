@@ -33,6 +33,47 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
+function renderAssessment() {
+  render(<MemoryRouter initialEntries={['/assessments/assessment-1']}><ToastProvider><Routes>
+    <Route path="/assessments/:assessmentId" element={<AssessmentIntroPage />} />
+  </Routes></ToastProvider></MemoryRouter>);
+}
+
+describe('Moodle group access', () => {
+  it('saves an explicit empty group list when the last group is unchecked', async () => {
+    renderAssessment();
+    fireEvent.click(await screen.findByRole('button', { name: 'Изменить доступ' }));
+    const group = await screen.findByRole('checkbox', { name: /Тестовая группа/ });
+    expect(group).toBeChecked();
+    fireEvent.click(group);
+    const save = screen.getByRole('button', { name: 'Сохранить доступ' });
+    expect(save).toBeEnabled();
+    fireEvent.click(save);
+    await waitFor(() => expect(mocks.publishAssessment).toHaveBeenCalledWith('assessment-1', [], false));
+  });
+
+  it('does not mistake a failed group request for an empty selection', async () => {
+    mocks.getAssessmentPublicationTargets.mockRejectedValue(new Error('Группы не загружены'));
+    renderAssessment();
+    fireEvent.click(await screen.findByRole('button', { name: 'Изменить доступ' }));
+    await screen.findByText('Группы не загружены');
+    const save = screen.getByRole('button', { name: 'Сохранить доступ' });
+    expect(save).toBeDisabled();
+    fireEvent.click(save);
+    expect(mocks.publishAssessment).not.toHaveBeenCalled();
+  });
+
+  it('still requires a selected group when initially opening a draft', async () => {
+    mocks.getAssessment.mockResolvedValue({ ...assessment, publicationStatus: 'DRAFT', availabilityRules: [] });
+    renderAssessment();
+    fireEvent.click(await screen.findByRole('button', { name: 'Настроить доступ' }));
+    const group = await screen.findByRole('checkbox', { name: /Тестовая группа/ });
+    expect(screen.getByRole('button', { name: 'Открыть работу' })).toBeDisabled();
+    fireEvent.click(group);
+    expect(screen.getByRole('button', { name: 'Открыть работу' })).toBeEnabled();
+  });
+});
+
 describe('per-assessment student AI access', () => {
   it.each([false, true])('lets the teacher change the current %s policy without editing Moodle metadata', async (initial) => {
     mocks.getAssessment.mockResolvedValue({ ...assessment, aiEnabled: initial });

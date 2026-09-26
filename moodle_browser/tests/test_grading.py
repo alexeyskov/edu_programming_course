@@ -210,7 +210,8 @@ async def test_quiz_grade_uses_canonical_manual_grading_form(
         f"{settings.base_url}/mod/quiz/comment.php?attempt=134403&slot=1",
         f"{settings.base_url}/course/modedit.php?update=777&return=1",
         f"{settings.base_url}/mod/quiz/report.php?id=777&mode=overview"
-        "&attempts=enrolled_with&onlygraded=0&onlyregraded=0&slotmarks=1&group=0&page=0",
+        "&attempts=enrolled_with&onlygraded=0&onlyregraded=0&slotmarks=1&group=0"
+        "&tifirst=&tilast=&page=0",
     ]
     assert guard_page.closed is True
     assert target == "/mod/quiz/comment.php"

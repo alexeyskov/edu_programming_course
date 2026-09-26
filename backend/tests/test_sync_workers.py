@@ -46,7 +46,6 @@ from app.models.integration import ExternalMapping, LMSSubmissionFingerprint, Sy
 from app.models.review import ReviewDecision
 from app.models.tasks import Assessment, AvailabilityRule, TaskBankItem, TaskVersion
 from app.services.common import DomainError, canonical_hash, canonical_json, sha256_text
-from app.services.course_sync_state import course_sync_stale_before
 from app.services.sync import (
     ClaimedOutboxEvent,
     ConnectionTarget,
@@ -523,6 +522,7 @@ async def _seed_attempt(
     duration_seconds: int | None = 600,
     revision: int = 4,
     auth_mode: str = "BRIDGE",
+    enrolled: bool = False,
 ) -> tuple[uuid.UUID, uuid.UUID]:
     async with session_factory() as db, db.begin():
         connection = LMSConnection(
@@ -546,6 +546,10 @@ async def _seed_attempt(
         )
         db.add_all([principal, course])
         await db.flush()
+        if enrolled:
+            db.add(CourseMembership(
+                course_id=course.id, principal_id=principal.id, role="STUDENT", active=True,
+            ))
         assessment = Assessment(
             course_id=course.id,
             title="Exam",
@@ -1225,19 +1229,16 @@ async def test_scheduler_enqueues_periodic_heartbeat_without_workspace_change(ap
         session_factory,
         settings,
         now=now,
-        include_course_sync=False,
     )
     duplicate = await run_scheduler_iteration(
         session_factory,
         settings,
         now=now,
-        include_course_sync=False,
     )
     heartbeat = await run_scheduler_iteration(
         session_factory,
         settings,
         now=now + timedelta(seconds=61),
-        include_course_sync=False,
     )
 
     async with session_factory() as db:
@@ -1537,7 +1538,6 @@ async def test_deadline_always_submits_last_server_revision(app_bundle) -> None:
         session_factory,
         settings,
         now=now,
-        include_course_sync=False,
     )
 
     async with session_factory() as db:
@@ -1582,7 +1582,6 @@ async def test_final_minute_checkpoint_is_terminal_even_without_new_revision(app
         session_factory,
         settings,
         now=now,
-        include_course_sync=False,
     )
 
     async with session_factory() as db:
@@ -2270,6 +2269,7 @@ async def test_latest_grade_uses_explicit_mod_assign_mapping_and_numeric_user(
         now=now,
         deadline=now + timedelta(minutes=10),
         auth_mode=auth_mode,
+        enrolled=True,
     )
     async with session_factory() as db, db.begin():
         attempt = await db.get(Attempt, attempt_id)
@@ -2400,6 +2400,7 @@ async def test_playwright_historical_assignment_grade_targets_exact_reopened_att
         now=now,
         deadline=now + timedelta(minutes=10),
         auth_mode="PLUGINLESS",
+        enrolled=True,
     )
     async with session_factory() as db, db.begin():
         attempt = await db.get(Attempt, attempt_id)
@@ -2572,6 +2573,7 @@ async def test_playwright_exports_historical_quiz_essay_grade_to_exact_slot(
         now=now,
         deadline=now + timedelta(minutes=10),
         auth_mode="PLUGINLESS",
+        enrolled=True,
     )
     async with session_factory() as db, db.begin():
         attempt = await db.get(Attempt, attempt_id)
@@ -2763,6 +2765,7 @@ async def _seed_app_quiz_grade_delivery(
         now=now,
         deadline=now + timedelta(minutes=10),
         auth_mode="PLUGINLESS",
+        enrolled=True,
     )
     async with session_factory() as db, db.begin():
         attempt = await db.get(Attempt, attempt_id)
@@ -3072,6 +3075,7 @@ async def test_grade_delivery_completion_cannot_acknowledge_a_newer_pending_revi
         session_factory,
         now=now,
         deadline=now + timedelta(minutes=10),
+        enrolled=True,
     )
     async with session_factory() as db, db.begin():
         attempt = await db.get(Attempt, attempt_id)
@@ -3291,87 +3295,26 @@ async def test_recovery_rejects_checkpoint_for_another_attempt(app_bundle) -> No
             )
 
 
-async def test_course_sync_scheduler_does_not_duplicate_open_event(app_bundle) -> None:
-    _, session_factory, settings = app_bundle
-    now = datetime.now(UTC)
-    await _seed_attempt(
-        session_factory,
-        now=now,
-        deadline=now + timedelta(minutes=10),
-    )
-
-    first = await run_scheduler_iteration(session_factory, settings, now=now)
-    second = await run_scheduler_iteration(session_factory, settings, now=now)
-
-    async with session_factory() as db:
-        count = await db.scalar(
-            select(func.count(SyncOutbox.id)).where(SyncOutbox.event_type == "course.sync")
-        )
-    assert first.courses_enqueued == 1
-    assert second.courses_enqueued == 0
-    assert count == 1
-
-
-async def test_course_sync_scheduler_preserves_fresh_foreground_marker_and_recovers_stale_one(
-    app_bundle,
+@pytest.mark.parametrize("sync_status", ["CURRENT", "PENDING", "SYNCING", "FAILED"])
+async def test_scheduler_never_refreshes_catalog_or_answers_without_teacher_request(
+    app_bundle, sync_status,
 ) -> None:
-    _, session_factory, settings = app_bundle
-    now = datetime.now(UTC).replace(microsecond=0)
+    _, sessions, settings = app_bundle
+    now = datetime.now(UTC)
     _, course_id = await _seed_attempt(
-        session_factory,
-        now=now,
-        deadline=now + timedelta(minutes=10),
+        sessions, now=now, deadline=now + timedelta(minutes=10),
     )
-    async with session_factory() as db, db.begin():
+    async with sessions() as db, db.begin():
         course = await db.get(Course, course_id)
-        assert course is not None
-        course.sync_status = "SYNCING"
-        course.updated_at = now
-
-    fresh = await run_scheduler_iteration(session_factory, settings, now=now)
-    async with session_factory() as db:
-        course = await db.get(Course, course_id)
-        event_count = await db.scalar(
-            select(func.count(SyncOutbox.id)).where(
-                SyncOutbox.course_id == course_id,
-                SyncOutbox.event_type == "course.sync",
-            )
-        )
-    assert fresh.courses_enqueued == 0
-    assert course is not None and course.sync_status == "SYNCING"
-    assert event_count == 0
-
-    async with session_factory() as db, db.begin():
-        course = await db.get(Course, course_id)
-        assert course is not None
-        course.updated_at = course_sync_stale_before(settings, now) - timedelta(seconds=1)
-        bucket = int(now.timestamp()) // settings.sync_course_interval_seconds
-        db.add(
-            SyncOutbox(
-                connection_id=course.connection_id,
-                course_id=course.id,
-                event_type="course.sync",
-                aggregate_type="Course",
-                aggregate_id=course.id,
-                idempotency_key=f"course-sync:{course.id}:{bucket}",
-                payload={"course_id": course.external_id},
-                state=SyncOutboxState.DELIVERED.value,
-                delivered_at=now,
-            )
-        )
-
-    recovered = await run_scheduler_iteration(session_factory, settings, now=now)
-    async with session_factory() as db:
-        course = await db.get(Course, course_id)
-        event_count = await db.scalar(
-            select(func.count(SyncOutbox.id)).where(
-                SyncOutbox.course_id == course_id,
-                SyncOutbox.event_type == "course.sync",
-            )
-        )
-    assert recovered.courses_enqueued == 1
-    assert course is not None and course.sync_status == "PENDING"
-    assert event_count == 2
+        course.sync_status = sync_status
+        course.updated_at = now - timedelta(days=10)
+    await run_scheduler_iteration(sessions, settings, now=now)
+    await run_scheduler_iteration(sessions, settings, now=now + timedelta(seconds=1))
+    async with sessions() as db:
+        assert await db.scalar(select(func.count(SyncOutbox.id)).where(
+            SyncOutbox.event_type.in_(["course.sync", "moodle.history.import"])
+        )) == 0
+        assert (await db.get(Course, course_id)).sync_status == sync_status
 
 
 @pytest.mark.parametrize(
@@ -3706,7 +3649,7 @@ async def test_playwright_course_sync_skips_teacher_without_browser_session(
     assert credential.lease_owner is None and credential.lease_expires_at is None
 
 
-async def test_busy_browser_credential_retries_course_sync_without_visible_failure(
+async def test_course_read_bypasses_credential_lease_but_connector_contention_retries(
     app_bundle,
 ) -> None:
     _, session_factory, settings = app_bundle
@@ -3722,12 +3665,25 @@ async def test_busy_browser_credential_retries_course_sync_without_visible_failu
         credential.lease_owner = "history-import-worker"
         credential.lease_expires_at = datetime.now(UTC) + timedelta(minutes=2)
 
-    assert await process_outbox_once(session_factory, settings)
+    from app.integrations.errors import IntegrationBusy
+
+    class BusyConnector:
+        async def discover_course(self, *_args):
+            raise IntegrationBusy("Moodle browser read pool is busy")
+
+    def factory(_settings, connection, _client):
+        assert connection.browser_read_only
+        assert connection.browser_lease_owner is None
+        return BusyConnector()
+
+    assert await process_outbox_once(session_factory, settings, bridge_factory=factory)
 
     async with session_factory() as db:
         event = await db.get(SyncOutbox, event_id)
         assert event is not None and event.course_id is not None
         course = await db.get(Course, event.course_id)
+        credential = await db.get(MoodleCredential, credential_id)
+        assert credential.lease_owner == "history-import-worker"
     assert event.state == SyncOutboxState.RETRY.value
     assert event.attempts == 0
     assert event.last_error.startswith("BROWSER_BUSY:")

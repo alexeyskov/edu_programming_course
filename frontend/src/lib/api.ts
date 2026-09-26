@@ -6,7 +6,7 @@ import {
 import { languageForPath, unwrapList } from './utils';
 import { createUuid } from './uuid';
 import type {
-  Assessment, AssessmentPublicationTargets, Attempt, AttemptStatus, AuthConnection, AuthorshipAnalysis, AvailabilityRule, Course, CourseCatalogEntry, CourseGroup, CourseSyncStatus, Diagnostic, EvidenceReport, HiddenTestManifestV1, HistoryEvent, InteractiveRun, LmsActivity, Role, RunResult,
+  Assessment, AssessmentPublicationTargets, AssessmentSyncStatus, Attempt, AttemptStatus, AuthConnection, AuthorshipAnalysis, AvailabilityRule, Course, CourseCatalogEntry, CourseGroup, CourseSyncStatus, Diagnostic, EvidenceReport, HiddenTestManifestV1, HistoryEvent, InteractiveRun, LmsActivity, Role, RunResult,
   CourseImportJob, InternalPasteRange, MoodleHistoryImportEvent, Session, SimilarityAnalysis, SimilarityComparison, SimilarityMatch, Submission, SystemHealth, SystemSettings, TaskBankItem, TaskVersion, TeacherAccessToken, TeacherAccessTokenIssued, TeacherExperiment, WorkspaceFile,
 } from '../types';
 
@@ -15,6 +15,9 @@ const envMode = import.meta.env.VITE_DEMO_MODE;
 export const demoMode: DemoMode = envMode ?? (import.meta.env.DEV ? 'auto' : 'never');
 export const apiBase = (import.meta.env.VITE_API_BASE ?? '/api/v1').replace(/\/$/, '');
 const demoDelay = (ms = 180) => new Promise((resolve) => setTimeout(resolve, ms));
+const READ_TIMEOUT_MS = 30_000;
+const EXTERNAL_OPERATION_TIMEOUT_MS = 330_000;
+type ApiRequestInit = RequestInit & { timeoutMs?: number };
 
 let csrfToken: string | undefined;
 let csrfPromise: Promise<string> | null = null;
@@ -41,10 +44,12 @@ const LOCALIZED_API_ERROR_MESSAGES: Readonly<Record<string, string>> = {
   INTEGRATION_ERROR: 'Не удалось выполнить обмен с внешним сервисом.',
   NOT_CONFIGURED: 'Подключение к внешнему сервису не настроено.',
   TIMEOUT: 'Внешний сервис не ответил вовремя. Повторите попытку.',
+  REQUEST_TIMEOUT: 'Не удалось дождаться ответа сервера. Запрос мог быть обработан; проверьте состояние перед повторной отправкой. Несохранённые правки остаются в этой вкладке.',
   BROWSER_BUSY: 'Браузерный коннектор Moodle занят. Повторите синхронизацию через несколько секунд.',
   UNAVAILABLE: 'Внешний сервис временно недоступен. Повторите попытку позже.',
   INVALID_RESPONSE: 'Внешний сервис вернул неожиданный ответ.',
   RESPONSE_TOO_LARGE: 'Ответ внешнего сервиса слишком большой.',
+  AI_CONTEXT_TOO_LARGE: 'Условие и код целиком не помещаются в лимит контекста ИИ. Обратитесь к администратору для увеличения лимита.',
   LMS_IMPORT_REQUIRES_CONFIGURATION: 'Импортированная работа ещё не готова. Синхронизируйте курс с Moodle.',
   MOODLE_SOURCE_UNCONFIRMED: 'Moodle не подтвердил все параметры работы. Повторите синхронизацию курса.',
   MOODLE_QUIZ_GRADING_METHOD_UNCONFIRMED: 'Не удалось подтвердить метод оценивания теста Moodle. Повторите синхронизацию курса.',
@@ -76,6 +81,11 @@ const LOCALIZED_API_ERROR_MESSAGES: Readonly<Record<string, string>> = {
   STUDENT_SCOPE_REQUIRED: 'Можно открывать работу только своим студентам.',
   ASSESSMENT_NOT_ASSIGNED: 'Работа не назначена вашей группе.',
   LMS_ATTEMPT_FINALIZED: 'Сеанс работы завершён через Moodle.',
+  LMS_ATTEMPT_DELETED: 'Попытка удалена в Moodle. Вернитесь к списку работ, чтобы открыть доступную попытку.',
+  COURSE_SYNC_IN_PROGRESS: 'Список работ и участников этого курса сейчас обновляется. Дождитесь завершения синхронизации курса.',
+  ASSESSMENT_SYNC_IN_PROGRESS: 'В этом курсе сейчас синхронизируются ответы. Дождитесь завершения перед обновлением курса.',
+  ASSESSMENT_SYNC_UNAVAILABLE: 'Синхронизация ответов для этой работы недоступна.',
+  LMS_EXPORT_UNAVAILABLE: 'Отправка ответа в LMS недоступна. Свяжитесь с администратором.',
 };
 
 const LOCALIZED_API_MESSAGE_TEXT: Readonly<Record<string, string>> = {
@@ -100,37 +110,78 @@ export class ApiError extends Error {
   }
 }
 
-async function ensureCsrf(force = false): Promise<string> {
+async function withRequestDeadline<T>(
+  signal: AbortSignal | null | undefined,
+  timeoutMs: number,
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  signal?.throwIfAborted();
+  const controller = new AbortController();
+  let timedOut = false;
+  const abort = () => controller.abort(signal?.reason);
+  signal?.addEventListener('abort', abort, { once: true });
+  const timer = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
+  try {
+    // The operation includes reading/parsing the body, not only its headers.
+    return await operation(controller.signal);
+  } catch (error) {
+    if (timedOut) throw new ApiError(408, 'REQUEST_TIMEOUT', 'Request timed out');
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
+  }
+}
+
+async function ensureCsrf(force = false, signal?: AbortSignal | null): Promise<string> {
+  signal?.throwIfAborted();
   if (force) csrfToken = undefined;
   if (csrfToken && !force) return csrfToken;
   if (!csrfPromise) {
-    csrfPromise = fetch(`${apiBase}/auth/csrf`, { credentials: 'include', headers: { Accept: 'application/json' } })
-      .then(async (response) => {
-        if (!response.ok) throw new ApiError(response.status, 'CSRF_FAILED', 'Не удалось подготовить защищённый запрос');
-        const body = await response.json() as { csrf_token: string };
-        if (!body.csrf_token) throw new ApiError(response.status, 'CSRF_FAILED', 'Сервер не вернул CSRF-токен');
-        csrfToken = body.csrf_token;
-        return body.csrf_token;
-      }).finally(() => { csrfPromise = null; });
+    csrfPromise = withRequestDeadline(undefined, READ_TIMEOUT_MS, async (signal) => {
+      const response = await fetch(`${apiBase}/auth/csrf`, { signal, credentials: 'include', headers: { Accept: 'application/json' } });
+      if (!response.ok) throw new ApiError(response.status, 'CSRF_FAILED', 'Не удалось подготовить защищённый запрос');
+      const body = await response.json() as { csrf_token: string };
+      if (!body.csrf_token) throw new ApiError(response.status, 'CSRF_FAILED', 'Сервер не вернул CSRF-токен');
+      csrfToken = body.csrf_token;
+      return body.csrf_token;
+    }).finally(() => { csrfPromise = null; });
   }
-  return csrfPromise;
+  if (!signal) return csrfPromise;
+  // Cancelling one caller must not cancel CSRF preparation shared by others.
+  return new Promise<string>((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener('abort', abort, { once: true });
+    csrfPromise!.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+    if (signal.aborted) abort();
+  });
 }
 
-async function request<T>(path: string, init: RequestInit = {}, retryCsrf = true): Promise<T> {
+async function request<T>(path: string, init: ApiRequestInit = {}, retryCsrf = true): Promise<T> {
   const method = (init.method ?? 'GET').toUpperCase();
-  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) await ensureCsrf();
+  init.signal?.throwIfAborted();
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) await ensureCsrf(false, init.signal);
   const headers = new Headers(init.headers);
   headers.set('Accept', 'application/json');
   if (init.body && !(init.body instanceof FormData)) headers.set('Content-Type', 'application/json');
   if (csrfToken && !['GET', 'HEAD', 'OPTIONS'].includes(method)) headers.set('X-CSRFToken', csrfToken);
-  const response = await fetch(`${apiBase}${path}`, { ...init, headers, credentials: 'include' });
+  const { timeoutMs = ['GET', 'HEAD', 'OPTIONS'].includes(method) ? READ_TIMEOUT_MS : EXTERNAL_OPERATION_TIMEOUT_MS, ...fetchInit } = init;
+  const { response, body } = await withRequestDeadline(init.signal, timeoutMs, async (signal) => {
+    const response = await fetch(`${apiBase}${path}`, { ...fetchInit, signal, headers, credentials: 'include' });
+    const body = response.status === 204 ? undefined : await response.json().catch((error) => {
+      // Some proxies return HTML errors, but an aborted stream is not an empty
+      // successful/error body and must keep its timeout/cancellation semantics.
+      if (response.ok || signal.aborted) throw error;
+      return {};
+    });
+    return { response, body };
+  });
   const returnedCsrf = response.headers.get('X-CSRFToken');
   if (returnedCsrf) csrfToken = returnedCsrf;
   if (!response.ok) {
-    const body = await response.json().catch(() => ({})) as Record<string, unknown>;
-    const error = apiError(response.status, body);
+    const error = apiError(response.status, body as Record<string, unknown>);
     if (response.status === 403 && error.code === 'CSRF_FAILED' && retryCsrf && !['GET', 'HEAD', 'OPTIONS'].includes(method)) {
-      await ensureCsrf(true);
+      await ensureCsrf(true, init.signal);
       return request<T>(path, init, false);
     }
     if (response.status === 401 && typeof window !== 'undefined') {
@@ -139,7 +190,7 @@ async function request<T>(path: string, init: RequestInit = {}, retryCsrf = true
     throw error;
   }
   if (response.status === 204) return undefined as T;
-  return response.json() as Promise<T>;
+  return body as T;
 }
 
 function apiError(status: number, body: Record<string, unknown>): ApiError {
@@ -264,6 +315,34 @@ function mapCourseSyncStatus(raw: any): CourseSyncStatus {
   };
 }
 
+function safeExternalUrl(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  try {
+    const url = new URL(value);
+    return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password ? url.href : undefined;
+  } catch { return undefined; }
+}
+
+function mapAssessmentSyncStatus(raw: any): AssessmentSyncStatus {
+  return {
+    assessmentId: String(raw.assessment_id),
+    assessmentTitle: raw.assessment_title || undefined,
+    status: raw.status,
+    lastError: raw.last_error || undefined,
+    errorCode: raw.error_code || undefined,
+    updatedAt: raw.updated_at || undefined,
+    warnings: Array.isArray(raw.warnings) ? raw.warnings.map((item: any) => ({
+      id: String(item.id), code: String(item.code), message: String(item.message),
+      studentName: item.student_name || undefined,
+      attemptId: item.attempt_id || undefined,
+      responseLabel: item.response_label || undefined,
+      submissionId: item.submission_id || undefined,
+      moodleUrl: safeExternalUrl(item.moodle_url),
+    })) : undefined,
+    warningsDismissed: typeof raw.warnings_dismissed === 'boolean' ? raw.warnings_dismissed : undefined,
+  };
+}
+
 function mapCourseCatalogEntry(raw: any): CourseCatalogEntry {
   const sourceStatus = String(raw.sync_status ?? 'PENDING').toUpperCase();
   const syncStatus: CourseCatalogEntry['syncStatus'] = ['CURRENT', 'SYNCED'].includes(sourceStatus)
@@ -301,29 +380,6 @@ function mapTeacherAccessToken(raw: any): TeacherAccessToken {
     useCount: Number(raw.use_count ?? 0),
     lastUsedAt: raw.last_used_at ? String(raw.last_used_at) : undefined,
     createdAt: String(raw.created_at ?? ''),
-  };
-}
-
-function mapMoodleHistoryImportEvent(raw: any): MoodleHistoryImportEvent {
-  const state = String(raw.state ?? 'PENDING').toUpperCase();
-  const payload = raw.payload && typeof raw.payload === 'object' && !Array.isArray(raw.payload)
-    ? raw.payload as Record<string, unknown>
-    : {};
-  return {
-    id: String(raw.id ?? ''),
-    courseId: raw.course_id ? String(raw.course_id) : undefined,
-    aggregateId: String(raw.aggregate_id ?? ''),
-    actorKey: payload.actor_external_subject ? String(payload.actor_external_subject) : undefined,
-    assessmentTitle: raw.aggregate_title ? String(raw.aggregate_title) : undefined,
-    lastError: String(raw.last_error ?? ''),
-    state: ['PENDING', 'PROCESSING', 'RETRY', 'DELIVERED', 'FAILED', 'BLOCKED'].includes(state)
-      ? state as MoodleHistoryImportEvent['state']
-      : 'FAILED',
-    createdAt: String(raw.created_at ?? ''),
-    updatedAt: String(raw.updated_at ?? raw.created_at ?? ''),
-    receipt: raw.receipt && typeof raw.receipt === 'object' && !Array.isArray(raw.receipt)
-      ? raw.receipt as Record<string, unknown>
-      : {},
   };
 }
 
@@ -459,11 +515,12 @@ function mapFile(raw: any): WorkspaceFile {
 function mapAttempt(raw: any, workspace?: any): Attempt {
   const state = String(raw.state ?? raw.status ?? 'ACTIVE').toUpperCase();
   const submittedStates = new Set(['SUBMITTED', 'AUTO_SUBMITTED', 'FINALIZED', 'GRADED']);
+  const deleted = raw.closure_reason === 'LMS_ATTEMPT_DELETED';
   const files = unwrapList<any>(workspace?.files ?? raw.files ?? []).map(mapFile);
   const rawPastePolicy = String(raw.paste_policy ?? 'INTERNAL_ONLY').toUpperCase();
   return {
     id: String(raw.id), assessmentId: String(raw.assessment_id ?? raw.assessment?.id ?? raw.assessment ?? ''), title: String(raw.title ?? raw.assessment_title ?? raw.assessment?.title ?? 'Работа'),
-    statement: String(raw.statement ?? raw.task_statement ?? ''), status: submittedStates.has(state) ? 'SUBMITTED' : state === 'ACTIVE' ? 'ACTIVE' : 'LOCKED',
+    statement: String(raw.statement ?? raw.task_statement ?? ''), status: deleted ? 'LOCKED' : submittedStates.has(state) ? 'SUBMITTED' : state === 'ACTIVE' ? 'ACTIVE' : 'LOCKED',
     revision: Number(workspace?.current_revision ?? workspace?.revision ?? raw.current_revision ?? raw.workspace_revision ?? raw.revision ?? 0),
     acknowledgedRevision: Number(raw.acknowledged_revision ?? workspace?.current_revision ?? workspace?.revision ?? raw.current_revision ?? raw.workspace_revision ?? 0),
     startedAt: raw.started_at ?? new Date().toISOString(), expectedEndAt: raw.expected_end_at ?? undefined, deadlineAt: raw.deadline_at ?? undefined,
@@ -471,9 +528,9 @@ function mapAttempt(raw: any, workspace?: any): Attempt {
     moodleSyncTimeoutSeconds: typeof raw.moodle_sync_timeout_seconds === 'number' ? raw.moodle_sync_timeout_seconds : undefined,
     closureReason: raw.closure_reason ?? undefined, closedAt: raw.closed_at ?? raw.submitted_at ?? undefined,
     lastCheckpointAt: raw.last_checkpoint_at, checkpointStatus: raw.checkpoint_status ?? 'SYNCED',
-    pastePolicy: ['ALLOW', 'UNRESTRICTED'].includes(rawPastePolicy) ? 'ALLOW' : 'STRICT', aiEnabled: Boolean(raw.ai_enabled),
+    pastePolicy: ['ALLOW', 'UNRESTRICTED'].includes(rawPastePolicy) ? 'ALLOW' : 'STRICT', aiEnabled: !deleted && Boolean(raw.ai_enabled),
     fileMode: (workspace?.multi_file ?? raw.workspace?.multi_file ?? raw.multi_file) ? 'MULTI' : 'SINGLE', files,
-    requiresLiveLmsPreparation: Boolean(raw.requires_live_lms_preparation),
+    requiresLiveLmsPreparation: !deleted && Boolean(raw.requires_live_lms_preparation),
     quizSession: raw.quiz_session ? {
       id: String(raw.quiz_session.id),
       rootAttemptId: String(raw.quiz_session.root_attempt_id),
@@ -1013,8 +1070,16 @@ export const api = {
     },
   ),
   syncCourse: (courseId: string) => withDemo(
-    async () => mapCourse(await request(`/courses/${courseId}/sync`, { method: 'POST', body: '{}' })),
+    async () => mapCourse(await request(`/courses/${courseId}/sync`, { method: 'POST', timeoutMs: READ_TIMEOUT_MS, body: '{}' })),
     () => cloneDemo(teacherCourse),
+  ),
+  getAssessmentSyncStatuses: (courseId: string) => withDemo(
+    async () => unwrapList<any>(await request(`/courses/${courseId}/assessment-sync-status`)).map(mapAssessmentSyncStatus),
+    () => assessmentState.filter((item) => item.courseId === courseId).map((item): AssessmentSyncStatus => ({ assessmentId: item.id, status: 'IDLE' })),
+  ),
+  syncAssessment: (assessmentId: string) => withDemo(
+    async () => mapAssessmentSyncStatus(await request(`/assessments/${assessmentId}/sync`, { method: 'POST', timeoutMs: READ_TIMEOUT_MS, body: '{}' })),
+    (): AssessmentSyncStatus => ({ assessmentId, status: 'COMPLETED', updatedAt: new Date().toISOString() }),
   ),
   getAttempt: (attemptId: string) => withDemo(async () => {
     const raw = await request<any>(`/attempts/${attemptId}`);
@@ -1061,7 +1126,7 @@ export const api = {
     () => cloneDemo(demoHistory),
   ),
   saveFile: (attemptId: string, file: WorkspaceFile, revision: number, source: 'typing' | 'internal_paste' = 'typing', receiptId?: string, pasteRange?: InternalPasteRange) => withDemo(async () => {
-    const raw = await request<any>(`/attempts/${attemptId}/workspace/files/${file.id}`, { method: 'PATCH', headers: { 'If-Match': String(revision) }, body: JSON.stringify({ content: file.content, source: source.toUpperCase(), receipt_id: receiptId, paste_range: pasteRange ? { offset: pasteRange.offset, delete_count: pasteRange.deleteCount } : undefined }) });
+    const raw = await request<any>(`/attempts/${attemptId}/workspace/files/${file.id}`, { method: 'PATCH', timeoutMs: READ_TIMEOUT_MS, headers: { 'If-Match': String(revision) }, body: JSON.stringify({ content: file.content, source: source.toUpperCase(), receipt_id: receiptId, paste_range: pasteRange ? { offset: pasteRange.offset, delete_count: pasteRange.deleteCount } : undefined }) });
     return { revision: Number(raw.workspace_revision ?? raw.revision ?? revision + 1) };
   }, () => {
     attemptState.files = attemptState.files.map((item) => item.id === file.id ? cloneDemo(file) : item);
@@ -1115,11 +1180,11 @@ export const api = {
     (): InteractiveRun => ({ sessionId, status: 'STOPPED', terminal: true, durationMs: 1, stdout: '', stderr: '', outputTruncated: false, diagnostics: [] }),
   ),
   submitAttempt: (attemptId: string, revision: number) => withDemo(
-    () => request(`/attempts/${attemptId}/submit`, { method: 'POST', headers: { 'Idempotency-Key': createUuid() }, body: JSON.stringify({ revision }) }),
+    () => request(`/attempts/${attemptId}/submit`, { method: 'POST', timeoutMs: READ_TIMEOUT_MS, headers: { 'Idempotency-Key': createUuid() }, body: JSON.stringify({ revision }) }),
     () => { attemptState.status = 'SUBMITTED'; return { receipt_id: 'DEMO-8F37', submitted_at: new Date().toISOString(), revision }; },
   ),
   retryAttemptSubmission: (attemptId: string) => withDemo(
-    () => request(`/attempts/${attemptId}/submit/retry`, { method: 'POST', headers: { 'Idempotency-Key': createUuid() }, body: '{}' }),
+    () => request(`/attempts/${attemptId}/submit/retry`, { method: 'POST', timeoutMs: READ_TIMEOUT_MS, headers: { 'Idempotency-Key': createUuid() }, body: '{}' }),
     () => ({ receipt_id: 'DEMO-8F37', submitted_at: new Date().toISOString(), revision: attemptState.revision }),
   ),
   getSubmissions: (assessmentId?: string) => withDemo(
@@ -1138,27 +1203,40 @@ export const api = {
     () => cloneDemo(assessmentId && assessmentId !== 'all' ? submissionsState.filter((item) => item.assessmentId === assessmentId) : submissionsState),
   ),
   getMoodleHistoryImportEvents: () => withDemo(
-    async () => unwrapList<any>(await request('/integrations/lms/outbox?event_type=moodle.history.import&latest_per_activity=true&limit=500'))
-      .filter((item) => String(item.event_type ?? '') === 'moodle.history.import')
-      .map(mapMoodleHistoryImportEvent),
+    async () => {
+      // The shared manual run is authoritative. Old per-worker/per-teacher
+      // outbox failures must not resurrect a finished run's error banner.
+      const courses = unwrapList<any>(await request('/courses')).filter((course) => mapRole(course.role) === 'TEACHER');
+      return (await Promise.all(courses.map(async (course) => (
+        unwrapList<any>(await request(`/courses/${course.id}/assessment-sync-status?include_warnings=true`))
+          .map(mapAssessmentSyncStatus)
+          .filter((item) => item.status !== 'IDLE')
+          .map((item): MoodleHistoryImportEvent => ({
+            id: item.assessmentId,
+            aggregateId: item.assessmentId,
+            courseId: String(course.id),
+            assessmentTitle: item.assessmentTitle,
+            state: item.status === 'SYNCING' ? 'PROCESSING' : item.status === 'COMPLETED' ? 'DELIVERED' : item.status === 'PARTIAL' ? 'PARTIAL' : 'FAILED',
+            lastError: item.lastError,
+            errorCode: item.errorCode,
+            createdAt: item.updatedAt ?? '',
+            updatedAt: item.updatedAt ?? '',
+            receipt: {},
+            warnings: item.warnings,
+            warningsDismissed: item.warningsDismissed,
+          }))
+      )))).flat();
+    },
     () => [] as MoodleHistoryImportEvent[],
   ),
-  retryMoodleHistoryImport: (eventId: string) => withDemo(
-    async () => mapMoodleHistoryImportEvent(await request(
-      `/integrations/lms/outbox/${encodeURIComponent(eventId)}/retry`,
-      {
-        method: 'POST',
-        body: JSON.stringify({ reason: 'Повторный запуск со страницы работ студентов' }),
-      },
-    )),
-    () => ({
-      id: eventId,
-      aggregateId: eventId,
-      state: 'RETRY' as const,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      receipt: {},
-    }),
+  dismissMoodleHistoryWarnings: (assessmentId: string, warningIds: string[]) => withDemo(
+    async (): Promise<string[]> => {
+      const result = await request<{ dismissed_warning_ids: string[] }>(`/assessments/${assessmentId}/sync-warnings/dismiss`, {
+        method: 'POST', body: JSON.stringify({ warning_ids: warningIds }),
+      });
+      return result.dismissed_warning_ids;
+    },
+    () => [...warningIds],
   ),
   getSubmission: (id: string) => withDemo(async () => mapSubmission(await request(`/submissions/${id}`)), () => cloneDemo(submissionsState.find((item) => item.id === id) ?? submissionsState[0])),
   getEvidenceRuns: (submissionId: string) => withDemo(
@@ -1299,8 +1377,8 @@ export const api = {
     })),
     () => [],
   ),
-  sendAiMessage: (threadId: string, content: string) => withDemo(async () => {
-    const raw = await request<any>(`/ai/threads/${threadId}/messages`, { method: 'POST', body: JSON.stringify({ content }) });
+  sendAiMessage: (threadId: string, content: string, context: { revision?: number; teacherComment?: string } = {}) => withDemo(async () => {
+    const raw = await request<any>(`/ai/threads/${threadId}/messages`, { method: 'POST', body: JSON.stringify({ content, revision: context.revision, teacher_comment: context.teacherComment }) });
     return { id: String(raw.id ?? createUuid()), content: String(raw.content ?? raw.message?.content ?? raw.response ?? ''), citations: raw.citations ?? [] };
   }, () => ({
     id: createUuid(),

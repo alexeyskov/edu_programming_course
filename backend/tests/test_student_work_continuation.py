@@ -7,7 +7,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import func, select
 
-from app.api.ai import _student_context
+from app.api.ai import _student_context, _teacher_context
 from app.api.attempts import _attempt_read
 from app.api.authoring import list_course_assessments, publish_assessment, update_assessment
 from app.api.courses import _course_payload
@@ -16,11 +16,11 @@ from app.auth.context import AuthContext
 from app.models.attempts import Attempt, Submission, Workspace, WorkspaceFile
 from app.models.courses import Course, CourseMembership
 from app.models.integration import ExternalMapping, SyncOutbox
-from app.models.tasks import Assessment
+from app.models.tasks import Assessment, TaskVersion
 from app.schemas.assessments import AssessmentPublishRequest, AssessmentUpdateRequest
 from app.services.common import DomainError
 from app.services.moodle_history import _mark_managed_quiz_as_split_container
-from app.services.workspace import replace_file_content, start_attempt
+from app.services.workspace import replace_file_content, start_attempt, submit_attempt
 from tests.test_attempt_review_services import _seed_course, _start_multi_quiz
 
 
@@ -122,7 +122,11 @@ async def test_an_explicit_lab_time_limit_is_not_removed(db, app_bundle):
     ],
 )
 async def test_unread_moodle_timer_is_not_assumed_unlimited(
-    db, app_bundle, transport, duration, expected,
+    db,
+    app_bundle,
+    transport,
+    duration,
+    expected,
 ):
     _, _, settings = app_bundle
     student, _, _, assessment = await _seed_course(db)
@@ -167,6 +171,68 @@ async def test_all_quiz_solutions_follow_current_parent_ai_permission(db, app_bu
                 settings=settings,
             )
         assert error.value.code == "STUDENT_AI_DISABLED"
+
+
+async def test_ai_context_stays_with_the_exact_quiz_question_for_both_roles(db, app_bundle):
+    _, _, settings = app_bundle
+    settings.ai_mock_enabled = True
+    student, teacher, parent, root, questions = await _start_multi_quiz(db)
+    parent.student_ai_enabled = True
+    parent.instructions = "Общие требования ко всем задачам этой работы"
+    contexts = {}
+    for question in questions:
+        attempt = await db.get(Attempt, question.attempt_id)
+        version = await db.get(TaskVersion, attempt.assigned_task_version_id)
+        workspace = await db.scalar(select(Workspace).where(Workspace.attempt_id == attempt.id))
+        source = await db.scalar(
+            select(WorkspaceFile).where(
+                WorkspaceFile.workspace_id == workspace.id,
+            )
+        )
+        await replace_file_content(
+            db,
+            attempt_id=attempt.id,
+            principal_id=student.id,
+            file_id=source.id,
+            content=f"// solution for slot {question.question_slot}",
+            expected_revision=0,
+            client_request_id=f"ai-slot-{question.question_slot}",
+        )
+        await db.flush()
+        context = await _student_context(
+            db,
+            principal_id=student.id,
+            attempt_id=attempt.id,
+            expected_course_id=parent.course_id,
+            settings=settings,
+            expected_revision=1,
+        )
+        assert context["task"]["id"] == str(version.id)
+        assert context["task"]["statement"] == version.statement
+        assert context["assessment"]["instructions"] == parent.instructions
+        assert [f["content"] for f in context["files"]] == [
+            f"// solution for slot {question.question_slot}",
+        ]
+        contexts[attempt.id] = context
+    assert len({c["task"]["statement"] for c in contexts.values()}) == 2
+
+    await submit_attempt(db, attempt_id=root.id, principal_id=student.id, expected_revision=1)
+    for question in questions:
+        submission = await db.scalar(
+            select(Submission).where(
+                Submission.attempt_id == question.attempt_id,
+            )
+        )
+        context = await _teacher_context(
+            db,
+            principal_id=teacher.id,
+            submission_id=submission.id,
+            expected_course_id=parent.course_id,
+            settings=settings,
+        )
+        assert context["task"] == contexts[question.attempt_id]["task"]
+        assert context["files"] == contexts[question.attempt_id]["files"]
+        assert context["assessment"]["instructions"] == parent.instructions
 
 
 async def test_teacher_can_change_only_local_ai_policy_on_published_work(db):
@@ -276,3 +342,69 @@ async def test_history_status_selects_newest_job_before_pagination(db):
     )
     assert len(rows) == 1 and rows[0].id == jobs[1].id
     assert rows[0].state == "DELIVERED" and rows[0].aggregate_title == assessment.title
+
+
+async def test_finished_inventory_does_not_hide_pending_or_failed_answer_reads(db):
+    _, teacher, _, assessment = await _seed_course(db)
+    course = await db.get(Course, assessment.course_id)
+    first = datetime(2026, 9, 9, tzinfo=UTC)
+    pending = SyncOutbox(
+        connection_id=course.connection_id,
+        course_id=course.id,
+        event_type="moodle.history.import",
+        aggregate_type="Assessment",
+        aggregate_id=assessment.id,
+        idempotency_key="detail-old",
+        payload={"actor_external_subject": teacher.external_subject, "detail_key": "9001"},
+        state="PENDING",
+        created_at=first,
+    )
+    inventory = SyncOutbox(
+        connection_id=course.connection_id,
+        course_id=course.id,
+        event_type="moodle.history.import",
+        aggregate_type="Assessment",
+        aggregate_id=assessment.id,
+        idempotency_key="inventory-new",
+        payload={"actor_external_subject": teacher.external_subject, "scan_only": True},
+        state="DELIVERED",
+        created_at=first + timedelta(hours=1),
+    )
+    db.add_all([pending, inventory])
+    await db.flush()
+    for state in ("PENDING", "FAILED"):
+        pending.state = state
+        await db.flush()
+        rows = await list_sync_outbox(
+            auth(teacher),
+            db,
+            limit=1,
+            offset=0,
+            event_type="moodle.history.import",
+            latest_per_activity=True,
+        )
+        assert rows[0].id == pending.id and rows[0].state == state
+    # A later successful retry for this exact answer supersedes its old error.
+    db.add(
+        SyncOutbox(
+            connection_id=course.connection_id,
+            course_id=course.id,
+            event_type="moodle.history.import",
+            aggregate_type="Assessment",
+            aggregate_id=assessment.id,
+            idempotency_key="detail-retry",
+            payload=pending.payload,
+            state="DELIVERED",
+            created_at=first + timedelta(hours=2),
+        )
+    )
+    await db.flush()
+    rows = await list_sync_outbox(
+        auth(teacher),
+        db,
+        limit=1,
+        offset=0,
+        event_type="moodle.history.import",
+        latest_per_activity=True,
+    )
+    assert rows[0].state == "DELIVERED"

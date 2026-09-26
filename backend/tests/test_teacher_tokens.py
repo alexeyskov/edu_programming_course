@@ -121,6 +121,21 @@ async def test_teacher_token_pool_binds_once_persists_and_revokes_immediately(
     settings.dev_auth_enabled = True
     connection = await _pluginless_connection(session_factory)
 
+    # Course synchronization has already imported this participant. The
+    # teacher token may change their local role, but login cannot add roster
+    # entries for a user who has never been manually synchronized.
+    async with session_factory() as db:
+        principal = ExternalPrincipal(
+            connection_id=connection.id, external_subject="42", display_name="Коваленко Алексей",
+        )
+        db.add(principal)
+        await db.flush()
+        course_id = await db.scalar(select(Course.id).where(
+            Course.connection_id == connection.id, Course.external_id == "549",
+        ))
+        db.add(CourseMembership(course_id=course_id, principal_id=principal.id, role="STUDENT"))
+        await db.commit()
+
     current_subject = "42"
     upstream_calls = 0
 

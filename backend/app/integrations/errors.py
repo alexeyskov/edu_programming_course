@@ -59,3 +59,7 @@ class IntegrationProtocolError(IntegrationError):
 
 class IntegrationResponseTooLarge(IntegrationProtocolError):
     code = "RESPONSE_TOO_LARGE"
+
+
+class AIContextTooLarge(IntegrationProtocolError):
+    code = "AI_CONTEXT_TOO_LARGE"

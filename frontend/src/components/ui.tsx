@@ -4,7 +4,7 @@ import { cn } from '../lib/utils';
 import { createUuid } from '../lib/uuid';
 
 export function Button({ className, variant = 'primary', size = 'md', loading, children, ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: 'primary' | 'secondary' | 'ghost' | 'danger'; size?: 'sm' | 'md' | 'lg' | 'icon'; loading?: boolean }) {
-  return <button className={cn('button', `button--${variant}`, `button--${size}`, className)} disabled={props.disabled || loading} {...props}>
+  return <button className={cn('button', `button--${variant}`, `button--${size}`, className)} {...props} disabled={props.disabled || loading}>
     {loading && <LoaderCircle size={16} className="spin" aria-hidden="true" />}{children}
   </button>;
 }

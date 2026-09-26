@@ -2,7 +2,7 @@ import { DiffEditor } from '@monaco-editor/react';
 import {
   AlertTriangle, Bot, Check, CheckCircle2, ChevronLeft, ChevronRight,
   FlaskConical, GitCompareArrows, History, Info, MessageSquareText, Play, RefreshCcw,
-  PanelLeftOpen, PanelRightClose, PanelRightOpen, RotateCcw, Save,
+  PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, RotateCcw, Save,
   Send, ShieldCheck, Square, UserCheck, X,
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -21,8 +21,8 @@ function lmsExportStateLabel(state: string): string {
     IMPORTED: 'Импортировано из Moodle',
     DELIVERED: 'Оценка передана в Moodle',
     PENDING: 'Ожидает отправки в Moodle',
-    BLOCKED: 'Передача в Moodle требует настройки',
-    FAILED: 'Ошибка передачи оценки в Moodle',
+    BLOCKED: 'Отправка ответа в LMS недоступна. Свяжитесь с администратором.',
+    FAILED: 'Отправка ответа в LMS недоступна. Свяжитесь с администратором.',
     SUPERSEDED: 'Заменено новой проверкой',
   };
   return labels[state.toUpperCase()] ?? 'Статус обмена с Moodle не определён';
@@ -482,7 +482,7 @@ export function ReviewPage() {
       const decision = await api.finalizeReview(submission.id, Number(grade), comment);
       if (submission.claim) await api.releaseClaim(submission.claim.id).catch(() => undefined);
       setDecisionOpen(false);
-      toast.push('success', 'Оценка утверждена', decision.lmsExportState === 'PENDING' ? 'Выгрузка в Moodle поставлена в очередь.' : decision.lmsExportState === 'BLOCKED' ? 'Выгрузка заблокирована: проверьте сопоставление с заданием Moodle.' : decision.lmsExportState ? `Статус выгрузки: ${decision.lmsExportState}.` : 'Статус выгрузки не предоставлен сервером.');
+      toast.push(decision.lmsExportState === 'BLOCKED' || decision.lmsExportState === 'FAILED' ? 'error' : 'success', 'Оценка утверждена', decision.lmsExportState === 'PENDING' ? 'Выгрузка в Moodle поставлена в очередь.' : decision.lmsExportState === 'BLOCKED' ? 'Отправка ответа в LMS недоступна. Свяжитесь с администратором.' : decision.lmsExportState ? lmsExportStateLabel(decision.lmsExportState) : 'Статус выгрузки не предоставлен сервером.');
       navigate(`/submissions${location.search}`);
     }
     catch (caught) { toast.push('error', 'Решение не сохранено', caught instanceof Error ? caught.message : undefined); }
@@ -534,11 +534,14 @@ export function ReviewPage() {
     </nav>}
     <div className={cn('review-layout', !reviewPanelOpen && 'review-layout--review-collapsed')}><section className="review-code"><div className="submission-meta"><span><strong>Сдано {formatDate(submission.submittedAt)}</strong><small>Неизменяемый снимок · {submission.files.length} файл</small></span><div className="submission-meta__actions">{!experimentMode && <Badge tone="success"><ShieldCheck size={13} /> Оригинал</Badge>}{experiment?.changed && experimentMode && <Badge tone="warning">Есть изменения</Badge>}</div></div>
       <div className={cn('review-editor-shell', !filesPanelOpen && 'review-editor-shell--files-collapsed')}>
-        {!filesPanelOpen && <aside className="review-files-rail" aria-label="Панель файлов скрыта"><button type="button" aria-label="Показать файлы" title="Показать панель файлов" onClick={() => setFilesPanelOpen(true)}><PanelLeftOpen size={17} /></button><span aria-hidden="true">Файлы</span></aside>}
-        <div className="review-editor">{diffOpen && experimentMode ? <DiffWorkspace original={diffFiles.original?.content ?? ''} modified={diffFiles.modified?.content ?? ''} path={diffFiles.path} theme={theme} /> : <CodeWorkspace ref={editorRef} files={files} activeFileId={activeFileId} onActiveFile={setActiveFileId} onChange={(id, content) => changeExperimentFile(id, content)} readOnly={!editable} strictPaste={false} scopeId={experiment?.id ?? submission.id} diagnostics={diagnostics} experiment={experimentMode} explorerVisible={filesPanelOpen} onExplorerCollapse={() => setFilesPanelOpen(false)} />}</div>
+        <aside className="review-files-rail workspace-files-rail" aria-label="Панель файлов">
+          <button type="button" aria-label={filesPanelOpen ? 'Скрыть файлы' : 'Показать файлы'} title={diffOpen && experimentMode ? 'Файлы доступны в режиме редактора' : filesPanelOpen ? 'Скрыть панель файлов' : 'Показать панель файлов'} aria-expanded={filesPanelOpen && !(diffOpen && experimentMode)} aria-controls={diffOpen && experimentMode ? undefined : 'review-file-explorer'} disabled={diffOpen && experimentMode} onClick={() => setFilesPanelOpen((open) => !open)}>{filesPanelOpen ? <PanelLeftClose size={17} /> : <PanelLeftOpen size={17} />}</button>
+          <span aria-hidden="true">Файлы</span>
+        </aside>
+        <div className="review-editor">{diffOpen && experimentMode ? <DiffWorkspace original={diffFiles.original?.content ?? ''} modified={diffFiles.modified?.content ?? ''} path={diffFiles.path} theme={theme} /> : <CodeWorkspace ref={editorRef} files={files} activeFileId={activeFileId} onActiveFile={setActiveFileId} onChange={(id, content) => changeExperimentFile(id, content)} readOnly={!editable} strictPaste={false} scopeId={experiment?.id ?? submission.id} diagnostics={diagnostics} experiment={experimentMode} explorerId="review-file-explorer" explorerVisible={filesPanelOpen} />}</div>
       </div>
       {consoleOpen && <div className="experiment-console"><header><strong>Консоль программы</strong><span>{interactiveRun ? interactiveStatusLabel(interactiveRun) : 'Готова к запуску'}</span>{diagnostics.length > 0 && <Badge tone="danger">{diagnostics.length} ошибка</Badge>}<Button className="experiment-console__close" size="sm" onClick={() => void closeConsole()}><X size={13} /> Закрыть</Button></header><div className="experiment-console__output">{diagnostics.map((item) => <button key={item.id} onClick={() => editorRef.current?.openDiagnostic(item)}><AlertTriangle size={14} /><span><strong>{item.message}</strong><small>{item.path}:{item.line}:{item.column}</small></span><ChevronRight size={15} /></button>)}{interactiveRun?.stdout && <pre className="is-stdout">{interactiveRun.stdout}</pre>}{interactiveRun?.stderr && <pre className="is-stderr">{interactiveRun.stderr}</pre>}{interactiveRun?.outputTruncated && <p>Вывод остановлен: достигнут установленный лимит.</p>}{!interactiveRun && <p>Нажмите «Запустить». Если программа запросит данные, введите одну строку ниже и нажмите Enter.</p>}{interactiveRun?.terminal && !interactiveRun.stdout && !interactiveRun.stderr && diagnostics.length === 0 && <p>Программа завершена без вывода.</p>}</div><form className="experiment-console__input" onSubmit={(event) => { event.preventDefault(); void sendExperimentInput(); }}><input aria-label="Ввод программы" value={interactiveInput} onChange={(event) => setInteractiveInput(event.target.value)} disabled={!interactiveInputOpen} maxLength={65_536} autoComplete="off" spellCheck={false} placeholder={interactiveRun?.terminal ? 'Программа завершена' : interactiveInputOpen ? 'Введите строку и нажмите Enter' : 'Сначала запустите программу'} /><button type="submit" aria-label="Передать строку программе" disabled={!interactiveInputOpen}><Send size={14} /> Отправить</button></form></div>}
-    </section>{reviewPanelOpen ? <aside className="review-side"><div className="review-side__top"><button type="button" className="review-side__collapse" aria-label="Скрыть панель проверки" title="Скрыть панель проверки" onClick={() => setReviewPanelOpen(false)}><PanelRightClose size={16} /></button><div className="evidence-tabs">{(['tests', 'integrity', 'history', 'ai'] as EvidenceTab[]).map((id) => <button key={id} className={evidenceTab === id ? 'is-active' : ''} onClick={() => setEvidenceTab(id)}>{id === 'tests' ? 'Тесты' : id === 'integrity' ? 'Плагиат' : id === 'history' ? 'История' : 'ИИ'}</button>)}</div></div><div className="evidence-body"><EvidencePanel tab={evidenceTab} submission={submission} courseId={courseId} canUseDecisionSupport={canUseDecisionSupport} canAskTeacherAi={canAskTeacherAi} reviewRequired={reviewRequired} decisionSupportEnabled={decisionSupportEnabled} /></div>
+    </section>{reviewPanelOpen ? <aside className="review-side"><div className="review-side__top"><button type="button" className="review-side__collapse" aria-label="Скрыть панель проверки" title="Скрыть панель проверки" onClick={() => setReviewPanelOpen(false)}><PanelRightClose size={16} /></button><div className="evidence-tabs">{(['tests', 'integrity', 'history', 'ai'] as EvidenceTab[]).map((id) => <button key={id} className={evidenceTab === id ? 'is-active' : ''} onClick={() => setEvidenceTab(id)}>{id === 'tests' ? 'Тесты' : id === 'integrity' ? 'Плагиат' : id === 'history' ? 'История' : 'ИИ'}</button>)}</div></div><div className="evidence-body"><EvidencePanel tab={evidenceTab} submission={submission} courseId={courseId} teacherComment={comment} canUseDecisionSupport={canUseDecisionSupport} canAskTeacherAi={canAskTeacherAi} reviewRequired={reviewRequired} decisionSupportEnabled={decisionSupportEnabled} /></div>
       <div className="grading-panel"><header><div><span className="eyebrow">Решение преподавателя</span><h2>Оценка и комментарий</h2></div><span>{reviewedReadOnly ? 'Утверждено' : canReview ? 'Черновик' : 'Только чтение'}</span></header>
         {reviewedReadOnly && <div className="review-decision-meta"><CheckCircle2 size={16} /><span><strong>{finalDecision?.reviewerName ?? 'Преподаватель'}</strong><small>{finalDecision?.reviewedAt ? formatDate(finalDecision.reviewedAt) : 'Дата решения не предоставлена'}{finalDecision?.revision ? ` · версия ${finalDecision.revision}` : ''}{submission.decisionHistory.length > 1 ? ` · решений в истории: ${submission.decisionHistory.length}` : ''}</small></span>{finalDecision?.lmsExportState && <Badge tone={finalDecision.lmsExportState === 'DELIVERED' ? 'success' : finalDecision.lmsExportState === 'BLOCKED' || finalDecision.lmsExportState === 'FAILED' ? 'danger' : 'neutral'}>{lmsExportStateLabel(finalDecision.lmsExportState)}</Badge>}</div>}
         <div className="grade-input"><Field label="Итоговый балл"><div><input type="number" min="0" max={submission.maxScore} disabled={!canReview} value={grade} onChange={(event) => { setGrade(event.target.value); setReviewDirty(true); }} /><span>/ {submission.maxScore}</span></div></Field></div><p className="no-recommendation">Оценка определяется преподавателем по доступным проверкам в приложении.</p><Field label={reviewedReadOnly ? 'Финальный комментарий студенту' : 'Комментарий студенту'}><textarea rows={8} disabled={!canReview} value={comment} onChange={(event) => { setComment(event.target.value); setReviewDirty(true); }} placeholder={reviewedReadOnly ? 'Комментарий не добавлен' : 'Объясните сильные стороны и что стоит исправить…'} /></Field>{canReview && <footer><Button variant="secondary" disabled={!validGrade || !reviewDirty} onClick={() => void saveDraft()}><Save size={15} /> Сохранить</Button><Button onClick={() => setDecisionOpen(true)} disabled={!validGrade}>Утвердить <ChevronRight size={15} /></Button></footer>}</div>
@@ -634,14 +637,14 @@ function clearInteractiveExperimentSession(submissionId: string, experimentId?: 
   }
 }
 
-function EvidencePanel({ tab, submission, courseId, canUseDecisionSupport, canAskTeacherAi, reviewRequired, decisionSupportEnabled }: {
+function EvidencePanel({ tab, submission, courseId, teacherComment, canUseDecisionSupport, canAskTeacherAi, reviewRequired, decisionSupportEnabled }: {
   tab: EvidenceTab; submission: Submission; courseId: string; canUseDecisionSupport: boolean; canAskTeacherAi: boolean;
-  reviewRequired: boolean; decisionSupportEnabled: boolean;
+  reviewRequired: boolean; decisionSupportEnabled: boolean; teacherComment: string;
 }) {
   if (tab === 'tests') return <EvidenceRunsPanel submission={submission} canLaunch={canUseDecisionSupport} reviewRequired={reviewRequired} decisionSupportEnabled={decisionSupportEnabled} />;
   if (tab === 'integrity') return <IntegrityPanel submission={submission} canReview={canUseDecisionSupport} decisionSupportEnabled={decisionSupportEnabled} />;
   if (tab === 'history') return <ReviewHistoryPanel submission={submission} />;
-  return <TeacherAiPanel submissionId={submission.id} courseId={courseId} canSend={canAskTeacherAi} />;
+  return <TeacherAiPanel key={submission.id} submissionId={submission.id} courseId={courseId} canSend={canAskTeacherAi} teacherComment={teacherComment} />;
 }
 
 function ReviewHistoryPanel({ submission }: { submission: Submission }) {
@@ -854,27 +857,32 @@ function selectDiffFiles(originalFiles: WorkspaceFile[], modifiedFiles: Workspac
 
 function DiffWorkspace({ original, modified, path, theme }: { original: string; modified: string; path: string; theme: 'light' | 'dark' }) { return <div className="diff-workspace"><header><span>Оригинал студента · {path}</span><span>Преподавательская копия · {path}</span></header><DiffEditor height="100%" original={original} modified={modified} language="cpp" theme={theme === 'dark' ? 'eduprog-dark' : 'eduprog-light'} options={{ readOnly: true, renderSideBySide: true, automaticLayout: true, minimap: { enabled: false }, fontSize: 13, lineHeight: 22 }} /></div>; }
 
-function TeacherAiPanel({ submissionId, courseId, canSend }: { submissionId: string; courseId: string; canSend: boolean }) {
+function TeacherAiPanel({ submissionId, courseId, canSend, teacherComment }: { submissionId: string; courseId: string; canSend: boolean; teacherComment: string }) {
   const [opened, setOpened] = useState(false);
   const [message, setMessage] = useState('');
   const [sending, setSending] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [messages, setMessages] = useState<Array<{ from: 'user' | 'ai'; text: string; citations?: Array<{ title: string; url: string }> }>>([]);
   const threadRef = useRef<string>();
+  const mountedRef = useRef(false);
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
   async function openChat() {
     setOpened(true); setLoadingHistory(true);
     try {
       const threads = await api.getTeacherAiThreads(courseId);
+      if (!mountedRef.current) return;
       const related = threads.filter((thread) => thread.submissionId === submissionId);
       const existing = related.find((thread) => thread.status === 'OPEN') ?? related[0];
       if (existing) {
         threadRef.current = existing.id;
         const stored = await api.getAiMessages(existing.id);
+        if (!mountedRef.current) return;
         setMessages(stored.map((item) => ({ from: item.from, text: item.content, citations: item.citations })));
       }
     } catch (caught) {
+      if (!mountedRef.current) return;
       setMessages([{ from: 'ai', text: caught instanceof Error ? `Историю чата загрузить не удалось: ${caught.message}` : 'Историю чата загрузить не удалось.' }]);
-    } finally { setLoadingHistory(false); }
+    } finally { if (mountedRef.current) setLoadingHistory(false); }
   }
   async function send() {
     const content = message.trim();
@@ -882,14 +890,17 @@ function TeacherAiPanel({ submissionId, courseId, canSend }: { submissionId: str
     setMessage(''); setMessages((items) => [...items, { from: 'user', text: content }]); setSending(true);
     try {
       if (!threadRef.current) threadRef.current = (await api.createTeacherAiThread(submissionId, courseId)).id;
-      const response = await api.sendAiMessage(threadRef.current, content);
+      if (!mountedRef.current) return;
+      const response = await api.sendAiMessage(threadRef.current, content, { teacherComment });
+      if (!mountedRef.current) return;
       setMessages((items) => [...items, { from: 'ai', text: response.content, citations: response.citations }]);
     } catch (caught) {
+      if (!mountedRef.current) return;
       setMessages((items) => [...items, { from: 'ai', text: caught instanceof Error ? `Ошибка: ${caught.message}` : 'Помощник недоступен' }]);
-    } finally { setSending(false); }
+    } finally { if (mountedRef.current) setSending(false); }
   }
-  if (!opened) return <div className="teacher-ai"><span><Bot /></span><h3>{canSend ? 'Спросить о работе' : 'История чата по работе'}</h3><p>{canSend ? 'Помощник получает зафиксированный снимок сдачи и серверный контекст, но не принимает решение и не меняет оценку.' : 'Сохранённый диалог доступен для аудита. Новые сообщения доступны преподавателю в его области проверки при включённой СППР.'}</p><button onClick={() => void openChat()}><MessageSquareText size={16} /> Открыть чат</button><small>{canSend ? 'Для вопросов закреплять работу за собой не нужно. Диалог не изменяет утверждённую оценку.' : 'Режим только для чтения.'}</small></div>;
-  return <div className="teacher-ai-chat"><header><Bot size={16} /><span><strong>Помощник проверки</strong><small>{canSend ? 'Снимок сдачи зафиксирован' : 'История · только чтение'}</small></span></header><div>{loadingHistory ? <p>Загружаю историю…</p> : messages.length ? messages.map((item, index) => <div className={cn('teacher-ai-message', item.from === 'user' && 'is-user')} key={index}><p>{item.text}</p>{item.citations?.map((citation) => <a key={citation.url} href={citation.url} target="_blank" rel="noreferrer">{citation.title}</a>)}</div>) : canSend ? <div className="teacher-ai-suggestions"><button onClick={() => setMessage('Почему один из граничных тестов не проходит?')}>Почему не проходит тест?</button><button onClick={() => setMessage('Какие замечания по корректности здесь важнее всего?')}>Что проверить вручную?</button></div> : <p>Сохранённых сообщений по этой работе нет.</p>}{sending && <p>Анализирую…</p>}</div><form onSubmit={(event) => { event.preventDefault(); void send(); }}><input value={message} disabled={!canSend || sending || loadingHistory} onChange={(event) => setMessage(event.target.value)} placeholder={canSend ? 'Вопрос о текущем коде…' : 'Новые сообщения недоступны'} /><button disabled={!canSend || !message.trim() || sending || loadingHistory} aria-label="Отправить"><Send size={14} /></button></form></div>;
+  if (!opened) return <div className="teacher-ai"><span><Bot /></span><h3>{canSend ? 'Спросить о работе' : 'История чата по работе'}</h3><p>{canSend ? 'Вопрос получит контекст открытой задачи: условие, все файлы сдачи студента и ваш комментарий, если он есть. Чат не сохраняет комментарий и не меняет оценку.' : 'Сохранённый диалог доступен для аудита. Новые сообщения доступны преподавателю в его области проверки при включённой СППР.'}</p><button onClick={() => void openChat()}><MessageSquareText size={16} /> Открыть чат</button><small>{canSend ? 'Для вопросов закреплять работу за собой не нужно. Диалог не изменяет утверждённую оценку.' : 'Режим только для чтения.'}</small></div>;
+  return <div className="teacher-ai-chat"><header><Bot size={16} /><span><strong>Помощник проверки</strong><small>{canSend ? 'Условие и код выбранной задачи' : 'История · только чтение'}</small></span></header><div>{loadingHistory ? <p>Загружаю историю…</p> : messages.length ? messages.map((item, index) => <div className={cn('teacher-ai-message', item.from === 'user' && 'is-user')} key={index}><p>{item.text}</p>{item.citations?.map((citation) => <a key={citation.url} href={citation.url} target="_blank" rel="noreferrer">{citation.title}</a>)}</div>) : !canSend && <p>Сохранённых сообщений по этой работе нет.</p>}{sending && <p>Анализирую…</p>}</div><form onSubmit={(event) => { event.preventDefault(); void send(); }}><input value={message} disabled={!canSend || sending || loadingHistory} onChange={(event) => setMessage(event.target.value)} placeholder={canSend ? 'Вопрос о текущем коде…' : 'Новые сообщения недоступны'} /><button disabled={!canSend || !message.trim() || sending || loadingHistory} aria-label="Отправить"><Send size={14} /></button></form></div>;
 }
 
 function interactiveStatusLabel(run: InteractiveRun): string {

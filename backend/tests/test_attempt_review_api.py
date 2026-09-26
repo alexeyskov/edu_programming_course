@@ -774,6 +774,18 @@ async def test_reopening_pending_submission_resumes_delivery_and_can_retry(app_b
         )
         assert submitted.status_code == 201, submitted.text
 
+        # A retry after a lost HTTP response is idempotent. Its receipt must
+        # describe the actual frozen snapshot, not echo a different/stale
+        # revision from the retry request.
+        repeated = await student_client.post(
+            f"/api/v1/attempts/{attempt['id']}/submit",
+            headers=student_headers,
+            json={"revision": 99},
+        )
+        assert repeated.status_code == 201, repeated.text
+        assert repeated.json()["submission_id"] == submitted.json()["submission_id"]
+        assert repeated.json()["revision"] == 0
+
         async with session_factory() as db:
             events = list(
                 (

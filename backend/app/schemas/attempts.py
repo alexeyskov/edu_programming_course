@@ -21,7 +21,7 @@ from app.schemas.common import (
 
 EditSource = Literal["TYPING", "INTERNAL_PASTE"]
 CheckpointStatus = Literal["SYNCED", "PENDING", "ERROR"]
-AttemptClosureReason = Literal["LMS_ATTEMPT_FINALIZED"]
+AttemptClosureReason = Literal["LMS_ATTEMPT_FINALIZED", "LMS_ATTEMPT_DELETED"]
 
 
 class AttemptStartRequest(EmptyMutation):

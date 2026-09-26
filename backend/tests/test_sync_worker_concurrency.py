@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 import httpx
+import pytest
 
 from app.workers import sync as sync_worker
 
@@ -14,6 +15,7 @@ async def test_sync_worker_uses_parallel_lanes_for_latency_sensitive_events(
     _, session_factory, settings = app_bundle
     settings.sync_worker_concurrency = 2
     settings.sync_terminal_concurrency = 0
+    settings.sync_history_concurrency = 0
     stop = asyncio.Event()
     both_started = asyncio.Event()
     calls = 0
@@ -82,6 +84,7 @@ async def test_reserved_terminal_lanes_deliver_twenty_students_during_long_impor
     _, sessions, settings = app_bundle
     settings.sync_worker_concurrency = 2
     settings.sync_terminal_concurrency = 2
+    settings.sync_history_concurrency = 0
     settings.sync_poll_seconds = 0.1
     stop = asyncio.Event()
     imports_started = asyncio.Event()
@@ -120,3 +123,78 @@ async def test_reserved_terminal_lanes_deliver_twenty_students_during_long_impor
         )
     assert sorted(delivered) == list(range(20))
     assert active_imports == 2
+
+
+async def test_history_lanes_progress_while_all_general_lanes_are_crawling_courses(
+    app_bundle, monkeypatch
+):
+    _, sessions, settings = app_bundle
+    settings.sync_worker_concurrency = 2
+    settings.sync_terminal_concurrency = 0
+    settings.sync_history_concurrency = 2
+    stop = asyncio.Event()
+    courses_started = asyncio.Event()
+    active_courses = 0
+    reports = list(range(20))
+    imported = []
+
+    async def process(*_args, history_imports_only=False, exclude_history_imports=False, **_kwargs):
+        nonlocal active_courses
+        if not history_imports_only:
+            assert exclude_history_imports
+            active_courses += 1
+            if active_courses == 2:
+                courses_started.set()
+            await stop.wait()
+            return True
+        await courses_started.wait()
+        assert not exclude_history_imports
+        if not reports:
+            return False
+        report = reports.pop(0)
+        await asyncio.sleep(0.001)
+        imported.append(report)
+        if len(imported) == 20:
+            stop.set()
+        return True
+
+    monkeypatch.setattr(sync_worker, "process_outbox_once", process)
+    async with httpx.AsyncClient() as client:
+        await asyncio.wait_for(
+            sync_worker.run_sync_worker(
+                sessions,
+                settings,
+                stop_event=stop,
+                client=client,
+            ),
+            5,
+        )
+    assert sorted(imported) == list(range(20))
+    assert active_courses == 2
+
+
+@pytest.mark.parametrize("mode", ["once", "explicit_concurrency", "no_reserved_history"])
+async def test_general_lanes_still_read_history_when_no_history_lanes_exist(
+    app_bundle, monkeypatch, mode,
+):
+    _, sessions, settings = app_bundle
+    settings.sync_worker_concurrency = 1
+    settings.sync_terminal_concurrency = 0
+    settings.sync_history_concurrency = 0 if mode == "no_reserved_history" else 2
+    stop = asyncio.Event()
+    filters = []
+
+    async def process(*_args, **kwargs):
+        filters.append((kwargs.get("history_imports_only"), kwargs.get("exclude_history_imports")))
+        stop.set()
+        return True
+
+    monkeypatch.setattr(sync_worker, "process_outbox_once", process)
+    async with httpx.AsyncClient() as client:
+        await sync_worker.run_sync_worker(
+            sessions, settings, client=client, stop_event=stop,
+            once=mode == "once",
+            concurrency=1 if mode == "explicit_concurrency" else None,
+        )
+    assert len(filters) == 1
+    assert not any(filters[0])

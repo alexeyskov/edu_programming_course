@@ -73,11 +73,12 @@ def test_profile_hidden_control_supplies_current_user_id_when_menu_omits_it() ->
     }
 
 
-def test_identity_drops_theme_avatar_initials_from_visible_name() -> None:
-    html = """
+@pytest.mark.parametrize("marker", ["АК", "КА"])
+def test_identity_drops_theme_avatar_initials_from_visible_name(marker) -> None:
+    html = f"""
     <html lang="ru"><body>
       <div class="usermenu">
-        <span class="usertext">АК Алексей Коваленко</span>
+        <span class="usertext">{marker} Алексей Коваленко</span>
         <a href="/user/profile.php?id=4376">Профиль</a>
         <a href="/login/logout.php?sesskey=opaque">Выход</a>
       </div>
@@ -756,6 +757,17 @@ def test_foreign_logout_and_pagination_links_do_not_count() -> None:
     """
     assert not has_authenticated_markup(html, BASE_URL)
     assert not parse_participants_page(html, BASE_URL, "549").has_next
+
+
+@pytest.mark.parametrize("row", [
+    "<tr><td>Unrecognized student identity</td></tr>",
+    "<tr><td><a href='/user/view.php?id=77'></a></td><td>Student</td></tr>",
+])
+def test_unidentified_roster_rows_cannot_authorize_membership_removal(row: str) -> None:
+    parsed = parse_participants_page(
+        f"<table id='participants'><tbody>{row}</tbody></table>", BASE_URL, "549"
+    )
+    assert parsed.table_present and not parsed.all_rows_classified
 
 
 def test_participants_link_alone_does_not_escalate_actor_to_teacher() -> None:

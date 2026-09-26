@@ -46,6 +46,7 @@ from app.models.identity import (
 from app.models.integration import (
     AuditEntry,
     ExternalMapping,
+    HistoryWarningDismissal,
     LMSSubmissionFingerprint,
     SyncOutbox,
     SystemSetting,
@@ -89,6 +90,7 @@ __all__ = [
     "EvidenceReport",
     "ExternalMapping",
     "ExternalPrincipal",
+    "HistoryWarningDismissal",
     "LMSConnection",
     "LMSSubmissionFingerprint",
     "LoginTransaction",

@@ -82,6 +82,25 @@ class SyncOutbox(UUIDTimestampModel):
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class HistoryWarningDismissal(UUIDTimestampModel):
+    """A teacher acknowledged one stable import problem, not the whole sync run."""
+
+    __tablename__ = "core_historywarningdismissal"
+    __table_args__ = (
+        UniqueConstraint(
+            "principal_id", "assessment_id", "warning_id", name="unique_history_warning_dismissal"
+        ),
+    )
+
+    principal_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("core_externalprincipal.id", ondelete="CASCADE")
+    )
+    assessment_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("core_assessment.id", ondelete="CASCADE"), index=True
+    )
+    warning_id: Mapped[str] = mapped_column(String(64))
+
+
 class LMSSubmissionFingerprint(UUIDTimestampModel):
     """Immutable fingerprint of the exact answer successfully delivered to an LMS.
 

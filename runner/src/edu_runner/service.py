@@ -34,7 +34,7 @@ from .models import (
     ProfileSummary,
 )
 from .paths import normalize_relative_path, write_regular_file
-from .process import InteractiveProcess, ProcessOutcome
+from .process import InteractiveInputBackpressure, InteractiveProcess, ProcessOutcome
 from .profiles import BuildProfile, DEFAULT_PROFILES, ResourceLimits
 
 
@@ -639,8 +639,11 @@ class RunnerService:
     ) -> InteractiveSessionResponse:
         session = self._interactive_session(session_id, owner_key=owner_key)
         process = session.process
-        if process is None or process.finished or not process.send_line(text):
-            raise InteractiveSessionStateError("interactive program is not running")
+        try:
+            if process is None or process.finished or not process.send_line(text):
+                raise InteractiveSessionStateError("interactive program is not running")
+        except InteractiveInputBackpressure as exc:
+            raise RunnerBusyError(str(exc)) from exc
         return self._interactive_response(session)
 
     def interactive_stop(

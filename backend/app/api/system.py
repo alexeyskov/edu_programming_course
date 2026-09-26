@@ -6,7 +6,7 @@ import uuid
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -818,16 +818,48 @@ async def list_sync_outbox(
         # Apply access filters BEFORE ranking. An old failed page completing
         # late must not replace a newer import just because updated_at changed.
         ranked = statement.add_columns(
-            func.row_number().over(
+            func.row_number()
+            .over(
                 partition_by=(
                     SyncOutbox.aggregate_id,
                     SyncOutbox.payload["actor_external_subject"].as_string(),
+                    SyncOutbox.payload["detail_key"].as_string(),
                 ),
                 order_by=(SyncOutbox.created_at.desc(), SyncOutbox.id.desc()),
-            ).label("activity_rank")
+            )
+            .label("activity_rank")
         ).subquery()
         entity = aliased(SyncOutbox, ranked)
-        statement = select(entity).where(ranked.c.activity_rank == 1)
+        # An inventory may finish while its answer jobs are still queued or
+        # failed. Do not let the newest successful page hide those jobs. First
+        # supersede older retries for each exact detail, then summarize the
+        # activity (keeping the same bounded public list contract).
+        summary = (
+            select(entity)
+            .where(ranked.c.activity_rank == 1)
+            .add_columns(
+                func.row_number()
+                .over(
+                    partition_by=(
+                        entity.aggregate_id,
+                        entity.payload["actor_external_subject"].as_string(),
+                    ),
+                    order_by=(
+                        case(
+                            (entity.state.in_(["FAILED", "BLOCKED"]), 0),
+                            (entity.state.in_(["PENDING", "PROCESSING", "RETRY"]), 1),
+                            else_=2,
+                        ),
+                        entity.created_at.desc(),
+                        entity.id.desc(),
+                    ),
+                )
+                .label("summary_rank"),
+            )
+            .subquery()
+        )
+        entity = aliased(SyncOutbox, summary)
+        statement = select(entity).where(summary.c.summary_rank == 1)
     if state is not None:
         statement = statement.where(entity.state == state.value)
     rows = list(
@@ -838,9 +870,19 @@ async def list_sync_outbox(
         ).all()
     )
     assessment_ids = {row.aggregate_id for row in rows if row.aggregate_type == "Assessment"}
-    titles = dict((await db.execute(select(Assessment.id, Assessment.title).where(
-        Assessment.id.in_(assessment_ids),
-    ))).all()) if assessment_ids else {}
+    titles = (
+        dict(
+            (
+                await db.execute(
+                    select(Assessment.id, Assessment.title).where(
+                        Assessment.id.in_(assessment_ids),
+                    )
+                )
+            ).all()
+        )
+        if assessment_ids
+        else {}
+    )
     return [_outbox_read(row, aggregate_title=titles.get(row.aggregate_id)) for row in rows]
 
 
@@ -902,6 +944,15 @@ async def retry_sync_outbox(
                     },
                 )
             await _require_outbox_access(db, auth=auth, row=row)
+            if row.event_type in {"course.sync", "moodle.history.import"}:
+                # These operations must start a fresh run under the course
+                # admission lock. Reopening a historical page here can revive
+                # an old run while another teacher synchronizes the course.
+                raise DomainError(
+                    409,
+                    "MANUAL_SYNC_REQUIRED",
+                    "Повторите синхронизацию курса или работы на странице «Курсы и работы».",
+                )
             await _ensure_grade_event_current(db, row)
             if row.state in {SyncOutboxState.PENDING.value, SyncOutboxState.RETRY.value}:
                 return _outbox_read(row)

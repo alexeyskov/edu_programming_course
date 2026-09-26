@@ -148,6 +148,16 @@ class Settings(BaseSettings):
         ge=16 * 1024,
         le=8 * 1024 * 1024,
     )
+    # History may carry a 100 MiB attachment encoded as base64, plus bounded
+    # text/metadata. Do not relax the cap on login and other ordinary RPCs.
+    moodle_browser_history_max_response_bytes: int = Field(
+        default=160 * 1024 * 1024,
+        ge=16 * 1024,
+        le=160 * 1024 * 1024,
+    )
+    moodle_browser_history_artifact_max_bytes: int = Field(
+        default=100 * 1024 * 1024, ge=1, le=100 * 1024 * 1024,
+    )
     moodle_browser_storage_state_max_bytes: int = Field(
         default=256 * 1024,
         ge=16 * 1024,
@@ -184,6 +194,12 @@ class Settings(BaseSettings):
         le=8,
         validation_alias="LMS_SYNC_TERMINAL_CONCURRENCY",
     )
+    sync_history_concurrency: int = Field(
+        default=2,
+        ge=0,
+        le=4,
+        validation_alias="LMS_SYNC_HISTORY_CONCURRENCY",
+    )
     # The dedicated sync-worker remains the primary outbox consumer.  The web
     # process also keeps one narrow, terminal-checkpoint-only lane so a missing
     # or restarting worker can never strand a student's final submission.
@@ -210,11 +226,6 @@ class Settings(BaseSettings):
         default=8,
         ge=1,
         validation_alias="LMS_SYNC_MAX_ATTEMPTS",
-    )
-    sync_course_interval_seconds: int = Field(
-        default=900,
-        ge=60,
-        validation_alias="LMS_SYNC_COURSE_INTERVAL_SECONDS",
     )
     sync_checkpoint_max_bytes: int = Field(
         default=4 * 1024 * 1024,

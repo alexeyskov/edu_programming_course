@@ -32,17 +32,18 @@ _TYPE_WORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (AssessmentType.LAB.value, ("лаборатор", "практич", "lab")),
 )
-_ARCHIVE_WORDS = ("архив", "archive")
-
-
-def classify_moodle_assessment(title: str, section_title: str) -> str | None:
+def classify_moodle_assessment(title: str, section_title: str) -> str:
     evidence = re.sub(r"\s+", " ", f"{section_title} {title}".casefold()).strip()
-    if any(marker in evidence for marker in _ARCHIVE_WORDS):
-        return None
+    # Titles classify the workflow, not visibility. A Moodle section named
+    # "Archive" still contains real activities teachers may need to review.
+    # New catalog entries remain unpublished drafts until explicitly enabled.
     for assessment_type, markers in _TYPE_WORDS:
         if any(marker in evidence for marker in markers):
             return assessment_type
-    return None
+    # A supported Moodle task need not contain a category keyword in its title.
+    # Unknown names use the ordinary lab workflow until more specific evidence
+    # is available; actual answer transport is still validated separately.
+    return AssessmentType.LAB.value
 
 
 def _epoch(value: object) -> datetime | None:
@@ -293,6 +294,53 @@ async def _refresh_managed_task(
     mapping.metadata_json = metadata
 
 
+async def merge_moodle_course_index(
+    db: AsyncSession, *, course: Course, activities: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Refresh the catalog without erasing separately synchronized task settings.
+
+    Course discovery only reads the index. Default/unknown values on that page
+    are not evidence that a previously read statement, timer or grade changed.
+    Missing activities are deliberately not merged back into the index.
+    """
+    mappings = (
+        await db.scalars(
+            select(ExternalMapping)
+            .join(Assessment, Assessment.id == ExternalMapping.local_id)
+            .where(
+                Assessment.course_id == course.id,
+                ExternalMapping.connection_id == course.connection_id,
+                ExternalMapping.local_type.in_(["Assessment", "core.assessment"]),
+            )
+        )
+    ).all()
+    previous = {}
+    for mapping in mappings:
+        activity = dict(mapping.metadata_json or {}).get("activity")
+        if isinstance(activity, dict):
+            previous[(str(activity.get("module", "")), str(activity.get("cmid", "")))] = activity
+    result = []
+    index_fields = {
+        "cmid", "instance_id", "module", "name", "title_confirmed", "visible",
+        "user_visible", "uservisible", "section_external_id", "url",
+    }
+    for activity in activities:
+        old = previous.get((str(activity.get("module", "")), str(activity.get("cmid", ""))))
+        # Full snapshots (bridge adapters/tests) remain authoritative; the
+        # Playwright index marks only its title as confirmed.
+        has_details = any(activity.get(key) is True for key in (
+            "schedule_confirmed", "grade_confirmed", "duration_confirmed",
+            "attempt_policy_confirmed", "statement_confirmed", "quiz_questions_confirmed",
+        ))
+        if old and not has_details:
+            result.append({
+                **old, **{key: value for key, value in activity.items() if key in index_fields}
+            })
+        else:
+            result.append(activity)
+    return result
+
+
 async def materialize_moodle_activity_drafts(
     db: AsyncSession,
     *,
@@ -411,9 +459,7 @@ async def materialize_moodle_activity_drafts(
                     assessment.max_score = score
                     if section is not None:
                         assessment.section_id = section.id
-                        assessment_type = classify_moodle_assessment(title, section.title)
-                        if assessment_type is not None:
-                            assessment.type = assessment_type
+                        assessment.type = classify_moodle_assessment(title, section.title)
                     policy = dict(assessment.policy or {})
                     activity_mapping = dict(policy.get("lms_activity_mapping") or {})
                     activity_mapping["submission_mode"] = metadata["submission_mode"]
@@ -451,8 +497,6 @@ async def materialize_moodle_activity_drafts(
         section = sections.get(str(activity.get("section_external_id", "")))
         section_title = section.title if section is not None else ""
         assessment_type = classify_moodle_assessment(title, section_title)
-        if assessment_type is None:
-            continue
         parsed_score = positive_decimal(activity.get("grade_max"))
         score = (
             parsed_score

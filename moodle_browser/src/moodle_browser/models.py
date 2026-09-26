@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import re
 from typing import Annotated, Literal
 
@@ -32,6 +33,8 @@ ManagedSubmissionFilename = Literal[
     "submission.zip",
 ]
 _ARTIFACT_BASE64_MAX_CHARS = ((4 * 1024 * 1024 + 2) // 3) * 4
+_HISTORY_ARTIFACT_MAX_BYTES = 100 * 1024 * 1024
+_HISTORY_ARTIFACT_BASE64_MAX_CHARS = ((_HISTORY_ARTIFACT_MAX_BYTES + 2) // 3) * 4
 _SAFE_ARTIFACT_FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
@@ -536,6 +539,18 @@ class HistoricalActivityRef(StrictModel):
     cmid: int = Field(gt=0, le=2**63 - 1)
 
 
+class HistoricalAttemptRef(StrictModel):
+    """Report evidence persisted between inventory and answer reads; no arbitrary URL."""
+
+    attempt_id: Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9:_-]{1,160}$")]
+    user_id: PositiveId
+    display_name: ShortText
+    state: Literal["IN_PROGRESS", "SUBMITTED", "GRADED", "UNKNOWN"]
+    submitted_at_epoch: int = Field(default=0, ge=0)
+    grade: float | None = Field(default=None, ge=0, le=1_000_000, allow_inf_nan=False)
+    grade_max: float | None = Field(default=None, gt=0, le=1_000_000, allow_inf_nan=False)
+
+
 class HistoricalSubmissionsRequest(StrictModel):
     """Bounded cursor request for historical Moodle submissions.
 
@@ -555,7 +570,54 @@ class HistoricalSubmissionsRequest(StrictModel):
     # attempts which still require manual grading.  The exhaustive historical
     # crawl is queued separately after this pass completes.
     priority_only: bool = False
+    # Inventory reads the entire report page without opening answers. Details
+    # subsequently use pinned identities, never a moving row offset.
+    scan_only: bool = False
+    # Only the initial inventory of an explicit activity synchronization reads
+    # that activity's settings. Course discovery itself is list/roster-only.
+    include_activity_metadata: bool = False
+    # Explicit synchronization checks all previously known IDs in bounded
+    # batches, independent of report pagination and answer downloads.
+    probe_only: bool = False
+    # The history worker streams references individually instead of packing
+    # every archive from all questions into one giant JSON response.
+    attachment_delivery: Literal["inline", "reference"] = "inline"
+    attempt_refs: list[HistoricalAttemptRef] = Field(default_factory=list, max_length=5)
+    # Previously bound Quiz attempts only. A missing report row is not deletion
+    # evidence; the connector probes these exact IDs using Moodle's read API.
+    known_attempt_ids: list[PositiveId] = Field(default_factory=list, max_length=5)
     storage_state: BrowserStorageState
+
+    @model_validator(mode="after")
+    def deletion_probe_scope(self) -> HistoricalSubmissionsRequest:
+        if self.probe_only and (
+            not self.scan_only
+            or self.activity.module != "quiz"
+            or not self.known_attempt_ids
+            or self.attempt_refs
+            or self.include_activity_metadata
+        ):
+            raise ValueError("deletion-only requests require Quiz IDs and inventory mode")
+        if self.include_activity_metadata and (not self.scan_only or self.cursor != "0:0"):
+            raise ValueError("activity metadata requires the initial inventory page")
+        if self.scan_only and self.attempt_refs:
+            raise ValueError("inventory and detail requests are mutually exclusive")
+        if len(self.attempt_refs) > self.limit:
+            raise ValueError("detail references exceed the page limit")
+        identities = [item.attempt_id for item in self.attempt_refs]
+        if len(identities) != len(set(identities)):
+            raise ValueError("detail references must be unique")
+        for item in self.attempt_refs:
+            if self.activity.module == "quiz":
+                if not re.fullmatch(r"[1-9][0-9]{0,19}", item.attempt_id):
+                    raise ValueError("invalid Quiz attempt reference")
+            elif not re.fullmatch(rf"user-{item.user_id}-attempt-[0-9]{{1,7}}", item.attempt_id):
+                raise ValueError("invalid Assignment attempt reference")
+        if self.known_attempt_ids and self.activity.module != "quiz":
+            raise ValueError("attempt deletion probes require a Quiz activity")
+        if len(set(self.known_attempt_ids)) != len(self.known_attempt_ids):
+            raise ValueError("attempt deletion probe identifiers must be unique")
+        return self
 
 
 class HistoricalArtifact(StrictModel):
@@ -571,11 +633,14 @@ class HistoricalArtifact(StrictModel):
         str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)
     ]
     mime_type: Annotated[str, StringConstraints(max_length=255)] = ""
-    size_bytes: int = Field(default=0, ge=0, le=4 * 1024 * 1024)
+    size_bytes: int = Field(default=0, ge=0, le=_HISTORY_ARTIFACT_MAX_BYTES)
     sha256: Annotated[str, StringConstraints(pattern=r"^(?:[a-f0-9]{64})?$")] = ""
-    content_base64: Annotated[str, StringConstraints(max_length=_ARTIFACT_BASE64_MAX_CHARS)] = ""
+    content_base64: Annotated[
+        str, StringConstraints(max_length=_HISTORY_ARTIFACT_BASE64_MAX_CHARS)
+    ] = ""
     downloaded: bool = True
     omission_reason: Annotated[str, StringConstraints(max_length=255)] = ""
+    download_url: Annotated[str, StringConstraints(max_length=2048)] = ""
 
     @field_validator("filename")
     @classmethod
@@ -590,23 +655,38 @@ class HistoricalArtifact(StrictModel):
 
     @model_validator(mode="after")
     def content_contract(self) -> HistoricalArtifact:
+        if self.download_url and (
+            self.downloaded or self.omission_reason != "DEFERRED_DOWNLOAD"
+        ):
+            raise ValueError("artifact download reference is inconsistent")
+        if self.omission_reason == "DEFERRED_DOWNLOAD" and not self.download_url:
+            raise ValueError("artifact download reference is missing")
         if not self.downloaded:
             if self.content_base64 or self.sha256 or not self.omission_reason:
                 raise ValueError("omitted artifact has an invalid representation")
             return self
+        if len(self.content_base64) != ((self.size_bytes + 2) // 3) * 4:
+            raise ValueError("artifact content is not canonical base64")
+        # Validate incrementally: a 100 MiB archive must not require another
+        # full decoded copy plus a re-encoded copy just to verify its model.
+        digest = hashlib.sha256()
+        decoded_size = 0
+        chunk_chars = 64 * 1024  # A multiple of four base64 characters.
         try:
-            decoded = base64.b64decode(self.content_base64, validate=True)
+            for offset in range(0, len(self.content_base64), chunk_chars):
+                encoded = self.content_base64[offset : offset + chunk_chars]
+                if offset + len(encoded) < len(self.content_base64) and "=" in encoded:
+                    raise ValueError("base64 padding precedes the final chunk")
+                decoded = base64.b64decode(encoded, validate=True)
+                if base64.b64encode(decoded).decode("ascii") != encoded:
+                    raise ValueError("noncanonical base64 padding")
+                decoded_size += len(decoded)
+                digest.update(decoded)
         except (ValueError, binascii.Error) as exc:
             raise ValueError("artifact content is not canonical base64") from exc
-        if (
-            len(self.content_base64) % 4
-            or base64.b64encode(decoded).decode("ascii") != self.content_base64
-            or len(decoded) != self.size_bytes
-        ):
+        if decoded_size != self.size_bytes:
             raise ValueError("artifact content is not canonical base64")
-        import hashlib
-
-        if hashlib.sha256(decoded).hexdigest() != self.sha256:
+        if digest.hexdigest() != self.sha256:
             raise ValueError("artifact digest does not match content")
         return self
 
@@ -659,7 +739,11 @@ class HistoricalSubmission(StrictModel):
 class HistoricalSubmissionsResponse(StrictModel):
     course_id: PositiveId
     activity: HistoricalActivityRef
+    activity_metadata: ActivitySnapshot | None = None
     items: list[HistoricalSubmission] = Field(default_factory=list, max_length=25)
+    candidates: list[HistoricalAttemptRef] = Field(default_factory=list, max_length=500)
+    scan_only: bool = False
+    deleted_attempt_ids: list[PositiveId] = Field(default_factory=list, max_length=5)
     next_cursor: Annotated[str, StringConstraints(pattern=r"^[0-9]{1,6}:[0-9]{1,6}$")] | None = (
         None
     )
