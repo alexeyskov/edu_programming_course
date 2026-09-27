@@ -62,7 +62,7 @@ describe('Moodle login page', () => {
     mocks.getConnections.mockResolvedValue([connection('CREDENTIALS')]);
     renderLogin();
 
-    expect(screen.getByRole('heading', { name: 'Среда осмысленного программирования' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Практикум программирования' })).toBeInTheDocument();
     expect(await screen.findByLabelText('Логин Moodle')).toBeInTheDocument();
     expect(screen.getByLabelText('Пароль Moodle')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Войти через Moodle мехмата ЮФУ/ })).toBeDisabled();
