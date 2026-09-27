@@ -156,14 +156,15 @@ describe('student interactive console', () => {
     vi.spyOn(Date, 'now').mockReturnValue(now);
     mocks.getAttempt.mockResolvedValue({
       ...attempt,
-      deadlineAt: new Date(now + 600_000).toISOString(),
-      expectedEndAt: new Date(now + 900_000).toISOString(),
+      deadlineAt: new Date(now + 3000_000).toISOString(),
+      expectedEndAt: new Date(now + 3300_000).toISOString(),
       moodleSyncTimeoutSeconds: 300,
     });
     renderPage();
     await screen.findByTestId('code-workspace');
-    expect(screen.getByText('10:00')).toBeInTheDocument();
-    expect(screen.queryByText('15:00')).not.toBeInTheDocument();
+    expect(screen.getByText('50:00')).toBeInTheDocument();
+    expect(screen.queryByText('55:00')).not.toBeInTheDocument();
+    expect(screen.queryByText('53:00')).not.toBeInTheDocument();
     expect(screen.queryByText(/Резерв на отправку в Moodle/)).not.toBeInTheDocument();
   });
 

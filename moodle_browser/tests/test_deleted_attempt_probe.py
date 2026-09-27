@@ -13,12 +13,16 @@ from pydantic import ValidationError
 
 from moodle_browser import service as service_module
 from moodle_browser.attempt_probe import (
+    ALL_ATTEMPT_STATES,
     READ_ATTEMPT_METHOD,
     missing_quiz_attempt_response,
+    parse_unfiltered_attempt_report,
     teacher_session_key,
+    unknown_missing_record_response,
 )
 from moodle_browser.config import Settings
 from moodle_browser.models import HistoricalSubmissionsRequest
+from moodle_browser.parsers import MoodleMarkupError
 from moodle_browser.service import MoodleBrowserService, MoodleSessionExpired
 
 BASE_URL = "https://edu.mmcs.sfedu.ru"
@@ -56,6 +60,7 @@ def test_missing_record_is_explicit_and_not_language_dependent(message: str) -> 
         failure("invalidrecord", "Cannot find record in question_usages"),
         failure("invalidrecord", "Cannot find record in external_functions"),
         failure("invalidrecord", "Cannot find record in old_quiz_attempts"),
+        failure("invalidrecordunknown", "Cannot find data record in database"),
         failure("dmlreadexception", "Database unavailable quiz_attempts"),
         failure("attempterrorcontentchange", "quiz_attempts", module="quiz"),
         failure("attempterrorinvalid", "quiz_attempts", module="quiz"),
@@ -107,6 +112,8 @@ class FakeResponse:
         self.disposed = False
 
     async def body(self) -> bytes:
+        if isinstance(self.payload, bytes):
+            return self.payload
         return json.dumps(self.payload).encode()
 
     async def dispose(self) -> None:
@@ -114,9 +121,11 @@ class FakeResponse:
 
 
 class FakeRequests:
-    def __init__(self, replies: list[Any]) -> None:
+    def __init__(self, replies: list[Any], pages: list[Any] | None = None) -> None:
         self.replies = replies
+        self.pages = pages or []
         self.calls: list[dict[str, Any]] = []
+        self.reads: list[dict[str, Any]] = []
         self.responses: list[FakeResponse] = []
 
     async def post(self, url: str, **kwargs: Any) -> FakeResponse:
@@ -127,6 +136,168 @@ class FakeRequests:
         response = FakeResponse(url, reply)
         self.responses.append(response)
         return response
+
+    async def get(self, url: str, **kwargs: Any) -> FakeResponse:
+        self.reads.append({"url": url, **kwargs})
+        reply = self.pages[len(self.reads) - 1]
+        if isinstance(reply, BaseException):
+            raise reply
+        response = FakeResponse(url, reply.encode())
+        self.responses.append(response)
+        return response
+
+
+def full_report(*attempts: str, next_page: int | None = None) -> str:
+    states = "".join(
+        f'<input type="checkbox" name="state{state}" checked>'
+        for state in ALL_ATTEMPT_STATES.split("-")
+    )
+    rows = "".join(
+        f'<tr><td><a href="/user/view.php?id=77">Student</a></td><td>Finished</td>'
+        f'<td><a href="/mod/quiz/review.php?attempt={attempt}&amp;cmid=31529">'
+        'Review</a></td></tr>' for attempt in attempts
+    )
+    results = (
+        f'<table id="attempts"><tbody>{rows}</tbody></table>' if rows
+        else '<div class="alert-info">Нечего показывать</div>'
+    )
+    paging = (
+        f'<a href="/mod/quiz/report.php?id=31529&amp;page={next_page}">Next</a>'
+        if next_page is not None else ""
+    )
+    return f'''<body class="course-508">{REPORT}<main>
+        <select name="group"><option value="0" selected>All groups</option></select>
+        <form><input name="id" value="31529"><input name="mode" value="overview">
+        <select name="attempts"><option value="all_with" selected>All</option></select>
+        {states}<input name="onlygraded" value="0"><input name="onlyregraded" value="0">
+        <input type="checkbox" name="onlyregraded" value="1"></form>
+        <div class="initialbar firstinitial"><li class="initialbarall active">All</li></div>
+        <div class="initialbar lastinitial"><li class="initialbarall active">All</li></div>
+        {results}{paging}</main></body>'''
+
+
+def test_generic_missing_record_needs_separate_evidence() -> None:
+    generic = failure("invalidrecordunknown", "Cannot find data record in database")
+    assert unknown_missing_record_response(generic)
+    assert not missing_quiz_attempt_response(generic)
+    assert not unknown_missing_record_response(failure("nopermissions", "Not found"))
+    assert not unknown_missing_record_response(failure("invalidrecordunknown", "x", module="quiz"))
+
+
+@pytest.mark.parametrize("before,after", [
+    ('value="all_with"', 'value="enrolled_with"'),
+    ('value="0" selected', 'value="7" selected'),
+    ('name="stateabandoned" checked', 'name="stateabandoned"'),
+    ('name="stateinprogress"', 'name="unsupported"'),
+    ('name="onlygraded" value="0"', 'name="onlygraded" value="1"'),
+    ('name="onlyregraded" value="1"', 'name="onlyregraded" value="1" checked'),
+    ('initialbarall active', 'initialbarletter active'),
+    ('class="initialbar lastinitial"', 'class="unknown"'),
+    ('name="id" value="31529"', 'name="id" value="999"'),
+    ('name="mode" value="overview"', 'name="mode" value="responses"'),
+    ('course-508', 'course-999'),
+    ('class="alert-info"', 'class="alert-danger"'),
+    ('Нечего показывать', 'Unknown or incomplete report'),
+])
+def test_filtered_or_unverified_report_cannot_corroborate_deletion(before, after) -> None:
+    with pytest.raises(MoodleMarkupError):
+        parse_unfiltered_attempt_report(
+            full_report().replace(before, after), base_url=BASE_URL,
+            course_id="508", cmid=31529, page_number=0,
+        )
+
+
+def test_report_rejects_unidentified_attempts() -> None:
+    with pytest.raises(MoodleMarkupError):
+        parse_unfiltered_attempt_report(
+            full_report("9001").replace('/user/view.php?id=77', '/unknown'),
+            base_url=BASE_URL, course_id="508", cmid=31529, page_number=0,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pages,expected", [
+    ([full_report()], (["9001"], False)),
+    ([full_report("9001")], ([], False)),
+    ([full_report("9002", next_page=1), full_report("9001")], ([], False)),
+    ([full_report("9002", next_page=1), full_report("9003")], (["9001"], False)),
+    ([full_report("9002", next_page=1), PlaywrightError("Timeout")], ([], True)),
+    ([full_report().replace('all_with', 'enrolled_with')], ([], True)),
+    ([full_report("9002", next_page=1), full_report("9002")], ([], True)),
+    ([full_report(str(10 + page), next_page=page + 1) for page in range(5)], ([], True)),
+])
+async def test_generic_missing_record_requires_a_complete_global_report(
+    monkeypatch, pages, expected
+) -> None:
+    service = MoodleBrowserService(Settings(shared_secret=b"x" * 32))
+    requests = FakeRequests([failure("invalidrecordunknown", "Not found")], pages)
+
+    async def authenticated(*_args):
+        pass
+
+    monkeypatch.setattr(service, "_require_authenticated_page", authenticated)
+    assert await service._probe_deleted_attempts(
+        SimpleNamespace(request=requests), REPORT, ["9001"], course_id="508", cmid=31529
+    ) == expected
+    assert len(requests.reads) == len(pages)
+    for page, call in enumerate(requests.reads):
+        params = parse_qs(urlsplit(call["url"]).query, keep_blank_values=True)
+        assert params == {
+            "id": ["31529"], "mode": ["overview"], "attempts": ["all_with"],
+            "group": ["0"], "onlygraded": ["0"], "onlyregraded": ["0"],
+            "states": [ALL_ATTEMPT_STATES], "tifirst": [""], "tilast": [""],
+            "pagesize": ["500"], "page": [str(page)],
+        }
+        assert call["max_redirects"] == 0 and call["timeout"] == 7_000
+    assert all(response.disposed for response in requests.responses)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["invalidrecordunknown", "nopermissions", "dmlreadexception"])
+async def test_generic_failure_without_scope_never_uses_report_absence(code) -> None:
+    service = MoodleBrowserService(Settings(shared_secret=b"x" * 32))
+    requests = FakeRequests([failure(code, "Not found")])
+    assert await service._probe_deleted_attempts(
+        SimpleNamespace(request=requests), REPORT, ["9001"]
+    ) == ([], True)
+    assert requests.reads == []
+
+
+@pytest.mark.asyncio
+async def test_fallback_expired_session_never_confirms_deletion(monkeypatch) -> None:
+    service = MoodleBrowserService(Settings(shared_secret=b"x" * 32))
+    requests = FakeRequests([failure("invalidrecordunknown", "Not found")], [full_report()])
+
+    async def expired(*_args):
+        raise MoodleSessionExpired("Expired")
+
+    monkeypatch.setattr(service, "_require_authenticated_page", expired)
+    with pytest.raises(MoodleSessionExpired):
+        await service._probe_deleted_attempts(
+            SimpleNamespace(request=requests), REPORT, ["9001"], course_id="508", cmid=31529
+        )
+    assert all(response.disposed for response in requests.responses)
+
+
+@pytest.mark.asyncio
+async def test_report_is_read_once_per_batch_and_never_substitutes_for_missing_record(monkeypatch):
+    service = MoodleBrowserService(Settings(shared_secret=b"x" * 32))
+    requests = FakeRequests([
+        failure("invalidrecordunknown", "Not found"),
+        failure("invalidrecordunknown", "Not found"),
+        failure("nopermissions", "Not found"),
+        failure("invalidrecord", "Missing question_usages"),
+    ], [full_report()])
+
+    async def authenticated(*_args):
+        pass
+
+    monkeypatch.setattr(service, "_require_authenticated_page", authenticated)
+    assert await service._probe_deleted_attempts(
+        SimpleNamespace(request=requests), REPORT, ["9001", "9002", "9003", "9004"],
+        course_id="508", cmid=31529,
+    ) == (["9001", "9002"], True)
+    assert len(requests.reads) == 1
 
 
 @pytest.mark.asyncio

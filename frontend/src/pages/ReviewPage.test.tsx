@@ -10,6 +10,7 @@ import { ReviewPage } from './ReviewPage';
 const mocks = vi.hoisted(() => ({
   getSubmission: vi.fn(), getAssessment: vi.fn(), getReviewDraft: vi.fn(), claimSubmission: vi.fn(),
   heartbeatClaim: vi.fn(), releaseClaim: vi.fn(), saveReview: vi.fn(), getEvidenceRuns: vi.fn(),
+  finalizeReview: vi.fn(),
   createExperiment: vi.fn(), runExperiment: vi.fn(), getRun: vi.fn(), saveExperimentFile: vi.fn(),
   startInteractiveExperiment: vi.fn(), getInteractiveExperiment: vi.fn(), sendInteractiveInput: vi.fn(), eofInteractiveExperiment: vi.fn(), stopInteractiveExperiment: vi.fn(),
   resetExperiment: vi.fn(), deleteExperiment: vi.fn(),
@@ -124,9 +125,50 @@ beforeEach(() => {
   mocks.claimSubmission.mockResolvedValue(claim);
   mocks.heartbeatClaim.mockResolvedValue(claim);
 });
-afterEach(() => { cleanup(); window.sessionStorage.clear(); });
+afterEach(() => { cleanup(); vi.useRealTimers(); window.sessionStorage.clear(); });
 
 describe('reviewed submission', () => {
+  it.each(['PENDING', 'FAILED'])('refreshes %s delivery without reloading or changing the decision', async (state) => {
+    vi.useFakeTimers();
+    const pending = { ...decision, lmsExportState: state };
+    mocks.getSubmission.mockResolvedValueOnce({ ...submission, latestDecision: pending, decisionHistory: [pending] });
+    renderPage();
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.queryByText('Оценка передана в Moodle')).not.toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+    expect(screen.getByText('Оценка передана в Moodle')).toBeVisible();
+    expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(9);
+    expect(screen.getByLabelText('Финальный комментарий студенту')).toHaveValue(decision.comment);
+    await act(async () => { await vi.advanceTimersByTimeAsync(15000); });
+    expect(mocks.getSubmission).toHaveBeenCalledTimes(2);
+    expect(mocks.claimSubmission).not.toHaveBeenCalled();
+  });
+
+  it('ignores a late heartbeat failure after successful finalization without releasing twice', async () => {
+    let rejectHeartbeat!: (reason: Error) => void;
+    mocks.heartbeatClaim.mockReturnValue(new Promise((_resolve, reject) => { rejectHeartbeat = reject; }));
+    mocks.finalizeReview.mockResolvedValue({ id: 'new-decision', grade: 9, comment: '', lmsExportState: 'PENDING' });
+    mocks.getSubmission.mockResolvedValue({ ...submission, status: 'CLAIMED', claim: { id: 'claim-1', mine: true, ownerName: 'Teacher' } });
+    renderPage();
+    await screen.findByText('Вы проверяете работу');
+    fireEvent.click(screen.getAllByRole('button', { name: 'Утвердить' })[0]);
+    fireEvent.click(screen.getByRole('button', { name: 'Утвердить и отправить' }));
+    await screen.findByText('Оценка утверждена');
+    await act(async () => { rejectHeartbeat(new Error('Резервирование работы больше не действует.')); });
+    expect(screen.queryByText('Право на изменение проверки потеряно')).not.toBeInTheDocument();
+    expect(mocks.releaseClaim).not.toHaveBeenCalled();
+    expect(mocks.finalizeReview).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId('location')).toHaveTextContent('/submissions?view=reviewed');
+  });
+
+  it('still reports an actual lost reservation during editing', async () => {
+    mocks.getSubmission.mockResolvedValue({ ...submission, status: 'CLAIMED', claim: { id: 'claim-1', mine: true, ownerName: 'Teacher' } });
+    mocks.heartbeatClaim.mockRejectedValue(new Error('Резервирование работы больше не действует.'));
+    renderPage();
+    expect(await screen.findByText('Право на изменение проверки потеряно')).toBeVisible();
+    expect(screen.getByLabelText(/Итоговый балл/)).toBeDisabled();
+  });
+
   it('shows the network and browser audit context in writing history', async () => {
     mocks.getSubmission.mockResolvedValue({
       ...submission,

@@ -91,8 +91,9 @@ class InventoryService(MoodleBrowserService):
     async def _state(self, _context):
         return STATE
 
-    async def _probe_deleted_attempts(self, _context, _report, candidates):
+    async def _probe_deleted_attempts(self, _context, _report, candidates, **scope):
         assert candidates == ["8888"]
+        assert scope == {"course_id": "549", "cmid": 30354}
         return candidates, False
 
     async def _historical_detail(self, _page, _context, **kwargs):
@@ -173,7 +174,7 @@ async def test_manual_deleted_attempt_batch_never_opens_report_or_answers(connec
 
 @pytest.mark.asyncio
 async def test_manual_incomplete_deletion_batch_is_not_reported_as_clean(connector, monkeypatch):
-    async def incomplete(*_args):
+    async def incomplete(*_args, **_kwargs):
         return [], True
 
     monkeypatch.setattr(connector, "_probe_deleted_attempts", incomplete)

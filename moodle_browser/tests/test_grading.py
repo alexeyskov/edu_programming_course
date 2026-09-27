@@ -41,6 +41,9 @@ class FakeLocator:
     async def get_attribute(self, name: str) -> str | None:
         return self.controls[0].attributes.get(name)
 
+    async def input_value(self) -> str:
+        return self.controls[0].value
+
     async def evaluate(self, script: str, value: str | None = None) -> Any:
         control = self.controls[0]
         if "tagName" in script:
@@ -121,8 +124,12 @@ def live_session_state(settings: Settings) -> BrowserStorageState:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("grading_method", ["1", "2", "3", "4"])
+@pytest.mark.parametrize(
+    "outcome",
+    ["saved", "already_saved", "wrong_mark", "wrong_comment", "wrong_target", "wrong_slot"],
+)
 async def test_quiz_grade_uses_canonical_manual_grading_form(
-    settings: Settings, grading_method: str
+    settings: Settings, grading_method: str, outcome: str
 ) -> None:
     mark = Control(attributes={"context_text": "Балл из 5,00"})
     textarea = Control(tag="textarea")
@@ -162,16 +169,37 @@ async def test_quiz_grade_uses_canonical_manual_grading_form(
     service = MoodleBrowserService(settings)
     visited: list[str] = []
     guard_page = FakePage({})
+    form_controls = page.controls
+    if outcome == "already_saved":
+        mark.value = "2,00000"
+        textarea.value = "<div>Проверено<br>Коваленко А.</div>"
 
     class Context:
         async def new_page(self) -> FakePage:
             return guard_page
 
-    submit.on_click = lambda: setattr(page, "url", f"{settings.base_url}/mod/quiz/comment.php")
+    def saved() -> None:
+        # Moodle's successful POST closes the grading dialog: no form or
+        # hidden identifiers remain. Only a fresh GET can confirm persistence.
+        page.url = f"{settings.base_url}/mod/quiz/comment.php"
+        page.controls = {}
+
+    submit.on_click = saved
 
     async def goto(fake_page: FakePage, url: str) -> str:
         visited.append(url)
         fake_page.url = url
+        if "/mod/quiz/comment.php" in url and submit.clicked:
+            assert not fake_page.controls
+            fake_page.controls = form_controls
+            if outcome == "wrong_mark":
+                mark.value = "0"
+            elif outcome == "wrong_comment":
+                textarea.value = "Другой комментарий"
+            elif outcome == "wrong_target":
+                fake_page.url = f"{settings.base_url}/mod/quiz/comment.php?attempt=999&slot=1"
+            elif outcome == "wrong_slot":
+                form_controls["input[name='slot']"][0].attributes["value"] = "2"
         if "/course/modedit.php" in url:
             return quiz_settings_markup(grading_method)
         if "/mod/quiz/report.php" in url:
@@ -200,10 +228,14 @@ async def test_quiz_grade_uses_canonical_manual_grading_form(
     service._state = state  # type: ignore[method-assign]
     service._require_authenticated_page = authenticated  # type: ignore[method-assign]
 
+    if outcome.startswith("wrong_"):
+        with pytest.raises(MoodleProtocolError):
+            await service._grade_quiz_essay(page, Context(), request)  # type: ignore[arg-type]
+        assert submit.clicked
+        return
+
     target, question_max, submitted_mark = await service._grade_quiz_essay(
-        page,
-        Context(),
-        request,  # type: ignore[arg-type]
+        page, Context(), request,  # type: ignore[arg-type]
     )
 
     assert visited == [
@@ -212,11 +244,18 @@ async def test_quiz_grade_uses_canonical_manual_grading_form(
         f"{settings.base_url}/mod/quiz/report.php?id=777&mode=overview"
         "&attempts=enrolled_with&onlygraded=0&onlyregraded=0&slotmarks=1&group=0"
         "&tifirst=&tilast=&page=0",
-    ]
+    ] + ([] if outcome == "already_saved" else [
+        f"{settings.base_url}/mod/quiz/comment.php?attempt=134403&slot=1",
+    ])
     assert guard_page.closed is True
     assert target == "/mod/quiz/comment.php"
     assert question_max == 5
     assert submitted_mark == 2
+    if outcome == "already_saved":
+        assert not submit.clicked
+        assert editor.value == ""
+        assert mark.value == "2,00000"
+        return
     assert mark.value == "2"
     assert textarea.value == "<p>Проверено</p><p>Коваленко А.</p>"
     assert editor.value == "Проверено\nКоваленко А."

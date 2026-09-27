@@ -1,8 +1,9 @@
 """Reconcile exact, positively confirmed Moodle Quiz deletions.
 
 A missing report row is never deletion evidence: group filters, pagination and
-permission changes all legitimately hide attempts. Only the connector's exact
-missing ``quiz_attempts`` record response for a requested, known id is authoritative.
+permission changes all legitimately hide attempts. The connector requires a
+missing ``quiz_attempts`` record, or Moodle's table-redacted missing-record error
+corroborated by a complete, verified unfiltered report, for a requested known id.
 Source snapshots stay intact; VOID is a recoverable local tombstone.
 """
 

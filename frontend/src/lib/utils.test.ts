@@ -1,7 +1,19 @@
 import { describe, expect, it } from 'vitest';
-import { findWorkspacePasteSource, formatGreetingName, formatRemaining, formatSessionElapsed, languageForPath, unwrapList, validateWorkspacePath, workspaceIdentifiers } from './utils';
+import { assessmentDisplayStatus, findWorkspacePasteSource, formatGreetingName, formatRemaining, formatSessionElapsed, languageForPath, unwrapList, validateWorkspacePath, workspaceIdentifiers } from './utils';
 
 describe('workspace utilities', () => {
+  it('distinguishes revoked Moodle groups from publication history and omitted student rules', () => {
+    const assessment = { status: 'AVAILABLE' as const, publicationStatus: 'PUBLISHED' as const, policy: { moodle_metadata_read_only: true }, availabilityRules: [] };
+    expect(assessmentDisplayStatus(assessment)).toBe('DRAFT');
+    const group = { id: 'g1', targetType: 'GROUP' as const, targetExternalId: 'group-1', allowed: true };
+    expect(assessmentDisplayStatus({ ...assessment, availabilityRules: [group] })).toBe('AVAILABLE');
+    expect(assessmentDisplayStatus({ ...assessment, availabilityRules: [{ ...group, allowed: false }] })).toBe('DRAFT');
+    expect(assessmentDisplayStatus({ ...assessment, availabilityRules: undefined })).toBe('AVAILABLE');
+    expect(assessmentDisplayStatus({ ...assessment, policy: {} })).toBe('AVAILABLE');
+    expect(assessmentDisplayStatus({ ...assessment, publicationStatus: 'CLOSED', status: 'CLOSED' })).toBe('CLOSED');
+    expect(assessment.publicationStatus).toBe('PUBLISHED');
+  });
+
   it('accepts only safe C/C++ workspace paths', () => {
     expect(validateWorkspacePath('src/answer.cpp')).toBeNull();
     expect(validateWorkspacePath('include/answer.hh')).toBeNull();

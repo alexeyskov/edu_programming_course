@@ -47,9 +47,12 @@ from .assignment import (
     parse_assignment_view_page,
 )
 from .attempt_probe import (
+    ALL_ATTEMPT_STATES,
     READ_ATTEMPT_METHOD,
     missing_quiz_attempt_response,
+    parse_unfiltered_attempt_report,
     teacher_session_key,
+    unknown_missing_record_response,
 )
 from .config import Settings, exact_https_origin
 from .historical import (
@@ -87,6 +90,7 @@ from .models import (
 )
 from .parsers import (
     MoodleMarkupError,
+    _plain_rich_text,
     canonical_hash,
     has_authenticated_markup,
     merge_course_sections,
@@ -1586,7 +1590,7 @@ class MoodleBrowserService:
                         value for value in request.known_attempt_ids if value not in visible_ids
                     ]
                     deleted_attempt_ids, probe_incomplete = await self._probe_deleted_attempts(
-                        context, report_html, candidates
+                        context, report_html, candidates, course_id=request.course_id, cmid=cmid
                     )
                     if probe_incomplete:
                         if request.probe_only:
@@ -1673,6 +1677,9 @@ class MoodleBrowserService:
         context: BrowserContext,
         report_html: str,
         attempt_ids: list[str],
+        *,
+        course_id: str | None = None,
+        cmid: int | None = None,
     ) -> tuple[list[str], bool]:
         """Bounded, read-only existence checks; never call the reopen operation.
 
@@ -1688,6 +1695,7 @@ class MoodleBrowserService:
         if not sesskey:
             return [], True
         deleted: list[str] = []
+        unknown: list[str] = []
         incomplete = False
         url = f"{self.settings.base_url}/lib/ajax/service.php?" + urlencode(
             {"sesskey": sesskey, "info": READ_ATTEMPT_METHOD}
@@ -1720,6 +1728,8 @@ class MoodleBrowserService:
                         payload = json.loads(body)
                         if missing_quiz_attempt_response(payload):
                             deleted.append(attempt_id)
+                        elif unknown_missing_record_response(payload):
+                            unknown.append(attempt_id)
                         elif (
                             isinstance(payload, list)
                             and len(payload) == 1
@@ -1750,7 +1760,59 @@ class MoodleBrowserService:
                                 await response.dispose()
         except TimeoutError:
             incomplete = True
+        if unknown:
+            report_ids = (
+                await self._unfiltered_quiz_attempt_ids(context, course_id=course_id, cmid=cmid)
+                if course_id and cmid
+                else None
+            )
+            if report_ids is None:
+                incomplete = True
+            else:
+                deleted.extend(value for value in unknown if value not in report_ids)
         return deleted, incomplete
+
+    async def _unfiltered_quiz_attempt_ids(
+        self, context: BrowserContext, *, course_id: str, cmid: int
+    ) -> set[str] | None:
+        """Corroborate generic missing records; never infer deletion from absence alone."""
+        ids: set[str] = set()
+        try:
+            async with asyncio.timeout(36):
+                for page_number in range(5):
+                    url = f"{self.settings.base_url}/mod/quiz/report.php?" + urlencode({
+                        "id": cmid, "mode": "overview", "attempts": "all_with", "group": 0,
+                        "onlygraded": 0, "onlyregraded": 0, "states": ALL_ATTEMPT_STATES,
+                        "tifirst": "", "tilast": "", "pagesize": 500, "page": page_number,
+                    })
+                    response = None
+                    try:
+                        response = await context.request.get(url, timeout=7_000, max_redirects=0)
+                        if response.status != 200 or response.url != url:
+                            return None
+                        body = await response.body()
+                        if len(body) > 8 * 1024 * 1024:
+                            return None
+                        markup = body.decode("utf-8")
+                        await self._require_authenticated_page(context, markup)
+                        report = await asyncio.to_thread(
+                            parse_unfiltered_attempt_report, markup,
+                            base_url=self.settings.base_url, course_id=course_id,
+                            cmid=cmid, page_number=page_number,
+                        )
+                        page_ids = {str(item["attempt_id"]) for item in report.items}
+                        if ids.intersection(page_ids) or (report.has_next and not page_ids):
+                            return None  # Repeated/stuck pagination is not a complete inventory.
+                        ids.update(page_ids)
+                        if not report.has_next:
+                            return ids
+                    finally:
+                        if response is not None:
+                            with suppress(PlaywrightError):
+                                await response.dispose()
+        except (TimeoutError, ValueError, PlaywrightError, MoodleMarkupError):
+            pass
+        return None  # Budget exhausted, parser failure or any unverified page: keep local data.
 
     async def _historical_detail(
         self,
@@ -3071,9 +3133,14 @@ class MoodleBrowserService:
         tolerance = max(Decimal("0.000000001"), local_scale * Decimal("0.000000001"))
         if abs(round_trip - local_grade) > tolerance:
             raise MoodleContractError("Moodle quiz mark cannot preserve the local grade")
+        await self._require_live_quiz_grade_preconditions(context, request)
+        if await self._quiz_grade_matches(page, submitted_mark, request.payload.comment):
+            # A previous Save may have succeeded before its acknowledgement
+            # was lost. Read back first; never duplicate that grading action.
+            _LOGGER.info("Moodle quiz grade already matches; no write needed")
+            return "/mod/quiz/comment.php", question_max, submitted_mark
         await self._set_grade(grade, submitted_mark)
         await self._set_editor(page, "textarea[name$='-comment']", request.payload.comment)
-        await self._require_live_quiz_grade_preconditions(context, request)
         submit = await self._one_visible(
             page,
             "form#manualgradingform #id_submitbutton",
@@ -3097,25 +3164,64 @@ class MoodleBrowserService:
             saved_attempt = saved_query.get("attempt")
             saved_slot = saved_query.get("slot")
             # Moodle 5.2 posts the manual-grading form to comment.php without
-            # a query string.  In that response the exact identifiers remain
-            # in the single canonical form's hidden controls, which are
-            # checked below.  Reject partial or conflicting query evidence.
+            # a query string and without the form. The subsequent GET below
+            # verifies the exact identifiers and persisted values. Reject
+            # partial or conflicting query evidence in the POST response.
             identifiers_absent = saved_attempt is None and saved_slot is None
             identifiers_exact = saved_attempt == [request.payload.attempt_id] and saved_slot == [
                 str(request.payload.question_slot)
             ]
             if not identifiers_absent and not identifiers_exact:
                 raise MoodleProtocolError("Moodle quiz save identifiers changed")
-            await self._require_hidden_value(page, "attempt", request.payload.attempt_id)
-            await self._require_hidden_value(page, "slot", str(request.payload.question_slot))
-            if await page.locator("form#manualgradingform").count() != 1:
-                raise MoodleProtocolError("Moodle manual grading save form is ambiguous")
         else:
             if saved_query.get("attempt") != [request.payload.attempt_id] or saved_query.get(
                 "cmid"
             ) not in (None, [str(request.payload.cmid)]):
                 raise MoodleProtocolError("Moodle quiz save identifiers changed")
+        # Moodle's successful POST returns a notification/close-window page,
+        # deliberately without manualgradingform or its hidden attempt/slot.
+        # A successful navigation is not a receipt: reopen the exact target
+        # read-only and compare the persisted question mark AND signed comment.
+        markup = await self._goto(page, target)
+        await self._require_session_without_global_navigation(context, markup, page.url)
+        readback = urlsplit(page.url)
+        query = parse_qs(readback.query)
+        if (
+            readback.path.rstrip("/") != "/mod/quiz/comment.php"
+            or query.get("attempt") != [request.payload.attempt_id]
+            or query.get("slot") != [str(request.payload.question_slot)]
+        ):
+            raise MoodleProtocolError("Moodle quiz grade readback changed target")
+        await self._require_hidden_value(page, "attempt", request.payload.attempt_id)
+        await self._require_hidden_value(page, "slot", str(request.payload.question_slot))
+        if (
+            await page.locator("form#manualgradingform").count() != 1
+            or not await self._quiz_grade_matches(page, submitted_mark, request.payload.comment)
+        ):
+            raise MoodleProtocolError("Moodle quiz grade or comment readback did not match")
         return "/mod/quiz/comment.php", question_max, submitted_mark
+
+    async def _quiz_grade_matches(self, page: Page, mark: Decimal, comment: str) -> bool:
+        grade = page.locator("input[name$='-mark']")
+        feedback = page.locator("textarea[name$='-comment']")
+        if await grade.count() != 1 or await feedback.count() != 1:
+            return False
+        raw_mark = await grade.input_value()
+        raw_comment = await feedback.input_value()
+        if len(raw_mark) > 128 or len(raw_comment) > 200_000:
+            return False
+        try:
+            actual = Decimal(raw_mark.strip().replace(",", "."))
+        except InvalidOperation:
+            return False
+        # Compare rendered plain text, not TinyMCE/Atto's equivalent HTML.
+        expected_html = "".join(f"<p>{html.escape(line)}</p>" for line in comment.splitlines())
+        return (
+            actual.is_finite()
+            and actual == mark
+            and " ".join(_plain_rich_text(raw_comment, maximum=200_000).split())
+            == " ".join(_plain_rich_text(expected_html, maximum=200_000).split())
+        )
 
     async def _require_live_quiz_grade_preconditions(
         self,

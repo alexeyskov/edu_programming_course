@@ -53,6 +53,19 @@ describe('teacher courses page', () => {
   const course = { id: 'course-1', title: 'C++', shortName: 'C++', syncStatus: 'SYNCED', role: 'TEACHER' };
   const assessment = { id: 'assessment-1', courseId: 'course-1', title: 'Работа 1', kind: 'LAB', status: 'AVAILABLE', standard: 'C++20', fileMode: 'SINGLE' };
 
+  it('labels and filters a published Moodle work with every group revoked as not enabled', async () => {
+    mocks.getCourses.mockResolvedValue([course]);
+    mocks.getAssessments.mockResolvedValue([{ ...assessment, publicationStatus: 'PUBLISHED', policy: { moodle_metadata_read_only: true }, availabilityRules: [] }]);
+    render(<MemoryRouter><ToastProvider><CoursesPage /></ToastProvider></MemoryRouter>);
+    fireEvent.click(await screen.findByRole('button', { name: 'Развернуть список работ курса C++' }));
+    expect(screen.getByRole('link', { name: /Работа 1.*Не включена/ })).toBeVisible();
+    const filter = screen.getAllByRole('combobox')[1];
+    fireEvent.change(filter, { target: { value: 'AVAILABLE' } });
+    expect(screen.queryByRole('link', { name: /Работа 1/ })).not.toBeInTheDocument();
+    fireEvent.change(filter, { target: { value: 'DRAFT' } });
+    expect(screen.getByRole('link', { name: /Работа 1.*Не включена/ })).toBeVisible();
+  });
+
   it.each([
     ['IDLE', '', 'Ответы ещё не синхронизировались'],
     ['COMPLETED', 'work-sync-button--success', 'Ответы синхронизированы'],

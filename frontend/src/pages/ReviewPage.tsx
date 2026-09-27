@@ -21,8 +21,10 @@ function lmsExportStateLabel(state: string): string {
     IMPORTED: 'Импортировано из Moodle',
     DELIVERED: 'Оценка передана в Moodle',
     PENDING: 'Ожидает отправки в Moodle',
-    BLOCKED: 'Отправка ответа в LMS недоступна. Свяжитесь с администратором.',
-    FAILED: 'Отправка ответа в LMS недоступна. Свяжитесь с администратором.',
+    PROCESSING: 'Передаём оценку в Moodle',
+    RETRY: 'Повторяем передачу оценки в Moodle',
+    BLOCKED: 'Передача оценки в Moodle заблокирована.',
+    FAILED: 'Не удалось подтвердить передачу оценки в Moodle.',
     SUPERSEDED: 'Заменено новой проверкой',
   };
   return labels[state.toUpperCase()] ?? 'Статус обмена с Moodle не определён';
@@ -59,7 +61,7 @@ export function ReviewPage() {
   const [switchingSubmissionId, setSwitchingSubmissionId] = useState<string | null>(null);
   const editorRef = useRef<CodeWorkspaceHandle>(null);
   const loadPromiseRef = useRef<Promise<void> | null>(null);
-  const heartbeatInFlightRef = useRef(false);
+  const stoppedClaimsRef = useRef(new Set<string>());
   const saveTimer = useRef<number>();
   const experimentRef = useRef<TeacherExperiment | null>(null);
   const pendingExperimentEdits = useRef<WorkspaceFile[]>([]);
@@ -192,22 +194,63 @@ export function ReviewPage() {
   useEffect(() => { void load(); return () => { if (saveTimer.current) window.clearTimeout(saveTimer.current); }; }, [load]);
   useEffect(() => {
     const claim = submission?.claim;
-    if (!claim?.mine || claimLost) return;
+    if (!claim?.mine || claimLost || finalizing || stoppedClaimsRef.current.has(claim.id)) return;
+    let cancelled = false;
+    let inFlight = false;
     const heartbeat = async () => {
-      if (heartbeatInFlightRef.current) return;
-      heartbeatInFlightRef.current = true;
+      if (cancelled || inFlight || stoppedClaimsRef.current.has(claim.id)) return;
+      inFlight = true;
       try {
         const renewed = await api.heartbeatClaim(claim.id);
-        setSubmission((value) => value ? { ...value, claim: renewed } : value);
+        if (!cancelled && !stoppedClaimsRef.current.has(claim.id)) {
+          setSubmission((value) => value?.claim?.id === claim.id ? { ...value, claim: renewed } : value);
+        }
       } catch (caught) {
-        setClaimLost(true);
-        toast.push('error', 'Право на изменение проверки потеряно', caught instanceof Error ? caught.message : 'Работа открыта только для чтения.');
-      } finally { heartbeatInFlightRef.current = false; }
+        if (!cancelled && !stoppedClaimsRef.current.has(claim.id)) {
+          setClaimLost(true);
+          toastRef.current.push('error', 'Право на изменение проверки потеряно', caught instanceof Error ? caught.message : 'Работа открыта только для чтения.');
+        }
+      } finally { inFlight = false; }
     };
     void heartbeat();
     const timer = window.setInterval(() => { void heartbeat(); }, 120_000);
-    return () => window.clearInterval(timer);
-  }, [submission?.claim?.id, submission?.claim?.mine, claimLost, toast]);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [submission?.id, submission?.claim?.id, submission?.claim?.mine, claimLost, finalizing]);
+
+  const exportedDecision = submission?.latestDecision ?? submission?.decisionHistory[0];
+  useEffect(() => {
+    if (!submission || submission.claim?.mine || !exportedDecision
+      || !['PENDING', 'PROCESSING', 'RETRY', 'FAILED', 'BLOCKED'].includes(exportedDecision.lmsExportState)) return;
+    const id = submission.id;
+    const decisionId = exportedDecision.id;
+    let cancelled = false;
+    let inFlight = false;
+    let timer: number;
+    const refreshExport = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        const fresh = await api.getSubmission(id);
+        const decision = fresh.latestDecision ?? fresh.decisionHistory[0];
+        if (!cancelled && decision?.id === decisionId) {
+          // Refresh delivery metadata only; never replace unsaved review edits
+          // or let a response from the previous question overwrite this one.
+          setSubmission((current) => current?.id === id && !current.claim?.mine
+            && (current.latestDecision ?? current.decisionHistory[0])?.id === decisionId ? {
+              ...current,
+              latestDecision: current.latestDecision ? { ...current.latestDecision, lmsExportState: decision.lmsExportState } : undefined,
+              decisionHistory: current.decisionHistory.map((entry) => entry.id === decisionId ? { ...entry, lmsExportState: decision.lmsExportState } : entry),
+            } : current);
+        }
+      } catch { /* Keep the last confirmed status on a transient read failure. */ }
+      finally {
+        inFlight = false;
+        if (!cancelled) timer = window.setTimeout(() => { void refreshExport(); }, 5000);
+      }
+    };
+    timer = window.setTimeout(() => { void refreshExport(); }, 3000);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [submission?.id, submission?.claim?.mine, exportedDecision?.id, exportedDecision?.lmsExportState]);
 
   async function enableExperiment(enterMode = true): Promise<TeacherExperiment | null> {
     if (!submission || !canUseSandbox) return null;
@@ -466,7 +509,10 @@ export function ReviewPage() {
       }
       prefetchedGroupedReview.current = { submission: openableTarget, assessment, draft };
 
-      if (submission.claim?.mine) await api.releaseClaim(submission.claim.id).catch(() => undefined);
+      if (submission.claim?.mine) {
+        stoppedClaimsRef.current.add(submission.claim.id);
+        await api.releaseClaim(submission.claim.id).catch(() => undefined);
+      }
       navigate(`/review/${encodeURIComponent(targetSubmissionId)}${location.search}`);
     } catch (caught) {
       toast.push('error', 'Задание не открыто', caught instanceof Error ? caught.message : 'Не удалось получить следующее задание. Текущее закрепление сохранено.');
@@ -476,22 +522,30 @@ export function ReviewPage() {
   }
 
   async function finalize() {
-    if (!submission?.claim?.mine || claimLost || grade === '' || !Number.isFinite(Number(grade)) || Number(grade) < 0 || Number(grade) > submission.maxScore) return;
+    if (!submission?.claim?.mine || claimLost || finalizing || grade === '' || !Number.isFinite(Number(grade)) || Number(grade) < 0 || Number(grade) > submission.maxScore) return;
+    const claimId = submission.claim.id;
+    if (stoppedClaimsRef.current.has(claimId)) return;
+    // Finalization releases the claim on the server. In-flight heartbeats
+    // must neither restore it nor report that intentional release as an error.
+    stoppedClaimsRef.current.add(claimId);
     setFinalizing(true);
     try {
       const decision = await api.finalizeReview(submission.id, Number(grade), comment);
-      if (submission.claim) await api.releaseClaim(submission.claim.id).catch(() => undefined);
+      setSubmission((value) => value?.id === submission.id ? { ...value, claim: undefined } : value);
       setDecisionOpen(false);
-      toast.push(decision.lmsExportState === 'BLOCKED' || decision.lmsExportState === 'FAILED' ? 'error' : 'success', 'Оценка утверждена', decision.lmsExportState === 'PENDING' ? 'Выгрузка в Moodle поставлена в очередь.' : decision.lmsExportState === 'BLOCKED' ? 'Отправка ответа в LMS недоступна. Свяжитесь с администратором.' : decision.lmsExportState ? lmsExportStateLabel(decision.lmsExportState) : 'Статус выгрузки не предоставлен сервером.');
+      toast.push(decision.lmsExportState === 'BLOCKED' || decision.lmsExportState === 'FAILED' ? 'error' : 'success', 'Оценка утверждена', decision.lmsExportState === 'PENDING' ? 'Выгрузка в Moodle поставлена в очередь.' : decision.lmsExportState ? lmsExportStateLabel(decision.lmsExportState) : 'Статус выгрузки не предоставлен сервером.');
       navigate(`/submissions${location.search}`);
     }
-    catch (caught) { toast.push('error', 'Решение не сохранено', caught instanceof Error ? caught.message : undefined); }
+    catch (caught) {
+      stoppedClaimsRef.current.delete(claimId);
+      toast.push('error', 'Решение не сохранено', caught instanceof Error ? caught.message : undefined);
+    }
     finally { setFinalizing(false); }
   }
 
   if (loading) return <PageLoader label="Получаем снимок сдачи и закрепление работы…" />;
   if (error || !submission) return <InlineError message={error ?? 'Сдача не найдена'} retry={() => void load()} />;
-  const canReview = Boolean(submission.canReview !== false && reviewRequired && submission.claim?.mine && !claimLost);
+  const canReview = Boolean(submission.canReview !== false && reviewRequired && submission.claim?.mine && !claimLost && !finalizing);
   const canUseDecisionSupport = submission.canReview !== false && decisionSupportEnabled;
   const canAskTeacherAi = submission.canReview !== false && decisionSupportEnabled;
   const validGrade = grade !== '' && Number.isFinite(Number(grade)) && Number(grade) >= 0 && Number(grade) <= submission.maxScore;
@@ -509,7 +563,7 @@ export function ReviewPage() {
   const activeGroupIndex = reviewGroupItems.findIndex((item) => item.submissionId === submission.id);
   return <div className={cn('review-page', experimentMode && 'review-page--experiment', consoleOpen && 'review-page--console')}>
     <header className="review-toolbar">
-      <div><button className="review-back" aria-label="Вернуться к работам" onClick={async () => { if (submission.claim?.mine) await api.releaseClaim(submission.claim.id).catch(() => undefined); navigate(`/submissions${location.search}`); }}><ChevronLeft /></button><span><small>{submission.assessmentTitle}</small><strong>{submission.studentName}{submission.studentGroup !== '—' ? ` · ${submission.studentGroup}` : ''}</strong></span></div>
+      <div><button className="review-back" aria-label="Вернуться к работам" onClick={async () => { if (submission.claim?.mine) { stoppedClaimsRef.current.add(submission.claim.id); await api.releaseClaim(submission.claim.id).catch(() => undefined); } navigate(`/submissions${location.search}`); }}><ChevronLeft /></button><span><small>{submission.assessmentTitle}</small><strong>{submission.studentName}{submission.studentGroup !== '—' ? ` · ${submission.studentGroup}` : ''}</strong></span></div>
       <div className={cn('claim-banner', !canReview && 'claim-banner--other', reviewedReadOnly && !foreignClaim && 'claim-banner--reviewed')}>
         {reviewedReadOnly && !foreignClaim ? <CheckCircle2 size={15} /> : <UserCheck size={15} />}
         <span><strong>{!reviewRequired ? 'Проверка преподавателя не требуется' : foreignClaim ? `Проверяет ${submission.claim?.ownerName}` : reviewedReadOnly ? 'Работа проверена' : canReview ? 'Вы проверяете работу' : 'Работа не закреплена'}</strong><small>{!reviewRequired ? 'страница доступна только для чтения' : foreignClaim ? 'официальная перепроверка заблокирована; личная песочница доступна' : reviewedReadOnly ? `${finalDecision?.reviewerName ?? 'Преподаватель'}${finalDecision?.reviewedAt ? ` · ${formatDate(finalDecision.reviewedAt)}` : ''}` : canReview ? 'работа закреплена за вами; резервирование продлевается автоматически' : submission.canReview === false ? 'у вас нет доступа к проверке этой работы' : 'режим только для чтения'}{foreignClaim && submission.claim?.expiresAt ? ` · до ${formatDate(submission.claim.expiresAt, { hour: '2-digit', minute: '2-digit' })}` : ''}</small></span>

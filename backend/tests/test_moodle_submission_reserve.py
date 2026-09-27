@@ -47,7 +47,10 @@ def test_invalid_reserve_is_rejected(monkeypatch, value):
 
 @pytest.mark.parametrize(
     ("remaining", "reserve", "editing_seconds"),
-    [(900, 300, 600), (900, 600, 300), (900, 0, 900), (300, 300, 0), (60, 300, 0)],
+    [
+        (3300, 300, 3000),  # 55 minutes in Moodle = 50 solving + 5 delivery.
+        (900, 300, 600), (900, 600, 300), (900, 0, 900), (300, 300, 0), (60, 300, 0),
+    ],
 )
 async def test_timer_uses_live_remaining_time_not_course_duration(
     db,

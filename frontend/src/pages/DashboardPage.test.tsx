@@ -49,6 +49,18 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe('teacher dashboard Moodle synchronization recovery', () => {
+  it('counts revoked Moodle access as not enabled and labels the upcoming event consistently', async () => {
+    mocks.getCourses.mockResolvedValue([{ ...syncingCourse, syncStatus: 'SYNCED' }]);
+    mocks.getAssessments.mockResolvedValue([{
+      id: 'revoked', courseId: 'course-1', title: 'Экзамен', kind: 'EXAM', status: 'AVAILABLE',
+      publicationStatus: 'PUBLISHED', policy: { moodle_metadata_read_only: true }, availabilityRules: [],
+    }]);
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>);
+    expect(await screen.findByText('1 ещё не включены для групп')).toBeVisible();
+    expect(screen.getByText('Не включена')).toBeVisible();
+    expect(screen.queryByText('Доступно')).not.toBeInTheDocument();
+  });
+
   it('shows each course own count even when their titles are identical', async () => {
     mocks.getCourses.mockResolvedValue([
       { ...syncingCourse, id: 'course-1', syncStatus: 'SYNCED', activeCount: 42 },

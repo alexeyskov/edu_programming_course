@@ -5,7 +5,7 @@ import { Badge, Button, Card, EmptyState, InlineError, PageLoader, useToast } fr
 import { LmsSyncErrorDialog } from '../components/LmsSyncErrorDialog';
 import { useAuth } from '../context/AuthContext';
 import { api } from '../lib/api';
-import { formatDate, kindLabel, statusLabel } from '../lib/utils';
+import { assessmentDisplayStatus, formatDate, kindLabel, statusLabel } from '../lib/utils';
 import type { Assessment, AssessmentSyncStatus, Course } from '../types';
 
 const workTitleCollator = new Intl.Collator('ru', { numeric: true, sensitivity: 'base' });
@@ -188,7 +188,7 @@ export function CoursesPage() {
 
   const filtered = assessments.filter((item) => item.title.toLowerCase().includes(query.toLowerCase())
     && (typeFilter === 'ALL' || item.kind === typeFilter)
-    && (statusFilter === 'ALL' || item.status === statusFilter || item.publicationStatus === statusFilter));
+    && (statusFilter === 'ALL' || assessmentDisplayStatus(item) === statusFilter));
 
   return <div className="content-width courses-page">
     <div className="page-heading">
@@ -265,7 +265,7 @@ export function CoursesPage() {
               return <div key={item.id} className="work-row-shell"><Link to={item.requiresLiveLmsPreparation || !item.attemptId ? `/assessments/${item.id}` : `/ide/${item.attemptId}`} className="work-row">
               <span><Badge tone="neutral">{kindLabel[item.kind]}</Badge><strong>{item.title}</strong><small>{item.standard} · {item.fileMode === 'MULTI' ? 'многофайловая' : 'один файл'}</small></span>
               <span><CalendarDays size={15} />{item.deadlineAt ? formatDate(item.deadlineAt) : 'Без ограничения'}</span>
-              <Badge tone={item.publicationStatus === 'DRAFT' ? 'warning' : item.status === 'GRADED' ? 'success' : item.status === 'IN_PROGRESS' ? 'info' : 'neutral'}>{item.publicationStatus === 'DRAFT' ? 'Не включена' : statusLabel[item.status]}</Badge><ArrowRight size={17} />
+              <Badge tone={assessmentDisplayStatus(item) === 'DRAFT' ? 'warning' : item.status === 'GRADED' ? 'success' : item.status === 'IN_PROGRESS' ? 'info' : 'neutral'}>{assessmentDisplayStatus(item) === 'DRAFT' ? 'Не включена' : statusLabel[item.status]}</Badge><ArrowRight size={17} />
             </Link>{canSync && <button type="button" className={`work-sync-button${syncTone}`}
               disabled={syncingCourse || syncing || Boolean(statusError)}
               aria-label={`Синхронизировать ответы: ${item.title}`}

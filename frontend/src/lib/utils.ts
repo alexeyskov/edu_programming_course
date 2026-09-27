@@ -1,4 +1,4 @@
-import type { AssessmentKind, AssessmentStatus, ClientContext, Diagnostic, WorkspaceFile } from '../types';
+import type { Assessment, AssessmentKind, AssessmentStatus, ClientContext, Diagnostic, WorkspaceFile } from '../types';
 
 export const cppKeywords = [
   'alignas', 'alignof', 'auto', 'bool', 'break', 'case', 'catch', 'char', 'class', 'const',
@@ -53,6 +53,17 @@ export const statusLabel: Record<AssessmentStatus, string> = {
   GRADED: 'Проверено',
   CLOSED: 'Закрыто',
 };
+
+export function assessmentDisplayStatus(item: Pick<Assessment, 'status' | 'publicationStatus' | 'policy' | 'availabilityRules'>): AssessmentStatus | 'DRAFT' {
+  // Revoking all Moodle groups keeps the published revision and past work,
+  // but no longer makes the assessment available. Missing rules in a student
+  // response are not the same thing as a teacher's explicitly empty rules.
+  if (item.publicationStatus === 'DRAFT' || (item.publicationStatus === 'PUBLISHED'
+    && item.policy?.moodle_metadata_read_only === true
+    && item.availabilityRules !== undefined
+    && !item.availabilityRules.some((rule) => rule.targetType === 'GROUP' && rule.allowed))) return 'DRAFT';
+  return item.status;
+}
 
 export function formatDate(value?: string, options?: Intl.DateTimeFormatOptions): string {
   if (!value) return '—';
