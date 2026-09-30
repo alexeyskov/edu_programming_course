@@ -6,7 +6,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import select
 
-from app.api.reviews import list_submissions
+from app.api.reviews import get_submission, list_submissions
 from app.auth.context import AuthContext
 from app.models.attempts import Attempt, Snapshot, Submission, Workspace
 from app.models.courses import Course, CourseMembership
@@ -47,6 +47,8 @@ async def test_parent_review_queue_includes_every_native_solution(db):
     assert len(rows) == len(all_rows) == 1
     assert rows[0].review_group is not None
     assert rows[0].review_group == all_rows[0].review_group
+    assert rows[0].parent_assessment_id == all_rows[0].parent_assessment_id == parent.id
+    assert rows[0].parent_assessment_title == parent.title
     assert [item.max_score for item in rows[0].review_group.items] == [Decimal(3), Decimal(5)]
     assert rows[0].max_score == Decimal(8)
     expected_ids = set((await db.scalars(select(Submission.id))).all())
@@ -59,7 +61,25 @@ async def test_parent_review_queue_includes_every_native_solution(db):
     )
     assert len(child_rows) == 1 and child_rows[0].max_score == Decimal(5)
     assert child_rows[0].review_group is None
+    assert child_rows[0].assessment_id == child.assessment_id
+    assert child_rows[0].parent_assessment_id == parent.id
+    assert child_rows[0].parent_assessment_title == parent.title
     assert await assessment_review_scope_ids(db, child.assessment_id) == {child.assessment_id}
+
+
+async def test_review_shows_the_pinned_statement_of_each_question(db):
+    _, teacher, parent, _, _ = await _submitted_quiz(db)
+    parent.instructions = "Общее описание курса, не условие вопроса"
+    statements = set()
+    for submission in (await db.scalars(select(Submission))).all():
+        attempt = await db.get(Attempt, submission.attempt_id)
+        version = await db.get(TaskVersion, attempt.assigned_task_version_id)
+        result = await get_submission(submission.id, _teacher_auth(teacher), db)
+        assert result.task_statement == version.statement
+        assert result.task_statement != parent.instructions
+        assert result.source_warnings == []
+        statements.add(result.task_statement)
+    assert len(statements) == 2
 
 
 async def test_parent_review_queue_keeps_native_sibling_during_partial_import(db):
@@ -124,6 +144,7 @@ async def test_parent_review_queue_keeps_native_sibling_during_partial_import(db
     )
     assert {item.submission_id for item in rows[0].review_group.items} == {imported.id, sibling.id}
     assert rows[0].max_score == Decimal(8)
+    assert rows[0].parent_assessment_id == parent.id
 
 
 async def test_parent_review_scope_retains_course_and_teacher_group_boundaries(db):

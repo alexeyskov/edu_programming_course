@@ -87,6 +87,7 @@ from app.services.moodle_attempt_selection import (
     is_completed_moodle_submission,
     latest_reviewable_moodle_submission_ids,
 )
+from app.services.moodle_history_warnings import submission_source_warnings
 from app.services.policy import (
     assessment_review_scope_ids,
     require_submission_review_access,
@@ -673,6 +674,10 @@ async def _collapse_submission_review_groups(
             row_keys.append(None)
             continue
         row_keys.append(key)
+        # Filter a Quiz by its parent work, independently of which question is
+        # currently the reviewable representative (or the only imported one).
+        item.parent_assessment_id = parent.id
+        item.parent_assessment_title = parent.title
         grouped_rows.setdefault(key, []).append((position, submission, item))
 
     for key, members in list(grouped_rows.items()):
@@ -1194,10 +1199,18 @@ async def get_submission(
         allow_review_without_requirement=system_access,
     )
     decision_history = await _decision_history(db, submission.id)
+    version = (
+        await db.get(TaskVersion, attempt.assigned_task_version_id)
+        if attempt.assigned_task_version_id else None
+    )
     return SubmissionTeacherRead(
         **base.model_dump(exclude={"review_group"}),
         attempt_id=attempt.id,
         assigned_task_version_id=attempt.assigned_task_version_id,
+        task_statement=version.statement if version else assessment.instructions,
+        source_warnings=await submission_source_warnings(
+            db, submission=submission, attempt=attempt, assessment=assessment,
+        ),
         snapshot_id=snapshot.id,
         revision=snapshot.revision,
         source=submission.source,

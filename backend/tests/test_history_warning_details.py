@@ -13,6 +13,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 
 from app.api.courses import course_assessment_sync_status, dismiss_assessment_sync_warnings
+from app.api.reviews import get_submission
 from app.auth.context import require_auth
 from app.db.base import utcnow
 from app.models.attempts import Submission
@@ -107,6 +108,29 @@ async def test_details_identify_student_and_only_the_incomplete_quiz_question(ap
         # The actual HTTP schema retains details, but never arbitrary receipts.
         public = AssessmentSyncRead.model_validate(status).model_dump_json()
         assert "Иван Иванов" in public and "solution.sln" not in public
+
+
+async def test_review_warning_is_scoped_to_the_exact_submission_and_clears_on_recovery(app_bundle):
+    _, sessions, settings = app_bundle
+    ids = await seed_warning(sessions, settings)
+    async with sessions() as db:
+        warning = (await status_for(db, ids))["warnings"][0]
+        broken = await db.get(Submission, warning["submission_id"])
+        reviewed = await get_submission(broken.id, auth(ids["teacher_id"]), db)
+        assert reviewed.source_warnings
+        assert "нет поддерживаемых исходников" in reviewed.source_warnings[0].message
+        assert reviewed.source_warnings[0].moodle_url == warning["moodle_url"]
+        assert "solution.sln" not in reviewed.model_dump_json()
+        other = await db.scalar(select(Submission).where(Submission.id != broken.id))
+        assert not (await get_submission(other.id, auth(ids["teacher_id"]), db)).source_warnings
+        # Warning comes from the answer, not the latest job or its acknowledgement.
+        await dismiss(db, ids, [warning])
+        assert (await get_submission(broken.id, auth(ids["teacher_id"]), db)).source_warnings
+        broken.external_receipt = {
+            **broken.external_receipt, "source_complete": True, "source_refresh_omissions": [],
+        }
+        await db.flush()
+        assert not (await get_submission(broken.id, auth(ids["teacher_id"]), db)).source_warnings
 
 
 async def test_failed_detail_has_name_and_moodle_link_before_any_submission_exists(app_bundle):

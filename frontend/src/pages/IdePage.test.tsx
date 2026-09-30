@@ -84,6 +84,41 @@ beforeEach(() => {
 afterEach(() => { cleanup(); window.sessionStorage.clear(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe('student interactive console', () => {
+  it.each([-4, 4])('uses backend time with a %s hour device offset, even after the device clock changes', async (offset) => {
+    vi.useFakeTimers();
+    const backend = Date.parse('2026-09-30T09:00:00Z');
+    vi.setSystemTime(backend + offset * 3600_000);
+    mocks.getAttempt.mockResolvedValue({
+      ...attempt, serverNow: new Date(backend).toISOString(),
+      deadlineAt: new Date(backend + 3600_000).toISOString(),
+    });
+    renderPage();
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByText('01:00:00')).toBeInTheDocument();
+    expect(screen.getByTestId('code-workspace')).toHaveAttribute('data-read-only', 'false');
+    vi.setSystemTime(backend + 24 * 3600_000);
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(screen.getByText('59:00')).toBeInTheDocument();
+    expect(screen.getByTestId('code-workspace')).toHaveAttribute('data-read-only', 'false');
+    await act(async () => { await vi.advanceTimersByTimeAsync(59 * 60_000); });
+    expect(screen.getByTestId('code-workspace')).toHaveAttribute('data-read-only', 'true');
+  });
+
+  it('refreshes backend time when returning to the browser tab', async () => {
+    vi.useFakeTimers();
+    mocks.getAttempt.mockResolvedValue({
+      ...attempt, serverNow: '2026-09-30T09:00:00Z', deadlineAt: '2026-09-30T10:00:00Z',
+    });
+    renderPage();
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByText('01:00:00')).toBeInTheDocument();
+    mocks.getAttemptStatus.mockResolvedValue({
+      id: attempt.id, status: 'ACTIVE', checkpointStatus: 'SYNCED', serverNow: '2026-09-30T09:30:00Z',
+    });
+    await act(async () => { fireEvent(document, new Event('visibilitychange')); });
+    expect(screen.getByText('30:00')).toBeInTheDocument();
+  });
+
   it('opens code without waiting for ancillary history or course lookups', async () => {
     mocks.getHistory.mockImplementation(() => new Promise(() => undefined));
     mocks.resolveCourseId.mockImplementation(() => new Promise(() => undefined));
@@ -154,8 +189,10 @@ describe('student interactive console', () => {
   it('shows the reduced editing time without exposing the Moodle reserve notice', async () => {
     const now = Date.now();
     vi.spyOn(Date, 'now').mockReturnValue(now);
+    vi.spyOn(performance, 'now').mockReturnValue(0);
     mocks.getAttempt.mockResolvedValue({
       ...attempt,
+      serverNow: new Date(now).toISOString(),
       deadlineAt: new Date(now + 3000_000).toISOString(),
       expectedEndAt: new Date(now + 3300_000).toISOString(),
       moodleSyncTimeoutSeconds: 300,
@@ -168,12 +205,12 @@ describe('student interactive console', () => {
     expect(screen.queryByText(/Резерв на отправку в Moodle/)).not.toBeInTheDocument();
   });
 
-  it('locks at the local deadline and follows server auto-submission without a manual click', async () => {
+  it('locks at the backend deadline and follows server auto-submission without a manual click', async () => {
     vi.useFakeTimers();
     const now = new Date('2026-09-10T10:00:00Z').getTime();
     vi.setSystemTime(now);
     mocks.getAttempt.mockResolvedValue({
-      ...attempt, deadlineAt: new Date(now + 10_000).toISOString(),
+      ...attempt, serverNow: new Date(now).toISOString(), deadlineAt: new Date(now + 10_000).toISOString(),
       expectedEndAt: new Date(now + 310_000).toISOString(), moodleSyncTimeoutSeconds: 300,
     });
     mocks.getAttemptStatus.mockImplementation(async () => ({
@@ -536,6 +573,26 @@ describe('student interactive console', () => {
       'fixtures/input.txt',
       0,
     ));
+  });
+
+  it.each(['helper.cpp', 'include/value.hpp'])('allows creating %s for an archive answer', async (path) => {
+    mocks.getAttempt.mockResolvedValue({ ...attempt, fileMode: 'MULTI' });
+    mocks.createFile.mockResolvedValue({ file: { id: 'new-file', path, content: '', language: 'cpp' }, revision: 1 });
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Создать файл' }));
+    fireEvent.change(screen.getByPlaceholderText('solution.cpp'), { target: { value: path } });
+    fireEvent.click(screen.getByRole('button', { name: 'Создать' }));
+    await waitFor(() => expect(mocks.createFile).toHaveBeenCalledWith('attempt-1', path, 0));
+    await waitFor(() => expect(screen.queryByRole('heading', { name: 'Новый файл' })).not.toBeInTheDocument());
+  });
+
+  it('does not allow a second source file for an online-text answer', async () => {
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Создать файл' }));
+    fireEvent.change(screen.getByPlaceholderText('input.txt'), { target: { value: 'helper.cpp' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Создать' }));
+    expect(await screen.findByText('В однофайловом режиме можно добавлять только текстовые файлы .txt')).toBeInTheDocument();
+    expect(mocks.createFile).not.toHaveBeenCalled();
   });
 
   it('locks the IDE and warns when status polling reports completion through Moodle', async () => {

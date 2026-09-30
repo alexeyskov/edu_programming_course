@@ -79,7 +79,7 @@ export function LoginPage() {
         </div>
         <img className="login-brand__institute" src={mmcsLogoUrl} alt="Институт математики, механики и компьютерных наук ЮФУ" />
       </div>
-      <div className="login-story__content"><h1>Среда осмысленного<br />программирования</h1><p>Рабочее пространство для самостоятельных C/C++ работ, прозрачной истории и проверки преподавателем.</p>
+      <div className="login-story__content"><h1>Практикум программирования</h1><p>Рабочее пространство для самостоятельных C/C++ работ, прозрачной истории и проверки преподавателем.</p>
         <div className="login-features">
           <span><Check /> Браузерная IDE и сборка</span>
           <span><Check /> Версионированная история</span>

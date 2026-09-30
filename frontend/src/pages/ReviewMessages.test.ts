@@ -1,14 +1,21 @@
 import { describe, expect, it } from 'vitest';
-import { formatEvidenceIssue } from './ReviewPage';
+import { apiNormalizers } from '../lib/api';
 
-describe('review evidence messages', () => {
-  it('replaces runner codes and English details with a Russian explanation', () => {
-    expect(formatEvidenceIssue('OUTPUT_MISMATCH', 'fallback')).toBe('Вывод программы не совпал с ожидаемым.');
-    expect(formatEvidenceIssue('RUNNER_INTEGRATION_FAILED', 'fallback')).toBe('Сервис запуска не смог сформировать результат для этого теста.');
+describe('review task and source warnings', () => {
+  it('preserves the submitted question statement and its safe Moodle link', () => {
+    const item = apiNormalizers.mapSubmission({
+      id: 'answer', task_statement: 'Напишите функцию <int>.\nНе используйте циклы.',
+      source_warnings: [{ code: 'ARCHIVE_SOURCE_OMITTED', message: 'Нет исходников.', moodle_url: 'https://moodle.test/mod/quiz/review.php?attempt=9' }],
+    });
+    expect(item.taskStatement).toBe('Напишите функцию <int>.\nНе используйте циклы.');
+    expect(item.sourceWarnings?.[0].moodleUrl).toBe('https://moodle.test/mod/quiz/review.php?attempt=9');
   });
 
-  it('does not expose an unknown backend code or message', () => {
-    expect(formatEvidenceIssue('FUTURE_INTERNAL_FAILURE', 'Сервис обнаружил проблему при выполнении теста.'))
-      .toBe('Сервис обнаружил проблему при выполнении теста.');
+  it('does not create executable links from warning metadata', () => {
+    const item = apiNormalizers.mapSubmission({
+      id: 'answer', source_warnings: [{ code: 'ARTIFACT_OMITTED', message: 'Не загружено.', moodle_url: 'javascript:alert(1)' }],
+    });
+    expect(item.sourceWarnings?.[0].moodleUrl).toBeUndefined();
+    expect(item.taskStatement).toBeUndefined();
   });
 });

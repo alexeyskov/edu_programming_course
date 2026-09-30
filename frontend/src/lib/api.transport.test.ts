@@ -19,6 +19,20 @@ afterEach(() => {
 });
 
 describe('API transport security contract', () => {
+  it('keeps comment-only review drafts ungraded instead of converting null into zero', async () => {
+    const draft = { grade: null, comment: 'Проверить границы массива.' };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ csrf_token: 'a'.repeat(32) }))
+      .mockResolvedValueOnce(jsonResponse(draft))
+      .mockResolvedValueOnce(jsonResponse(draft));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    await api.saveReview('question-1', null, draft.comment);
+    expect(fetchMock.mock.calls[1][0]).toMatch(/submissions\/question-1\/review-draft$/);
+    expect(fetchMock.mock.calls[1][1]).toMatchObject({ method: 'PUT', body: JSON.stringify(draft) });
+    await expect(api.getReviewDraft('question-1')).resolves.toEqual(draft);
+  });
+
   it('maps scoped warning details and posts only the explicitly acknowledged identities', async () => {
     const warningId = 'a'.repeat(64);
     const fetchMock = vi.fn()

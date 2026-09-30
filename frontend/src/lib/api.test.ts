@@ -196,6 +196,7 @@ describe('backend DTO normalization', () => {
   it('maps independently reviewable Moodle Quiz questions into one response group', () => {
     const submission = apiNormalizers.mapSubmission({
       id: 'question-2', assessment_id: 'assessment-2', assessment_title: 'Задание с массивами',
+      parent_assessment_id: 'quiz-3', parent_assessment_title: 'Самостоятельная работа №3',
       status: 'CLAIMED', max_score: 4,
       review_group: {
         id: 'quiz-response-81', title: 'Самостоятельная работа №3',
@@ -206,6 +207,7 @@ describe('backend DTO normalization', () => {
       },
     });
 
+    expect(submission).toMatchObject({ assessmentId: 'assessment-2', parentAssessmentId: 'quiz-3', parentAssessmentTitle: 'Самостоятельная работа №3' });
     expect(submission.reviewGroup).toEqual({
       id: 'quiz-response-81', title: 'Самостоятельная работа №3',
       items: [

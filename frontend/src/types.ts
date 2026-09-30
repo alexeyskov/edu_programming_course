@@ -210,6 +210,8 @@ export interface Attempt {
   revision: number;
   acknowledgedRevision: number;
   startedAt: string;
+  serverNow?: string;
+  serverTimeReceivedAt?: number;
   expectedEndAt?: string;
   deadlineAt?: string;
   hasTimeLimit?: boolean;
@@ -232,6 +234,8 @@ export interface Attempt {
 
 export interface AttemptStatus {
   id: string;
+  serverNow?: string;
+  serverTimeReceivedAt?: number;
   aiEnabled?: boolean;
   deadlineAt?: string;
   expectedEndAt?: string;
@@ -341,7 +345,11 @@ export interface Submission {
   id: string;
   source?: string;
   assessmentId: string;
+  parentAssessmentId?: string;
+  parentAssessmentTitle?: string;
   taskVersionId?: string;
+  taskStatement?: string;
+  sourceWarnings?: Array<{ code: string; message: string; moodleUrl?: string }>;
   courseId?: string;
   courseTitle?: string;
   assessmentTitle: string;

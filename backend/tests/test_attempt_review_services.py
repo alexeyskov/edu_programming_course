@@ -404,6 +404,24 @@ async def test_submission_without_required_review_is_visible_but_cannot_be_revie
     assert await db.scalar(select(func.count()).select_from(ReviewDecision)) == 0
 
 
+async def test_comment_only_review_draft_keeps_grade_unset(db):
+    _student, teacher, _other_teacher, _attempt, submission, _main_file = await _create_submission(
+        db
+    )
+    await claim_submission(db, submission_id=submission.id, teacher_id=teacher.id)
+    draft = await save_review_draft(
+        db,
+        submission_id=submission.id,
+        teacher_id=teacher.id,
+        grade=None,
+        comment="Check boundary handling before assigning a grade",
+    )
+    await db.refresh(draft)
+    assert draft.grade is None
+    assert draft.comment == "Check boundary handling before assigning a grade"
+    assert await db.scalar(select(func.count()).select_from(ReviewDecision)) == 0
+
+
 async def test_new_claim_owner_can_replace_stale_draft(db):
     _student, teacher, other_teacher, _attempt, submission, _main_file = await _create_submission(
         db
@@ -862,7 +880,8 @@ async def test_multi_quiz_creates_isolated_writable_solutions_and_shared_dto(db,
         assert dto.state == "ACTIVE"
         assert dto.quiz_session.root_attempt_id == root.id
         assert [item.attempt_id for item in dto.quiz_session.questions] == [root.id, child.id]
-        assert dto.expected_end_at == root.expected_end_at
+        assert dto.expected_end_at == root.expected_end_at.replace(tzinfo=UTC)
+        assert dto.server_now.utcoffset() == timedelta(0)
     replay = await start_attempt(
         db,
         assessment_id=assessment.id,
@@ -1151,6 +1170,25 @@ async def test_deferred_random_quiz_binds_runtime_question_and_transport(
         ).all()
     )
     assert len(runtime_versions) == 2
+
+    # The transport selected for this exact Moodle question, not the course's
+    # default single-file profile, must govern new source/header files.
+    for revision, path in enumerate(("helper.cpp", "include/value.hpp")):
+        kwargs = dict(
+            attempt_id=attempt.id,
+            principal_id=student.id,
+            path=path,
+            content="// additional source\n",
+            expected_revision=revision if multi_file else 0,
+            client_request_id=f"runtime-transport-file-{revision}",
+        )
+        if multi_file:
+            created = await create_workspace_file(db, **kwargs)
+            assert created.file.path == path
+        else:
+            with pytest.raises(DomainError) as error:
+                await create_workspace_file(db, **kwargs)
+            assert error.value.code == "SINGLE_FILE_ASSESSMENT"
 
 
 async def test_deferred_quiz_repairs_legacy_active_attempt_with_runtime_statement(db) -> None:

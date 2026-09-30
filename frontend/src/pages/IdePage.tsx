@@ -8,6 +8,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { CodeWorkspace, type CodeWorkspaceHandle } from '../components/CodeWorkspace';
 import { Badge, Button, Field, InlineError, Modal, PageLoader, useToast } from '../components/ui';
 import { api, ApiError } from '../lib/api';
+import { createServerClock } from '../lib/serverClock';
 import { createEditorClipboardSession, type EditorClipboardSession } from '../lib/editorClipboard';
 import { cn, findWorkspacePasteSource, formatClientContext, formatDate, formatRemaining, formatSessionElapsed, isTextDataPath, isTranslationUnitPath, severityOrder, validateWorkspacePath } from '../lib/utils';
 import { createUuid } from '../lib/uuid';
@@ -70,7 +71,8 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
   const [running, setRunning] = useState(false);
   const [interactiveInput, setInteractiveInput] = useState('');
   const [remaining, setRemaining] = useState('');
-  const [now, setNow] = useState(Date.now());
+  const serverClock = useRef(createServerClock());
+  const [now, setNow] = useState<number | null>(null);
   const [statementOpen, setStatementOpen] = useState(true);
   const [filesPanelOpen, setFilesPanelOpen] = useState(true);
   const [bottomPanelOpen, setBottomPanelOpen] = useState(true);
@@ -196,6 +198,8 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
         }
       }
       dirtyFilesRef.current = []; setConflictOpen(false);
+      serverClock.current.sync(loaded.serverNow, loaded.serverTimeReceivedAt);
+      setNow(serverClock.current.now());
       attemptRef.current = loaded; setAttempt(loaded); setCourseId(''); setFiles(loaded.files); setActiveFileId(restoredActiveFile(loaded)); setHistory([]); setSaveState('saved');
       setMetadataError(false);
       // A slow or failed history/course lookup must not block the student's
@@ -245,6 +249,8 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
       try {
         const current = await api.getAttemptStatus(attempt.id);
         if (cancelled || lmsFinalizedRef.current) return;
+        serverClock.current.sync(current.serverNow, current.serverTimeReceivedAt);
+        setNow(serverClock.current.now());
         if (isLmsClosureReason(current.closureReason)) {
           closeForLmsFinalization(undefined, current.closureReason);
           return;
@@ -286,7 +292,14 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
     };
     void poll();
     const timer = window.setInterval(() => { void poll(); }, 5_000);
-    return () => { cancelled = true; window.clearInterval(timer); };
+    const refreshTime = () => { if (!document.hidden) void poll(); };
+    document.addEventListener('visibilitychange', refreshTime);
+    window.addEventListener('pageshow', refreshTime);
+    return () => {
+      cancelled = true; window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', refreshTime);
+      window.removeEventListener('pageshow', refreshTime);
+    };
   }, [attempt?.id, attempt?.status, closeForLmsFinalization, handleLmsFinalizedError]);
 
   useEffect(() => {
@@ -350,8 +363,9 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
   useEffect(() => {
     if (!attempt) return;
     const update = () => {
-      const value = Date.now();
+      const value = serverClock.current.now();
       setNow(value);
+      if (value === null) { setRemaining('Уточняем время…'); return; }
       const visibleEnd = attempt.deadlineAt ?? attempt.expectedEndAt;
       setRemaining(visibleEnd
         ? formatRemaining(visibleEnd, value)
@@ -408,7 +422,7 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
     const warn = (event: BeforeUnloadEvent) => { if (dirtyFilesRef.current.length) { event.preventDefault(); event.returnValue = ''; } };
     window.addEventListener('beforeunload', warn); return () => window.removeEventListener('beforeunload', warn);
   }, []);
-  const locked = !attempt || attempt.status !== 'ACTIVE' || Boolean(attempt.deadlineAt && new Date(attempt.deadlineAt).getTime() <= now);
+  const locked = !attempt || attempt.status !== 'ACTIVE' || Boolean(now !== null && attempt.deadlineAt && new Date(attempt.deadlineAt).getTime() <= now);
   const editorReadOnly = locked || Boolean(switchingQuestionId) || submitting || leaving;
   const untimed = attempt?.hasTimeLimit === false && !attempt.deadlineAt && !attempt.expectedEndAt;
   const quizQuestions = attempt?.quizSession?.questions ?? [];
@@ -428,7 +442,8 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
     else dirtyFilesRef.current.push(entry);
     setHistory((items) => [{ id: createUuid(), type: source === 'internal_paste' ? 'internal_paste' : 'edit', label: source === 'internal_paste' ? 'Внутренняя вставка' : `Изменён ${files.find((file) => file.id === fileId)?.path}`, at: new Date().toISOString(), revision: attempt.revision + 1 }, ...items]);
     if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
-    const nearDeadline = Boolean(attempt.deadlineAt && new Date(attempt.deadlineAt).getTime() - Date.now() <= 3_000);
+    const serverNow = serverClock.current.now();
+    const nearDeadline = Boolean(serverNow !== null && attempt.deadlineAt && new Date(attempt.deadlineAt).getTime() - serverNow <= 3_000);
     saveTimerRef.current = window.setTimeout(() => { void flushDirtyFiles().catch(() => undefined); }, nearDeadline ? 0 : 700);
   }
 
@@ -714,7 +729,7 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
   if (error || !attempt) return <InlineError message={error ?? 'Попытка не найдена'} retry={() => void load()} />;
   return <div className="ide-page">
     {metadataError && <div role="alert">Не удалось загрузить историю или данные курса. Код доступен для редактирования и сдачи. <Button variant="ghost" loading={metadataLoading} onClick={() => void loadMetadata(attempt, loadGenerationRef.current)}>Повторить загрузку дополнительных данных</Button></div>}
-    <div className="ide-toolbar"><div className="ide-title"><span><small>{locked ? 'Только чтение' : 'Активная попытка'}</small><strong>{attempt.title}</strong></span></div><div className="ide-status"><span className={cn('save-state', `save-state--${saveState}`)}><Cloud size={15} />{saveState === 'saved' ? `Сохранено · r${attempt.acknowledgedRevision}` : saveState === 'saving' ? 'Сохраняем…' : saveState === 'offline' ? 'Нет связи · очередь хранится в этой вкладке' : saveState === 'closed' ? 'Сеанс завершён в Moodle' : 'Ошибка сохранения'}</span>{untimed ? <span>Без таймера</span> : <span title={attempt.deadlineAt || attempt.expectedEndAt ? 'Примерное оставшееся время по текущей сессии Moodle' : 'Примерное время с начала сессии'}><Clock3 size={16} /><strong>{attempt.deadlineAt || attempt.expectedEndAt ? remaining : `В сессии · ${remaining}`}</strong></span>}<span className="server-time">На устройстве: {new Intl.DateTimeFormat('ru', { hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(now)}</span></div><div className="ide-actions">{!locked && <Button variant="ghost" loading={leaving} disabled={Boolean(switchingQuestionId) || submitting || running} onClick={() => void saveAndLeave()}>Сохранить и выйти</Button>}{attempt.aiEnabled && <Button variant="ghost" disabled={Boolean(switchingQuestionId)} onClick={() => setAiOpen(true)}><Bot size={17} /> Помощь ИИ</Button>}<Button onClick={() => setSubmitOpen(true)} disabled={editorReadOnly || running}><CircleStop size={16} /> {multiQuestion ? 'Завершить работу' : 'Завершить'}</Button></div></div>
+    <div className="ide-toolbar"><div className="ide-title"><span><small>{locked ? 'Только чтение' : 'Активная попытка'}</small><strong>{attempt.title}</strong></span></div><div className="ide-status"><span className={cn('save-state', `save-state--${saveState}`)}><Cloud size={15} />{saveState === 'saved' ? `Сохранено · r${attempt.acknowledgedRevision}` : saveState === 'saving' ? 'Сохраняем…' : saveState === 'offline' ? 'Нет связи · очередь хранится в этой вкладке' : saveState === 'closed' ? 'Сеанс завершён в Moodle' : 'Ошибка сохранения'}</span>{untimed ? <span>Без таймера</span> : <span title={attempt.deadlineAt || attempt.expectedEndAt ? 'Примерное оставшееся время по текущей сессии Moodle' : 'Примерное время с начала сессии'}><Clock3 size={16} /><strong>{attempt.deadlineAt || attempt.expectedEndAt ? remaining : `В сессии · ${remaining}`}</strong></span>}{now !== null && <span className="server-time">Время сервера: {new Intl.DateTimeFormat('ru', { timeZone: 'UTC', hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(now)} UTC</span>}</div><div className="ide-actions">{!locked && <Button variant="ghost" loading={leaving} disabled={Boolean(switchingQuestionId) || submitting || running} onClick={() => void saveAndLeave()}>Сохранить и выйти</Button>}{attempt.aiEnabled && <Button variant="ghost" disabled={Boolean(switchingQuestionId)} onClick={() => setAiOpen(true)}><Bot size={17} /> Помощь ИИ</Button>}<Button onClick={() => setSubmitOpen(true)} disabled={editorReadOnly || running}><CircleStop size={16} /> {multiQuestion ? 'Завершить работу' : 'Завершить'}</Button></div></div>
     {multiQuestion && <nav className="ide-question-switcher" aria-label="Задачи работы" aria-busy={Boolean(switchingQuestionId)}>
       <span className="ide-question-switcher__label">{switchingQuestionId ? 'Сохраняем и переключаем…' : 'Задачи работы'}</span>
       <div className="ide-question-switcher__tabs" role="tablist" aria-label="Выбор задачи">

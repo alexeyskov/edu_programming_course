@@ -62,6 +62,10 @@ class SubmissionReviewGroupRead(ReadModel):
 class SubmissionListItemRead(ReadModel):
     id: UUID
     assessment_id: UUID
+    parent_assessment_id: UUID | None = None
+    parent_assessment_title: (
+        Annotated[str, StringConstraints(min_length=1, max_length=255)] | None
+    ) = None
     course_id: UUID
     course_title: Annotated[str, StringConstraints(min_length=1, max_length=255)]
     assessment_title: Annotated[str, StringConstraints(min_length=1, max_length=255)]
@@ -98,9 +102,17 @@ class SubmissionDecisionRead(ReadModel):
     updated_at: datetime
 
 
+class SubmissionSourceWarningRead(ReadModel):
+    code: Annotated[str, StringConstraints(min_length=1, max_length=64)]
+    message: Annotated[str, StringConstraints(min_length=1, max_length=2_000)]
+    moodle_url: Annotated[str, StringConstraints(max_length=2_048)] | None = None
+
+
 class SubmissionTeacherRead(SubmissionListItemRead):
     attempt_id: UUID
     assigned_task_version_id: UUID | None
+    task_statement: str = ""
+    source_warnings: list[SubmissionSourceWarningRead] = Field(default_factory=list)
     snapshot_id: UUID
     revision: Revision
     source: Annotated[str, StringConstraints(min_length=1, max_length=32)]

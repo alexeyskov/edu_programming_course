@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import Field, StringConstraints, field_validator, model_validator
 
+from app.db.base import utcnow
 from app.models.enums import AttemptState
 from app.schemas.assessments import PastePolicy
 from app.schemas.common import (
@@ -51,6 +52,7 @@ class AttemptStudentRead(ReadModel):
     sequence: int = Field(ge=1)
     state: AttemptState
     started_at: datetime
+    server_now: datetime = Field(default_factory=utcnow)
     expected_end_at: datetime | None = None
     deadline_at: datetime | None = None
     # None means Moodle has not supplied an authoritative timer, not unlimited.
@@ -69,6 +71,13 @@ class AttemptStudentRead(ReadModel):
     # use it to call the idempotent start endpoint before showing the editor.
     requires_live_lms_preparation: bool = False
     quiz_session: QuizSessionRead | None = None
+
+    @field_validator("server_now", "started_at", "expected_end_at", "deadline_at")
+    @classmethod
+    def timestamps_are_utc(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 class AttemptTeacherRead(AttemptStudentRead):

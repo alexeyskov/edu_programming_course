@@ -5,16 +5,22 @@ import {
   PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, RotateCcw, Save,
   Send, ShieldCheck, Square, UserCheck, X,
 } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type MutableRefObject } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { CodeWorkspace, type CodeWorkspaceHandle } from '../components/CodeWorkspace';
+import { ConsoleTranscript, type ConsoleInput } from '../components/ConsoleTranscript';
 import { Badge, Button, Field, InlineError, Modal, PageLoader, useToast } from '../components/ui';
 import { useTheme } from '../context/ThemeContext';
 import { api } from '../lib/api';
 import { cn, formatClientContext, formatDate } from '../lib/utils';
-import type { Assessment, AuthorshipAnalysis, Diagnostic, EvidenceReport, InteractiveRun, SimilarityAnalysis, Submission, SubmissionReviewGroupItem, TeacherExperiment, WorkspaceFile } from '../types';
+import type { Assessment, AuthorshipAnalysis, Diagnostic, InteractiveRun, SimilarityAnalysis, Submission, SubmissionReviewGroupItem, TeacherExperiment, WorkspaceFile } from '../types';
 
-type EvidenceTab = 'tests' | 'integrity' | 'history' | 'ai';
+type EvidenceTab = 'task' | 'integrity' | 'history' | 'ai';
+type PrefetchedReview = {
+  submission: Submission;
+  assessment: Assessment | null;
+  draft: { grade: number | null; comment: string } | null;
+};
 
 function lmsExportStateLabel(state: string): string {
   const labels: Record<string, string> = {
@@ -32,17 +38,29 @@ function lmsExportStateLabel(state: string): string {
 
 export function ReviewPage() {
   const { submissionId = 'sub-1' } = useParams();
+  const prefetchedGroupedReview = useRef<PrefetchedReview | null>(null);
+  // Async sandbox operations and their refs belong to exactly one submission.
+  // A route change must not reuse a previous question's experiment or run.
+  return <SubmissionReview key={submissionId} submissionId={submissionId} prefetchedGroupedReview={prefetchedGroupedReview} />;
+}
+
+function SubmissionReview({ submissionId, prefetchedGroupedReview }: {
+  submissionId: string;
+  prefetchedGroupedReview: MutableRefObject<PrefetchedReview | null>;
+}) {
   const [submission, setSubmission] = useState<Submission | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeFileId, setActiveFileId] = useState('');
-  const [evidenceTab, setEvidenceTab] = useState<EvidenceTab>('tests');
+  const [evidenceTab, setEvidenceTab] = useState<EvidenceTab>('task');
   const [experiment, setExperiment] = useState<TeacherExperiment | null>(null);
   const [experimentFiles, setExperimentFiles] = useState<WorkspaceFile[]>([]);
   const [interactiveRun, setInteractiveRun] = useState<InteractiveRun | null>(null);
   const [experimentMode, setExperimentMode] = useState(false);
   const [consoleOpen, setConsoleOpen] = useState(false);
   const [interactiveInput, setInteractiveInput] = useState('');
+  const [consoleInputs, setConsoleInputs] = useState<ConsoleInput[]>([]);
+  const [inputSending, setInputSending] = useState(false);
   const [diffOpen, setDiffOpen] = useState(false);
   const [running, setRunning] = useState(false);
   const [grade, setGrade] = useState('');
@@ -71,12 +89,8 @@ export function ReviewPage() {
   const experimentStop = useRef<Promise<InteractiveRun | null> | null>(null);
   const consoleClose = useRef<Promise<void> | null>(null);
   const experimentClose = useRef<Promise<void> | null>(null);
-  const prefetchedGroupedReview = useRef<{
-    submission: Submission;
-    assessment: Assessment | null;
-    draft: { grade: number; comment: string } | null;
-  } | null>(null);
   const interactiveRunRef = useRef<InteractiveRun | null>(null);
+  const inputSendingRef = useRef(false);
   const toast = useToast();
   const toastRef = useRef(toast);
   const { theme } = useTheme();
@@ -130,6 +144,7 @@ export function ReviewPage() {
       setLoading(true);
       setError(null);
       setClaimLost(false);
+      setEvidenceTab('task');
       experimentRef.current = null;
       interactiveRunRef.current = null;
       pendingExperimentEdits.current = [];
@@ -138,6 +153,7 @@ export function ReviewPage() {
       setExperimentMode(false);
       setInteractiveRun(null);
       setInteractiveInput('');
+      setConsoleInputs([]);
       setConsoleOpen(false);
       setDiffOpen(false);
       try {
@@ -166,13 +182,15 @@ export function ReviewPage() {
         if (item.canReview !== false && requiresReview && !item.claim && item.status === 'UNGRADED') { const claim = await api.claimSubmission(item.id); setSubmission({ ...item, status: 'CLAIMED', claim }); }
         const finalDecision = item.latestDecision ?? item.decisionHistory[0];
         const finalDecisionIsReadOnly = Boolean(finalDecision && !item.claim?.mine);
-        setGrade(item.status === 'GRADED' || finalDecisionIsReadOnly ? finalDecision?.grade.toString() ?? item.score?.toString() ?? '' : draft?.grade.toString() ?? finalDecision?.grade.toString() ?? item.score?.toString() ?? '');
+        setGrade(item.status === 'GRADED' || finalDecisionIsReadOnly
+          ? finalDecision?.grade.toString() ?? item.score?.toString() ?? ''
+          : draft ? draft.grade?.toString() ?? '' : finalDecision?.grade.toString() ?? item.score?.toString() ?? '');
         setComment(item.status === 'GRADED' || finalDecisionIsReadOnly ? finalDecision?.comment ?? '' : draft?.comment ?? finalDecision?.comment ?? ''); setReviewDirty(false); setError(null);
         const storedInteractive = readInteractiveExperimentSession(item.id);
         if (storedInteractive) {
           try {
             const restoredExperiment = await api.createExperiment(item.id);
-            if (restoredExperiment.id !== storedInteractive.experimentId) {
+            if (restoredExperiment.submissionId !== item.id || restoredExperiment.id !== storedInteractive.experimentId) {
               clearInteractiveExperimentSession(item.id);
             } else {
               const restoredRun = await api.getInteractiveExperiment(restoredExperiment.id, storedInteractive.sessionId);
@@ -190,7 +208,7 @@ export function ReviewPage() {
     })();
     loadPromiseRef.current = operation.finally(() => { loadPromiseRef.current = null; });
     return loadPromiseRef.current;
-  }, [submissionId]);
+  }, [submissionId, prefetchedGroupedReview]);
   useEffect(() => { void load(); return () => { if (saveTimer.current) window.clearTimeout(saveTimer.current); }; }, [load]);
   useEffect(() => {
     const claim = submission?.claim;
@@ -254,10 +272,11 @@ export function ReviewPage() {
 
   async function enableExperiment(enterMode = true): Promise<TeacherExperiment | null> {
     if (!submission || !canUseSandbox) return null;
-    let current = experimentRef.current;
+    let current = experimentRef.current?.submissionId === submission.id ? experimentRef.current : null;
     if (!current) {
       if (!experimentCreate.current) {
         const operation = api.createExperiment(submission.id).then((created) => {
+          if (created.submissionId !== submission.id) throw new Error('Песочница относится к другому заданию. Откройте задание повторно.');
           experimentRef.current = created;
           setExperiment(created);
           setExperimentFiles(created.files);
@@ -328,8 +347,7 @@ export function ReviewPage() {
     setRunning(true);
     const operation = (async () => {
       try {
-        let current = experimentRef.current;
-        if (!current) current = await enableExperiment(false);
+        let current = await enableExperiment(false);
         if (!current || experimentClose.current) return;
         // The ordinary Run action always represents the immutable student
         // submission.  A durable teacher experiment may still contain edits
@@ -352,6 +370,7 @@ export function ReviewPage() {
         const revision = pendingExperimentEdits.current.length ? await flushExperimentEdits() : current.revision;
         const result = await api.startInteractiveExperiment(current.id, revision);
         interactiveRunRef.current = result;
+        setConsoleInputs([]);
         setInteractiveInput(''); setInteractiveRun(result);
         if (result.diagnostics[0]) editorRef.current?.openDiagnostic(result.diagnostics[0]);
       }
@@ -405,14 +424,23 @@ export function ReviewPage() {
   async function sendExperimentInput() {
     const current = experimentRef.current;
     const active = interactiveRunRef.current;
-    if (!current || !active || active.terminal) return;
+    if (!current || !active || active.terminal || active.inputClosed || inputSendingRef.current) return;
     const text = interactiveInput;
+    inputSendingRef.current = true;
+    setInputSending(true);
     try {
       const updated = await api.sendInteractiveInput(current.id, active.sessionId, text);
-      interactiveRunRef.current = updated;
-      setInteractiveInput(''); setInteractiveRun(updated);
+      if (interactiveRunRef.current?.sessionId !== active.sessionId) return;
+      setConsoleInputs((inputs) => [...inputs, { sessionId: active.sessionId, stdoutOffset: active.stdout.length, text }]);
+      // Do not erase a new line typed while the preceding request was pending.
+      setInteractiveInput((value) => value === text ? '' : value);
+      if (!interactiveRunRef.current.terminal || updated.terminal) {
+        interactiveRunRef.current = updated;
+        setInteractiveRun(updated);
+      }
     }
     catch (caught) { toast.push('error', 'Ввод не передан программе', caught instanceof Error ? caught.message : undefined); }
+    finally { inputSendingRef.current = false; setInputSending(false); }
   }
 
   function closeExperimentMode(): Promise<void> {
@@ -451,8 +479,8 @@ export function ReviewPage() {
       toast.push('error', 'Изменения не сохранены', 'Закрепление работы потеряно. Останьтесь на текущем задании и обновите страницу.');
       return false;
     }
-    const parsedGrade = Number(grade);
-    if (grade === '' || !Number.isFinite(parsedGrade) || parsedGrade < 0 || parsedGrade > submission.maxScore) {
+    const parsedGrade = grade === '' ? null : Number(grade);
+    if (parsedGrade !== null && (!Number.isFinite(parsedGrade) || parsedGrade < 0 || parsedGrade > submission.maxScore)) {
       toast.push('error', 'Изменения не сохранены', `Укажите балл от 0 до ${submission.maxScore}, прежде чем переходить к другому заданию.`);
       return false;
     }
@@ -492,8 +520,16 @@ export function ReviewPage() {
       // and retain the current reservation until the destination has been fully
       // loaded and (when necessary) reserved for this teacher.
       if (!await persistReviewDraft(false)) return;
-      if (experimentMode) await closeExperimentMode();
-      else if (consoleOpen) await closeConsole();
+      // Creation/start may still be pending before the console is visible.
+      // Finish saving/stopping this question before releasing its claim.
+      if (experimentCreate.current) await experimentCreate.current;
+      if (experimentRun.current) await experimentRun.current;
+      if (experimentClose.current) await experimentClose.current;
+      if (consoleClose.current) await consoleClose.current;
+      if (saveTimer.current) window.clearTimeout(saveTimer.current);
+      saveTimer.current = undefined;
+      if (experimentFlush.current || pendingExperimentEdits.current.length) await flushExperimentEdits();
+      await stopActiveExperimentRun();
 
       const target = await api.getSubmission(targetSubmissionId);
       const [assessment, draft] = await Promise.all([
@@ -549,12 +585,13 @@ export function ReviewPage() {
   const canUseDecisionSupport = submission.canReview !== false && decisionSupportEnabled;
   const canAskTeacherAi = submission.canReview !== false && decisionSupportEnabled;
   const validGrade = grade !== '' && Number.isFinite(Number(grade)) && Number(grade) >= 0 && Number(grade) <= submission.maxScore;
+  const validDraft = grade === '' || validGrade;
   const files = experimentMode ? experimentFiles : submission.files;
   const diagnostics = interactiveRun?.diagnostics ?? [];
   const finalDecision = submission.latestDecision ?? submission.decisionHistory[0];
   const foreignClaim = Boolean(submission.claim && !submission.claim.mine);
   const reviewedReadOnly = Boolean(finalDecision && !submission.claim?.mine);
-  const canUseSandbox = Boolean(submission.canReview !== false && (canReview || finalDecision || submission.status === 'GRADED'));
+  const canUseSandbox = Boolean(!switchingSubmissionId && submission.canReview !== false && (canReview || finalDecision || submission.status === 'GRADED'));
   const interactiveActive = Boolean(interactiveRun && !interactiveRun.terminal);
   const interactiveInputOpen = interactiveActive && !interactiveRun?.inputClosed;
   const editable = Boolean(experimentMode && experiment && canUseSandbox && !closingExperiment);
@@ -568,7 +605,7 @@ export function ReviewPage() {
         {reviewedReadOnly && !foreignClaim ? <CheckCircle2 size={15} /> : <UserCheck size={15} />}
         <span><strong>{!reviewRequired ? 'Проверка преподавателя не требуется' : foreignClaim ? `Проверяет ${submission.claim?.ownerName}` : reviewedReadOnly ? 'Работа проверена' : canReview ? 'Вы проверяете работу' : 'Работа не закреплена'}</strong><small>{!reviewRequired ? 'страница доступна только для чтения' : foreignClaim ? 'официальная перепроверка заблокирована; личная песочница доступна' : reviewedReadOnly ? `${finalDecision?.reviewerName ?? 'Преподаватель'}${finalDecision?.reviewedAt ? ` · ${formatDate(finalDecision.reviewedAt)}` : ''}` : canReview ? 'работа закреплена за вами; резервирование продлевается автоматически' : submission.canReview === false ? 'у вас нет доступа к проверке этой работы' : 'режим только для чтения'}{foreignClaim && submission.claim?.expiresAt ? ` · до ${formatDate(submission.claim.expiresAt, { hour: '2-digit', minute: '2-digit' })}` : ''}</small></span>
       </div>
-      <div>{!experimentMode ? <><span className="sandbox-tooltip" data-tooltip="Изменения не затрагивают сдачу студента, историю авторства и проверку на плагиат"><Button aria-label="Открыть преподавательскую песочницу" title="Изменения не затрагивают сдачу студента, историю авторства и проверку на плагиат" variant="ghost" disabled={!canUseSandbox || running || closingExperiment} onClick={() => void enableExperiment(true)}><FlaskConical size={15} /> Открыть песочницу</Button></span>{interactiveActive ? <Button aria-label="Остановить программу" variant="secondary" loading={running} onClick={() => void stopExperiment()}><Square size={14} fill="currentColor" /> Остановить</Button> : <Button aria-label="Компилировать и запустить код" variant="secondary" loading={running} disabled={!canUseSandbox || closingExperiment} onClick={() => void runExperiment()}><Play size={15} /> Запустить</Button>}</> : <><Button aria-label="Закрыть преподавательскую песочницу" variant="ghost" loading={closingExperiment} disabled={running} onClick={() => void closeExperimentMode()}><FlaskConical size={15} /> Закрыть песочницу</Button><Button variant="ghost" onClick={() => setDiffOpen((value) => !value)}><GitCompareArrows size={16} /> Сравнить</Button>{interactiveActive ? <Button aria-label="Остановить программу" variant="secondary" loading={running} onClick={() => void stopExperiment()}><Square size={14} fill="currentColor" /> Остановить</Button> : <Button aria-label="Компилировать и запустить код" variant="secondary" loading={running} disabled={!canUseSandbox || closingExperiment} onClick={() => void runExperiment()}><Play size={15} /> Запустить</Button>}</>}{reviewedReadOnly ? submission.canReview !== false ? <Button loading={rechecking} disabled={foreignClaim} onClick={() => void startRecheck()}><RotateCcw size={16} /> Перепроверить</Button> : <Badge>Только просмотр</Badge> : <Button onClick={() => setDecisionOpen(true)} disabled={!canReview || grade === '' || Number(grade) < 0 || Number(grade) > submission.maxScore}><Check size={16} /> Утвердить</Button>}</div>
+      <div>{!experimentMode ? <><span className="sandbox-tooltip" data-tooltip="Изменения не затрагивают сдачу студента, историю авторства и проверку на плагиат"><Button aria-label="Открыть преподавательскую песочницу" title="Изменения не затрагивают сдачу студента, историю авторства и проверку на плагиат" variant="ghost" disabled={!canUseSandbox || running || closingExperiment} onClick={() => void enableExperiment(true)}><FlaskConical size={15} /> Открыть песочницу</Button></span>{interactiveActive ? <Button aria-label="Остановить программу" variant="secondary" loading={running} onClick={() => void stopExperiment()}><Square size={14} fill="currentColor" /> Остановить</Button> : <Button aria-label="Компилировать и запустить код" variant="secondary" loading={running} disabled={!canUseSandbox || closingExperiment} onClick={() => void runExperiment()}><Play size={15} /> Запустить</Button>}</> : <><Button aria-label="Закрыть преподавательскую песочницу" variant="ghost" loading={closingExperiment} disabled={running} onClick={() => void closeExperimentMode()}><FlaskConical size={15} /> Закрыть песочницу</Button><Button variant="ghost" className="review-compare-toggle" aria-pressed={diffOpen} title={diffOpen ? 'Сравнение включено. Нажмите ещё раз, чтобы вернуться к редактору.' : 'Сравнить с исходным кодом студента'} onClick={() => setDiffOpen((value) => !value)}><GitCompareArrows size={16} /> Сравнить</Button>{interactiveActive ? <Button aria-label="Остановить программу" variant="secondary" loading={running} onClick={() => void stopExperiment()}><Square size={14} fill="currentColor" /> Остановить</Button> : <Button aria-label="Компилировать и запустить код" variant="secondary" loading={running} disabled={!canUseSandbox || closingExperiment} onClick={() => void runExperiment()}><Play size={15} /> Запустить</Button>}</>}{reviewedReadOnly ? submission.canReview !== false ? <Button loading={rechecking} disabled={foreignClaim} onClick={() => void startRecheck()}><RotateCcw size={16} /> Перепроверить</Button> : <Badge>Только просмотр</Badge> : <Button onClick={() => setDecisionOpen(true)} disabled={!canReview || grade === '' || Number(grade) < 0 || Number(grade) > submission.maxScore}><Check size={16} /> Утвердить</Button>}</div>
     </header>
     {reviewGroupItems.length > 1 && <nav className="review-question-switcher" aria-label="Задания в ответе студента">
       <div className="review-question-switcher__heading"><span>Ответ студента</span><strong>{submission.reviewGroup?.title ?? 'Задания Moodle'}</strong><small>Задание {activeGroupIndex + 1} из {reviewGroupItems.length}</small></div>
@@ -594,11 +631,11 @@ export function ReviewPage() {
         </aside>
         <div className="review-editor">{diffOpen && experimentMode ? <DiffWorkspace original={diffFiles.original?.content ?? ''} modified={diffFiles.modified?.content ?? ''} path={diffFiles.path} theme={theme} /> : <CodeWorkspace ref={editorRef} files={files} activeFileId={activeFileId} onActiveFile={setActiveFileId} onChange={(id, content) => changeExperimentFile(id, content)} readOnly={!editable} strictPaste={false} scopeId={experiment?.id ?? submission.id} diagnostics={diagnostics} experiment={experimentMode} explorerId="review-file-explorer" explorerVisible={filesPanelOpen} />}</div>
       </div>
-      {consoleOpen && <div className="experiment-console"><header><strong>Консоль программы</strong><span>{interactiveRun ? interactiveStatusLabel(interactiveRun) : 'Готова к запуску'}</span>{diagnostics.length > 0 && <Badge tone="danger">{diagnostics.length} ошибка</Badge>}<Button className="experiment-console__close" size="sm" onClick={() => void closeConsole()}><X size={13} /> Закрыть</Button></header><div className="experiment-console__output">{diagnostics.map((item) => <button key={item.id} onClick={() => editorRef.current?.openDiagnostic(item)}><AlertTriangle size={14} /><span><strong>{item.message}</strong><small>{item.path}:{item.line}:{item.column}</small></span><ChevronRight size={15} /></button>)}{interactiveRun?.stdout && <pre className="is-stdout">{interactiveRun.stdout}</pre>}{interactiveRun?.stderr && <pre className="is-stderr">{interactiveRun.stderr}</pre>}{interactiveRun?.outputTruncated && <p>Вывод остановлен: достигнут установленный лимит.</p>}{!interactiveRun && <p>Нажмите «Запустить». Если программа запросит данные, введите одну строку ниже и нажмите Enter.</p>}{interactiveRun?.terminal && !interactiveRun.stdout && !interactiveRun.stderr && diagnostics.length === 0 && <p>Программа завершена без вывода.</p>}</div><form className="experiment-console__input" onSubmit={(event) => { event.preventDefault(); void sendExperimentInput(); }}><input aria-label="Ввод программы" value={interactiveInput} onChange={(event) => setInteractiveInput(event.target.value)} disabled={!interactiveInputOpen} maxLength={65_536} autoComplete="off" spellCheck={false} placeholder={interactiveRun?.terminal ? 'Программа завершена' : interactiveInputOpen ? 'Введите строку и нажмите Enter' : 'Сначала запустите программу'} /><button type="submit" aria-label="Передать строку программе" disabled={!interactiveInputOpen}><Send size={14} /> Отправить</button></form></div>}
-    </section>{reviewPanelOpen ? <aside className="review-side"><div className="review-side__top"><button type="button" className="review-side__collapse" aria-label="Скрыть панель проверки" title="Скрыть панель проверки" onClick={() => setReviewPanelOpen(false)}><PanelRightClose size={16} /></button><div className="evidence-tabs">{(['tests', 'integrity', 'history', 'ai'] as EvidenceTab[]).map((id) => <button key={id} className={evidenceTab === id ? 'is-active' : ''} onClick={() => setEvidenceTab(id)}>{id === 'tests' ? 'Тесты' : id === 'integrity' ? 'Плагиат' : id === 'history' ? 'История' : 'ИИ'}</button>)}</div></div><div className="evidence-body"><EvidencePanel tab={evidenceTab} submission={submission} courseId={courseId} teacherComment={comment} canUseDecisionSupport={canUseDecisionSupport} canAskTeacherAi={canAskTeacherAi} reviewRequired={reviewRequired} decisionSupportEnabled={decisionSupportEnabled} /></div>
+      {consoleOpen && <div className="experiment-console"><header><strong>Консоль программы</strong><span>{interactiveRun ? interactiveStatusLabel(interactiveRun) : 'Готова к запуску'}</span>{diagnostics.length > 0 && <Badge tone="danger">{diagnostics.length} ошибка</Badge>}<Button className="experiment-console__close" size="sm" onClick={() => void closeConsole()}><X size={13} /> Закрыть</Button></header><div className="experiment-console__output">{diagnostics.map((item) => <button key={item.id} onClick={() => editorRef.current?.openDiagnostic(item)}><AlertTriangle size={14} /><span><strong>{item.message}</strong><small>{item.path}:{item.line}:{item.column}</small></span><ChevronRight size={15} /></button>)}{interactiveRun && <ConsoleTranscript sessionId={interactiveRun.sessionId} stdout={interactiveRun.stdout} inputs={consoleInputs} />}{interactiveRun?.stderr && <pre className="is-stderr">{interactiveRun.stderr}</pre>}{interactiveRun?.outputTruncated && <p>Вывод остановлен: достигнут установленный лимит.</p>}{!interactiveRun && <p>Нажмите «Запустить». Если программа запросит данные, введите одну строку ниже и нажмите Enter.</p>}{interactiveRun?.terminal && !interactiveRun.stdout && !interactiveRun.stderr && consoleInputs.length === 0 && diagnostics.length === 0 && <p>Программа завершена без вывода.</p>}</div><form className="experiment-console__input" onSubmit={(event) => { event.preventDefault(); void sendExperimentInput(); }}><input aria-label="Ввод программы" value={interactiveInput} onChange={(event) => setInteractiveInput(event.target.value)} disabled={!interactiveInputOpen} maxLength={65_536} autoComplete="off" spellCheck={false} placeholder={interactiveRun?.terminal ? 'Программа завершена' : interactiveInputOpen ? 'Введите строку и нажмите Enter' : 'Сначала запустите программу'} /><button type="submit" aria-label="Передать строку программе" disabled={!interactiveInputOpen || inputSending}><Send size={14} /> Отправить</button></form></div>}
+    </section>{reviewPanelOpen ? <aside className="review-side"><div className="review-side__top"><button type="button" className="review-side__collapse" aria-label="Скрыть панель проверки" title="Скрыть панель проверки" onClick={() => setReviewPanelOpen(false)}><PanelRightClose size={16} /></button><div className="evidence-tabs" role="tablist" aria-label="Материалы проверки">{(['task', 'integrity', 'history', 'ai'] as EvidenceTab[]).map((id) => <button key={id} type="button" role="tab" aria-selected={evidenceTab === id} className={evidenceTab === id ? 'is-active' : ''} onClick={() => setEvidenceTab(id)}>{id === 'task' ? 'Задание' : id === 'integrity' ? 'Плагиат' : id === 'history' ? 'История' : 'ИИ'}</button>)}</div></div><div className="evidence-body">{Boolean(submission.sourceWarnings?.length) && <div className="review-source-warning" role="alert"><strong><AlertTriangle size={16} /> Сдача загружена не полностью</strong>{submission.sourceWarnings!.map((warning) => <div key={`${warning.code}:${warning.message}`}><p>{warning.message} Код: {warning.code}.</p>{warning.moodleUrl && <a href={warning.moodleUrl} target="_blank" rel="noopener noreferrer">Открыть ответ в Moodle</a>}</div>)}</div>}<EvidencePanel tab={evidenceTab} submission={submission} courseId={courseId} teacherComment={comment} canUseDecisionSupport={canUseDecisionSupport} canAskTeacherAi={canAskTeacherAi} reviewRequired={reviewRequired} decisionSupportEnabled={decisionSupportEnabled} /></div>
       <div className="grading-panel"><header><div><span className="eyebrow">Решение преподавателя</span><h2>Оценка и комментарий</h2></div><span>{reviewedReadOnly ? 'Утверждено' : canReview ? 'Черновик' : 'Только чтение'}</span></header>
         {reviewedReadOnly && <div className="review-decision-meta"><CheckCircle2 size={16} /><span><strong>{finalDecision?.reviewerName ?? 'Преподаватель'}</strong><small>{finalDecision?.reviewedAt ? formatDate(finalDecision.reviewedAt) : 'Дата решения не предоставлена'}{finalDecision?.revision ? ` · версия ${finalDecision.revision}` : ''}{submission.decisionHistory.length > 1 ? ` · решений в истории: ${submission.decisionHistory.length}` : ''}</small></span>{finalDecision?.lmsExportState && <Badge tone={finalDecision.lmsExportState === 'DELIVERED' ? 'success' : finalDecision.lmsExportState === 'BLOCKED' || finalDecision.lmsExportState === 'FAILED' ? 'danger' : 'neutral'}>{lmsExportStateLabel(finalDecision.lmsExportState)}</Badge>}</div>}
-        <div className="grade-input"><Field label="Итоговый балл"><div><input type="number" min="0" max={submission.maxScore} disabled={!canReview} value={grade} onChange={(event) => { setGrade(event.target.value); setReviewDirty(true); }} /><span>/ {submission.maxScore}</span></div></Field></div><p className="no-recommendation">Оценка определяется преподавателем по доступным проверкам в приложении.</p><Field label={reviewedReadOnly ? 'Финальный комментарий студенту' : 'Комментарий студенту'}><textarea rows={8} disabled={!canReview} value={comment} onChange={(event) => { setComment(event.target.value); setReviewDirty(true); }} placeholder={reviewedReadOnly ? 'Комментарий не добавлен' : 'Объясните сильные стороны и что стоит исправить…'} /></Field>{canReview && <footer><Button variant="secondary" disabled={!validGrade || !reviewDirty} onClick={() => void saveDraft()}><Save size={15} /> Сохранить</Button><Button onClick={() => setDecisionOpen(true)} disabled={!validGrade}>Утвердить <ChevronRight size={15} /></Button></footer>}</div>
+        <div className="grade-input"><Field label="Итоговый балл"><div><input type="number" min="0" max={submission.maxScore} disabled={!canReview} value={grade} onChange={(event) => { setGrade(event.target.value); setReviewDirty(true); }} /><span>/ {submission.maxScore}</span></div></Field></div><p className="no-recommendation">Оценка определяется преподавателем по доступным проверкам в приложении.</p><Field label={reviewedReadOnly ? 'Финальный комментарий студенту' : 'Комментарий студенту'}><textarea rows={8} disabled={!canReview} value={comment} onChange={(event) => { setComment(event.target.value); setReviewDirty(true); }} placeholder={reviewedReadOnly ? 'Комментарий не добавлен' : 'Объясните сильные стороны и что стоит исправить…'} /></Field>{canReview && <footer><Button variant="secondary" disabled={!validDraft || !reviewDirty || Boolean(switchingSubmissionId)} onClick={() => void saveDraft()}><Save size={15} /> Сохранить</Button><Button onClick={() => setDecisionOpen(true)} disabled={!validGrade}>Утвердить <ChevronRight size={15} /></Button></footer>}</div>
     </aside> : <aside className="review-side-rail" aria-label="Панель проверки скрыта"><button type="button" aria-label="Показать панель проверки" title="Показать панель проверки" onClick={() => setReviewPanelOpen(true)}><PanelRightOpen size={17} /></button><span aria-hidden="true">Проверка</span></aside>}</div>
     <Modal open={decisionOpen} title="Утвердить решение" onClose={() => setDecisionOpen(false)} footer={<><Button variant="ghost" onClick={() => setDecisionOpen(false)}>Отмена</Button><Button loading={finalizing} onClick={() => void finalize()}><CheckCircle2 size={16} /> Утвердить и отправить</Button></>}><div className="decision-summary"><span className="decision-grade">{grade}<small>/{submission.maxScore}</small></span><div><strong>{submission.studentName}</strong><p>{comment || 'Комментарий не добавлен'}</p></div></div><p className="modal-copy"><Info size={16} /> Финальное решение снимет закрепление работы. Сервер вернёт фактический статус LMS-выгрузки; без сопоставления с заданием Moodle она может быть заблокирована.</p></Modal>
   </div>;
@@ -691,11 +728,14 @@ function clearInteractiveExperimentSession(submissionId: string, experimentId?: 
   }
 }
 
-function EvidencePanel({ tab, submission, courseId, teacherComment, canUseDecisionSupport, canAskTeacherAi, reviewRequired, decisionSupportEnabled }: {
+function EvidencePanel({ tab, submission, courseId, teacherComment, canUseDecisionSupport, canAskTeacherAi, decisionSupportEnabled }: {
   tab: EvidenceTab; submission: Submission; courseId: string; canUseDecisionSupport: boolean; canAskTeacherAi: boolean;
   reviewRequired: boolean; decisionSupportEnabled: boolean; teacherComment: string;
 }) {
-  if (tab === 'tests') return <EvidenceRunsPanel submission={submission} canLaunch={canUseDecisionSupport} reviewRequired={reviewRequired} decisionSupportEnabled={decisionSupportEnabled} />;
+  if (tab === 'task') return <section className="review-task" aria-label="Задание студента">
+    <h3>{submission.assessmentTitle}</h3>
+    <p className="review-task__statement">{submission.taskStatement?.trim() || 'Текст задания не был получен из Moodle. Синхронизируйте работу или посмотрите условие в Moodle.'}</p>
+  </section>;
   if (tab === 'integrity') return <IntegrityPanel submission={submission} canReview={canUseDecisionSupport} decisionSupportEnabled={decisionSupportEnabled} />;
   if (tab === 'history') return <ReviewHistoryPanel submission={submission} />;
   return <TeacherAiPanel key={submission.id} submissionId={submission.id} courseId={courseId} canSend={canAskTeacherAi} teacherComment={teacherComment} />;
@@ -718,88 +758,6 @@ function ReviewHistoryPanel({ submission }: { submission: Submission }) {
   </div>;
 }
 
-const evidenceIssueMessages: Readonly<Record<string, string>> = {
-  RUNNER_INTEGRATION_FAILED: 'Сервис запуска не смог сформировать результат для этого теста.',
-  PROGRAM_DID_NOT_COMPLETE: 'Программа не завершилась успешно на этом скрытом тесте.',
-  OUTPUT_MISMATCH: 'Вывод программы не совпал с ожидаемым.',
-  STALE_EVIDENCE_RECOVERED: 'Предыдущая проверка была прервана и завершена системой.',
-  TIMEOUT: 'Время проверки истекло.',
-  TIME_LIMIT: 'Превышено ограничение времени.',
-  MEMORY_LIMIT: 'Превышено ограничение памяти.',
-  OUTPUT_LIMIT: 'Превышено ограничение объёма вывода.',
-  WORKSPACE_LIMIT: 'Превышено ограничение рабочей области.',
-  INFRA_ERROR: 'Ошибка сервиса запуска.',
-  INTERNAL_ERROR: 'Внутренняя ошибка сервиса запуска.',
-  INVALID_RESPONSE: 'Сервис запуска вернул неожиданный ответ.',
-  NOT_CONFIGURED: 'Сервис запуска не настроен.',
-  RESPONSE_TOO_LARGE: 'Ответ сервиса запуска слишком большой.',
-  UNAVAILABLE: 'Сервис запуска временно недоступен.',
-  RUN_FAILED: 'Проверку не удалось завершить.',
-};
-
-export function formatEvidenceIssue(code: string | undefined, fallback: string): string {
-  return evidenceIssueMessages[(code ?? '').toUpperCase()] ?? fallback;
-}
-
-function EvidenceRunsPanel({ submission, canLaunch, reviewRequired, decisionSupportEnabled }: {
-  submission: Submission; canLaunch: boolean; reviewRequired: boolean; decisionSupportEnabled: boolean;
-}) {
-  const [reports, setReports] = useState<EvidenceReport[]>([]);
-  const [selectedId, setSelectedId] = useState<string>();
-  const [loading, setLoading] = useState(true);
-  const [running, setRunning] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const load = useCallback(async () => {
-    setLoading(true); setError(null);
-    try {
-      const loaded = await api.getEvidenceRuns(submission.id);
-      setReports(loaded); setSelectedId((current) => current && loaded.some((item) => item.id === current) ? current : loaded[0]?.id);
-    } catch (caught) { setError(caught instanceof Error ? caught.message : 'Не удалось загрузить отчёты скрытых тестов'); }
-    finally { setLoading(false); }
-  }, [submission.id]);
-  useEffect(() => { void load(); }, [load]);
-
-  async function launch() {
-    if (!canLaunch || running) return;
-    setRunning(true); setError(null);
-    try {
-      const created = await api.createEvidenceRun(submission.id);
-      setReports((items) => [created, ...items.filter((item) => item.id !== created.id)]); setSelectedId(created.id);
-    } catch (caught) { setError(caught instanceof Error ? caught.message : 'Скрытые тесты не запущены'); }
-    finally { setRunning(false); }
-  }
-
-  const selected = reports.find((item) => item.id === selectedId) ?? reports[0];
-  const disabledReason = !reviewRequired ? 'Для этой работы отключена проверка преподавателем.'
-    : !decisionSupportEnabled ? 'СППР отключена в настройках работы.'
-      : !canLaunch ? 'Для запуска скрытых тестов необходимо закрепить работу за собой.' : undefined;
-  if (loading) return <div className="evidence-loading"><RefreshCcw size={17} /> Получаем отчёты скрытых тестов…</div>;
-  return <div className="evidence-runs">
-    <header><div><strong>Детерминированные скрытые тесты</strong><small>Сервис запуска проверяет неизменяемый снимок сдачи.</small></div><div><button className="evidence-refresh" type="button" aria-label="Обновить отчёты" disabled={running} onClick={() => void load()}><RefreshCcw size={14} /></button><Button size="sm" variant="secondary" loading={running} disabled={!canLaunch} onClick={() => void launch()}><Play size={13} /> Запустить</Button></div></header>
-    {disabledReason && <p className="evidence-policy-note"><Info size={14} /> {disabledReason}</p>}
-    {error && <InlineError message={error} retry={() => void load()} />}
-    {reports.length ? <><div className="evidence-run-list" aria-label="Отчёты скрытых тестов">{reports.map((report) => <button key={report.id} type="button" className={cn(report.id === selected?.id && 'is-active')} onClick={() => setSelectedId(report.id)}><span className={cn('status-dot', report.status === 'COMPLETED' && report.passedCases === report.totalCases ? 'status-dot--ok' : report.status === 'FAILED' ? 'status-dot--danger' : 'status-dot--warning')} /><span><strong>{reportStatusLabel(report)}</strong><small>{formatDate(report.createdAt)} · {shortHash(report.snapshotManifestHash)}</small></span><ChevronRight size={14} /></button>)}</div>{selected && <EvidenceRunDetails report={selected} />}</> : <EvidenceEmpty title="Скрытые тесты ещё не запускались" />}
-    <p className="evidence-verdict-note"><ShieldCheck size={14} /><span><strong>Результат не является оценкой</strong>Он не заполняет балл и не утверждает решение автоматически.</span></p>
-  </div>;
-}
-
-function EvidenceRunDetails({ report }: { report: EvidenceReport }) {
-  return <section className="evidence-run-details">
-    <header><div><span className={cn('status-dot', report.status === 'COMPLETED' && report.passedCases === report.totalCases ? 'status-dot--ok' : report.status === 'FAILED' ? 'status-dot--danger' : 'status-dot--warning')} /><strong>{report.passedCases} из {report.totalCases} пройдено</strong></div><Badge tone={report.status === 'COMPLETED' ? report.passedCases === report.totalCases ? 'success' : 'warning' : report.status === 'RUNNING' ? 'warning' : 'danger'}>{report.status === 'COMPLETED' ? 'Завершён' : report.status === 'RUNNING' ? 'Выполняется' : 'Ошибка'}</Badge></header>
-    {report.failureMessage && <p className="evidence-run-failure"><AlertTriangle size={14} /> <span><strong>Проверку не удалось завершить</strong>{formatEvidenceIssue(report.failureCode, 'Подробности ошибки сервиса запуска недоступны.')}</span></p>}
-    <div className="evidence-cases">{report.outcomes.map((outcome) => <details key={`${outcome.caseIndex}-${outcome.runId}`}><summary><span className={cn('status-dot', outcome.status === 'PASSED' ? 'status-dot--ok' : outcome.status === 'FAILED' ? 'status-dot--warning' : 'status-dot--danger')} /><span><strong>{outcome.caseIndex + 1}. {outcome.name}</strong><small>{outcome.status === 'PASSED' ? 'Пройден' : outcome.status === 'FAILED' ? 'Не пройден' : 'Ошибка инфраструктуры'} · {outcome.comparison === 'EXACT' ? 'точное сравнение' : 'без хвостовых пробелов'}</small></span><ChevronRight size={14} /></summary><dl><div><dt>Код завершения</dt><dd>{outcome.exitCode ?? 'нет'}</dd></div><div><dt>Файлы изолированы</dt><dd>{outcome.filesystemIsolated === undefined ? 'нет данных' : outcome.filesystemIsolated ? 'да' : 'нет'}</dd></div><div><dt>Сеть</dt><dd>{outcome.networkEnabled === undefined ? 'нет данных' : outcome.networkEnabled ? 'включена' : 'отключена'}</dd></div><div><dt>Фактический вывод</dt><dd><code>{shortHash(outcome.actualStdoutSha256)}</code></dd></div><div><dt>Ожидаемый вывод</dt><dd><code>{shortHash(outcome.expectedStdoutSha256)}</code></dd></div></dl>{outcome.actualStdoutPreview && <div className="evidence-output"><small>stdout (ограниченное превью)</small><pre>{outcome.actualStdoutPreview}</pre></div>}{outcome.stderrPreview && <div className="evidence-output evidence-output--error"><small>stderr (ограниченное превью)</small><pre>{outcome.stderrPreview}</pre></div>}</details>)}</div>
-    {report.findings.length > 0 && <div className="evidence-findings"><strong>Наблюдения запуска</strong>{report.findings.map((finding, index) => <p key={`${finding.code}-${finding.caseIndex ?? 'report'}-${index}`}>{formatEvidenceIssue(finding.code, 'Сервис обнаружил проблему при выполнении теста.')}{finding.caseIndex === undefined ? '' : ` · тест ${finding.caseIndex + 1}`}</p>)}</div>}
-    <small className="evidence-hashes">набор тестов {shortHash(report.hiddenTestManifestHash)} · задание {shortHash(report.taskContentHash)} · снимок {shortHash(report.snapshotManifestHash)}</small>
-  </section>;
-}
-
-function reportStatusLabel(report: EvidenceReport): string {
-  if (report.status === 'RUNNING') return 'Выполняется';
-  if (report.status === 'FAILED') return 'Ошибка запуска';
-  return `${report.passedCases}/${report.totalCases} тестов`;
-}
-function shortHash(value: string): string { return value ? value.slice(0, 10) : 'нет данных'; }
 
 function IntegrityPanel({ submission, canReview, decisionSupportEnabled }: { submission: Submission; canReview: boolean; decisionSupportEnabled: boolean }) {
   const [authorship, setAuthorship] = useState<AuthorshipAnalysis[]>([]);

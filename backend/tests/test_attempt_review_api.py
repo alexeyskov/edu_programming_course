@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
@@ -129,6 +129,7 @@ async def _start_attempt(
     headers: dict[str, str],
     assessment_id: str,
 ) -> tuple[dict, dict]:
+    before_start = utcnow()
     started = await client.post(
         f"/api/v1/assessments/{assessment_id}/attempts",
         headers=headers,
@@ -136,6 +137,11 @@ async def _start_attempt(
     )
     assert started.status_code == 201, started.text
     attempt = started.json()
+    assert before_start <= datetime.fromisoformat(attempt["server_now"]) <= utcnow()
+    before_poll = utcnow()
+    current = await client.get(f"/api/v1/attempts/{attempt['id']}")
+    assert current.status_code == 200, current.text
+    assert before_poll <= datetime.fromisoformat(current.json()["server_now"]) <= utcnow()
     workspace = await client.get(f"/api/v1/attempts/{attempt['id']}/workspace")
     assert workspace.status_code == 200, workspace.text
     return attempt, workspace.json()

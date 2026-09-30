@@ -512,7 +512,7 @@ function mapFile(raw: any): WorkspaceFile {
   return { id: String(raw.id ?? path), path, content: String(raw.content ?? ''), readOnly: Boolean(raw.read_only), language: languageForPath(path) };
 }
 
-function mapAttempt(raw: any, workspace?: any): Attempt {
+function mapAttempt(raw: any, workspace?: any, receivedAt = performance.now()): Attempt {
   const state = String(raw.state ?? raw.status ?? 'ACTIVE').toUpperCase();
   const submittedStates = new Set(['SUBMITTED', 'AUTO_SUBMITTED', 'FINALIZED', 'GRADED']);
   const deleted = raw.closure_reason === 'LMS_ATTEMPT_DELETED';
@@ -524,6 +524,7 @@ function mapAttempt(raw: any, workspace?: any): Attempt {
     revision: Number(workspace?.current_revision ?? workspace?.revision ?? raw.current_revision ?? raw.workspace_revision ?? raw.revision ?? 0),
     acknowledgedRevision: Number(raw.acknowledged_revision ?? workspace?.current_revision ?? workspace?.revision ?? raw.current_revision ?? raw.workspace_revision ?? 0),
     startedAt: raw.started_at ?? new Date().toISOString(), expectedEndAt: raw.expected_end_at ?? undefined, deadlineAt: raw.deadline_at ?? undefined,
+    serverNow: raw.server_now ?? undefined, serverTimeReceivedAt: receivedAt,
     hasTimeLimit: typeof raw.has_time_limit === 'boolean' ? raw.has_time_limit : undefined,
     moodleSyncTimeoutSeconds: typeof raw.moodle_sync_timeout_seconds === 'number' ? raw.moodle_sync_timeout_seconds : undefined,
     closureReason: raw.closure_reason ?? undefined, closedAt: raw.closed_at ?? raw.submitted_at ?? undefined,
@@ -546,6 +547,8 @@ function mapAttemptStatus(raw: any): AttemptStatus {
   const mapped = mapAttempt(raw);
   return {
     id: mapped.id,
+    serverNow: mapped.serverNow,
+    serverTimeReceivedAt: mapped.serverTimeReceivedAt,
     aiEnabled: typeof raw.ai_enabled === 'boolean' ? raw.ai_enabled : undefined,
     deadlineAt: mapped.deadlineAt,
     expectedEndAt: mapped.expectedEndAt,
@@ -661,6 +664,12 @@ function mapSubmission(raw: any): Submission {
   const rawOrigin = raw.origin_verification ?? raw.originVerification;
   return {
     id: String(raw.id), source: raw.source ? String(raw.source).toUpperCase() : undefined, assessmentId: String(raw.assessment_id ?? ''), taskVersionId: raw.assigned_task_version_id ? String(raw.assigned_task_version_id) : undefined, courseId: raw.course_id ? String(raw.course_id) : undefined, courseTitle: raw.course_title ? String(raw.course_title) : undefined, assessmentTitle: String(raw.assessment_title ?? raw.assessment?.title ?? 'Работа'),
+    parentAssessmentId: raw.parent_assessment_id ? String(raw.parent_assessment_id) : undefined,
+    parentAssessmentTitle: raw.parent_assessment_title ? String(raw.parent_assessment_title) : undefined,
+    taskStatement: typeof raw.task_statement === 'string' ? raw.task_statement : undefined,
+    sourceWarnings: unwrapList<any>(raw.source_warnings ?? []).map((warning) => ({
+      code: String(warning.code), message: String(warning.message), moodleUrl: safeExternalUrl(warning.moodle_url),
+    })),
     studentName: String(raw.student?.display_name ?? raw.student_name ?? 'Студент'), studentGroup: String(raw.group_name ?? raw.student_group ?? '—'),
     submittedAt: raw.submitted_at ?? raw.created_at ?? new Date().toISOString(), status: mapSubmissionStatus(raw.status),
     score: raw.score === undefined || raw.score === null ? undefined : Number(raw.score),
@@ -1083,12 +1092,13 @@ export const api = {
   ),
   getAttempt: (attemptId: string) => withDemo(async () => {
     const raw = await request<any>(`/attempts/${attemptId}`);
+    const receivedAt = performance.now();
     const workspace = await request<any>(`/attempts/${attemptId}/workspace`);
-    return mapAttempt(raw, workspace);
-  }, () => cloneDemo(attemptState)),
+    return mapAttempt(raw, workspace, receivedAt);
+  }, () => ({ ...cloneDemo(attemptState), serverNow: new Date().toISOString(), serverTimeReceivedAt: performance.now() })),
   getAttemptStatus: (attemptId: string) => withDemo(
     async () => mapAttemptStatus(await request(`/attempts/${attemptId}`)),
-    () => mapAttemptStatus(attemptState),
+    () => mapAttemptStatus({ ...attemptState, server_now: new Date().toISOString() }),
   ),
   startAttempt: (assessmentId: string, signal?: AbortSignal) => withDemo(
     async () => {
@@ -1300,12 +1310,12 @@ export const api = {
     const raw = await request<any>(`/review-claims/${claimId}/heartbeat`, { method: 'POST', body: '{}' });
     return { id: String(raw.id), ownerId: String(raw.owner?.id ?? raw.owner_id), ownerName: String(raw.owner?.display_name ?? raw.owner_name), expiresAt: raw.lease_expires_at ?? raw.expires_at, mine: true };
   }, () => ({ id: claimId, ownerId: 'teacher-demo', ownerName: teacherSession.displayName, expiresAt: inFuture(300), mine: true })),
-  saveReview: (submissionId: string, grade: number, comment: string) => withDemo(
+  saveReview: (submissionId: string, grade: number | null, comment: string) => withDemo(
     () => request(`/submissions/${submissionId}/review-draft`, { method: 'PUT', body: JSON.stringify({ grade, comment }) }), () => ({ grade, comment, revision: 2 }),
   ),
   getReviewDraft: (submissionId: string) => withDemo(async () => {
     const raw = await request<any | null>(`/submissions/${submissionId}/review-draft`);
-    return raw ? { grade: Number(raw.grade), comment: String(raw.comment ?? '') } : null;
+    return raw ? { grade: raw.grade == null ? null : Number(raw.grade), comment: String(raw.comment ?? '') } : null;
   }, () => null),
   finalizeReview: (submissionId: string, grade: number, comment: string) => withDemo(
     async () => { const raw = await request<any>(`/submissions/${submissionId}/review-decisions`, { method: 'POST', headers: { 'Idempotency-Key': createUuid() }, body: JSON.stringify({ grade, comment }) }); return { id: String(raw.id), grade: Number(raw.grade ?? grade), comment: String(raw.comment ?? comment), lmsExportState: raw.lms_export_state ? String(raw.lms_export_state) : undefined }; },

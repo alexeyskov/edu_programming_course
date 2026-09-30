@@ -21,7 +21,11 @@ from app.models.courses import Course
 from app.models.identity import ExternalPrincipal, LMSConnection
 from app.models.integration import HistoryWarningDismissal, SyncOutbox
 from app.models.tasks import Assessment
-from app.services.moodle_history_diagnostics import history_import_diagnostic, history_warning_codes
+from app.services.moodle_history_diagnostics import (
+    WARNING_MESSAGES,
+    history_import_diagnostic,
+    history_warning_codes,
+)
 from app.services.policy import review_student_ids_for_course
 
 _SOURCE_CODES = {
@@ -89,6 +93,38 @@ def _source_identity(receipt: dict) -> object:
         for item in observations if isinstance(item, dict) and item.get("sha256")
     }) if isinstance(observations, list) else []
     return digests or _text(receipt.get("external_revision"))
+
+
+async def submission_source_warnings(
+    db: AsyncSession, *, submission: Submission, attempt: Attempt, assessment: Assessment,
+) -> list[dict[str, str | None]]:
+    """Called only after exact submission review authorization; no course-wide errors.
+
+    Read the saved answer, not the latest course job: an incomplete archive must
+    remain visible here even after unrelated work is synchronized successfully.
+    Never expose raw connector reasons, filenames, payloads or exception bodies.
+    """
+    omissions = _omissions(submission)
+    receipt = submission.external_receipt or {}
+    if not omissions and receipt.get("source_complete") is not False:
+        return []
+    course = await db.get(Course, assessment.course_id)
+    connection = await db.get(LMSConnection, course.connection_id) if course else None
+    student = await db.get(ExternalPrincipal, attempt.principal_id)
+    url = _moodle_url(
+        connection.base_url, _text(receipt.get("lms_module")),
+        _text(receipt.get("lms_cmid")), _text(receipt.get("moodle_parent_attempt_id")),
+        student.external_subject if student else "",
+    ) if connection else None
+    details = {}
+    for omission in omissions or [{}]:
+        reason = _text(omission.get("reason"))
+        code = reason if reason in _SOURCE_CODES else (
+            "ARCHIVE_SOURCE_OMITTED" if reason.startswith("ARCHIVE_") else "ARTIFACT_OMITTED"
+        )
+        message = _OMISSION_MESSAGES.get(reason, WARNING_MESSAGES[code])
+        details[(code, message)] = {"code": code, "message": message, "moodle_url": url}
+    return list(details.values())
 
 
 async def add_history_warning_details(

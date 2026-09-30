@@ -57,6 +57,7 @@ const previousDecision = {
 };
 const submission: Submission = {
   id: 'graded', assessmentId: 'assessment-1', assessmentTitle: 'Самостоятельная работа',
+  taskStatement: 'Найдите максимум массива. Используйте функцию.',
   studentName: 'Софья Лебедева', studentGroup: '1.1', submittedAt: '2026-08-25T10:00:00Z',
   status: 'GRADED', score: 9, maxScore: 10, risk: 'LOW', testsPassed: 5, testsTotal: 5,
   files: [{ id: 'main', path: 'main.cpp', content: 'int main() {}', language: 'cpp' }], history: [],
@@ -73,6 +74,34 @@ function renderPage(initialEntry = '/review/graded?view=reviewed') {
     <Route path="/review/:submissionId" element={<ReviewPage />} />
     <Route path="/submissions" element={<p>Список работ</p>} />
   </Routes></ToastProvider></ThemeProvider></MemoryRouter>);
+}
+
+function mockUngradedQuestionGroup() {
+  const reviewGroup = {
+    id: 'quiz-response', title: 'Два задания',
+    items: [1, 2].map((position) => ({
+      submissionId: `question-${position}`, position, title: `Задача ${position}`,
+      maxScore: 5, status: 'UNGRADED' as const,
+    })),
+  };
+  const questions: Submission[] = reviewGroup.items.map((item) => ({
+    ...submission, id: item.submissionId, courseId: 'course-1', assessmentTitle: item.title,
+    status: 'UNGRADED', score: undefined, maxScore: 5, latestDecision: undefined, decisionHistory: [],
+    claim: undefined, canReview: true, reviewRequired: true, reviewGroup,
+    files: [{ ...submission.files[0], content: `int main() { return ${item.position}; }` }],
+  }));
+  const claim = (id: string) => ({
+    id, ownerId: 'teacher-1', ownerName: 'Преподаватель', mine: true,
+    expiresAt: '2026-08-25T12:00:00Z',
+  });
+  mocks.getSubmission.mockImplementation(async (id: string) => questions.find((item) => item.id === id));
+  mocks.claimSubmission.mockImplementation(async (id: string) => claim(`claim-${id}`));
+  mocks.heartbeatClaim.mockImplementation(async (id: string) => claim(id));
+  mocks.createExperiment.mockImplementation(async (id: string) => ({
+    id: `experiment-${id}`, submissionId: id, revision: 0, changed: false,
+    files: questions.find((item) => item.id === id)!.files, createdAt: '2026-08-25T12:00:00Z',
+  }));
+  return questions;
 }
 
 beforeEach(() => {
@@ -128,6 +157,37 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.useRealTimers(); window.sessionStorage.clear(); });
 
 describe('reviewed submission', () => {
+  it('opens the exact task by default without requesting or generating hidden tests', async () => {
+    renderPage();
+    expect(await screen.findByRole('region', { name: 'Задание студента' })).toHaveTextContent(submission.taskStatement!);
+    expect(screen.getByRole('tab', { name: 'Задание' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.queryByRole('tab', { name: 'Тесты' })).not.toBeInTheDocument();
+    expect(mocks.getEvidenceRuns).not.toHaveBeenCalled();
+  });
+
+  it('shows source warnings for the opened submission, with a safe Moodle link', async () => {
+    mocks.getSubmission.mockResolvedValue({ ...submission, sourceWarnings: [{
+      code: 'ARCHIVE_SOURCE_OMITTED', message: 'В архиве нет исходников C/C++.',
+      moodleUrl: 'https://moodle.test/mod/quiz/review.php?attempt=9',
+    }] });
+    renderPage();
+    expect(await screen.findByRole('alert')).toHaveTextContent('В архиве нет исходников C/C++.');
+    expect(screen.getByRole('link', { name: 'Открыть ответ в Moodle' })).toHaveAttribute('rel', 'noopener noreferrer');
+    fireEvent.click(screen.getByRole('tab', { name: 'История' }));
+    expect(screen.getByRole('alert')).toHaveTextContent('ARCHIVE_SOURCE_OMITTED');
+  });
+
+  it('renders task markup as text and honestly reports a missing statement', async () => {
+    mocks.getSubmission.mockResolvedValue({ ...submission, taskStatement: '<script>invalid()</script>' });
+    const page = renderPage();
+    expect(await screen.findByRole('region', { name: 'Задание студента' })).toHaveTextContent('<script>invalid()</script>');
+    expect(document.querySelector('.review-task script')).toBeNull();
+    page.unmount();
+    mocks.getSubmission.mockResolvedValue({ ...submission, taskStatement: '' });
+    renderPage();
+    expect(await screen.findByRole('region', { name: 'Задание студента' })).toHaveTextContent('Текст задания не был получен из Moodle');
+  });
+
   it.each(['PENDING', 'FAILED'])('refreshes %s delivery without reloading or changing the decision', async (state) => {
     vi.useFakeTimers();
     const pending = { ...decision, lmsExportState: state };
@@ -184,7 +244,7 @@ describe('reviewed submission', () => {
 
     renderPage();
     await screen.findByText('Работа проверена');
-    fireEvent.click(screen.getByRole('button', { name: 'История' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'История' }));
 
     expect(screen.getByText(/IP: 203\.0\.113\.42 · Google Chrome 140\.0/)).toBeInTheDocument();
     expect(screen.getByText(/Windows 10\/11 · компьютер/)).toBeInTheDocument();
@@ -198,9 +258,11 @@ describe('reviewed submission', () => {
         { submissionId: 'question-2', position: 2, title: 'Массивы', score: 4, maxScore: 5, status: 'GRADED' as const },
       ],
     };
-    const first = { ...submission, id: 'question-1', assessmentTitle: 'Строки', score: 3, maxScore: 3, reviewGroup };
+    const first = { ...submission, id: 'question-1', assessmentTitle: 'Строки', taskStatement: 'Посчитайте буквы.', score: 3, maxScore: 3, reviewGroup,
+      sourceWarnings: [{ code: 'ARTIFACT_OMITTED', message: 'Не загружен первый ответ.' }] };
     const second = {
       ...submission, id: 'question-2', assessmentTitle: 'Массивы', score: 4, maxScore: 5, reviewGroup,
+      taskStatement: 'Посчитайте элементы массива.',
       files: [{ id: 'arrays-main', path: 'main.cpp', content: 'int values[3];', language: 'cpp' }],
     };
     mocks.getSubmission.mockImplementation(async (id: string) => id === 'question-2' ? second : first);
@@ -213,6 +275,9 @@ describe('reviewed submission', () => {
     expect(within(switcher).getByRole('tab', { name: /№1 Строки Балл: 3 \/ 3 Проверено/ })).toHaveAttribute('aria-selected', 'true');
     expect(within(switcher).getByRole('tab', { name: /№2 Массивы Балл: 4 \/ 5 Проверено/ })).toHaveAttribute('aria-selected', 'false');
 
+    expect(screen.getByRole('region', { name: 'Задание студента' })).toHaveTextContent('Посчитайте буквы.');
+    expect(screen.getByRole('alert')).toHaveTextContent('Не загружен первый ответ.');
+    fireEvent.click(screen.getByRole('tab', { name: 'История' }));
     fireEvent.click(within(switcher).getByRole('tab', { name: /№2 Массивы/ }));
 
     await waitFor(() => expect(mocks.getSubmission).toHaveBeenLastCalledWith('question-2'));
@@ -221,6 +286,113 @@ describe('reviewed submission', () => {
     expect(within(nextSwitcher).getByText('Задание 2 из 2')).toBeInTheDocument();
     expect(within(nextSwitcher).getByRole('tab', { name: /№2 Массивы/ })).toHaveAttribute('aria-selected', 'true');
     expect(screen.queryByText('Список работ')).not.toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Задание' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('region', { name: 'Задание студента' })).toHaveTextContent('Посчитайте элементы массива.');
+    expect(screen.queryByText('Не загружен первый ответ.')).not.toBeInTheDocument();
+  });
+
+  it('runs each ungraded question in its own sandbox when switching there and back', async () => {
+    mockUngradedQuestionGroup();
+    mocks.saveExperimentFile.mockResolvedValue(1);
+    renderPage('/review/question-1');
+    await screen.findByText('Вы проверяете работу');
+    fireEvent.click(screen.getByRole('button', { name: 'Открыть преподавательскую песочницу' }));
+    await screen.findByRole('button', { name: 'Закрыть преподавательскую песочницу' });
+    fireEvent.change(screen.getByLabelText('Код main.cpp'), { target: { value: 'int main() { return 7; }' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Компилировать и запустить код' }));
+    await waitFor(() => expect(mocks.startInteractiveExperiment).toHaveBeenCalledWith('experiment-question-1', 1));
+
+    fireEvent.click(screen.getByRole('tab', { name: /№2 Задача 2/ }));
+    await waitFor(() => expect(screen.getByRole('tab', { name: /№2 Задача 2/ })).toHaveAttribute('aria-selected', 'true'));
+    expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(null);
+    expect(screen.getByLabelText('Код main.cpp')).toHaveValue('int main() { return 2; }');
+    fireEvent.click(screen.getByRole('button', { name: 'Компилировать и запустить код' }));
+    await waitFor(() => expect(mocks.startInteractiveExperiment).toHaveBeenCalledWith('experiment-question-2', 0));
+    expect(mocks.resetExperiment).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('tab', { name: /№1 Задача 1/ }));
+    await waitFor(() => expect(screen.getByRole('tab', { name: /№1 Задача 1/ })).toHaveAttribute('aria-selected', 'true'));
+    expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(null);
+    fireEvent.click(screen.getByRole('button', { name: 'Компилировать и запустить код' }));
+    await waitFor(() => expect(mocks.startInteractiveExperiment).toHaveBeenLastCalledWith('experiment-question-1', 0));
+    expect(mocks.createExperiment.mock.calls.map(([id]) => id)).toEqual(['question-1', 'question-2', 'question-1']);
+    expect(mocks.releaseClaim.mock.calls.map(([id]) => id)).toEqual(['claim-question-1', 'claim-question-2']);
+    expect(mocks.saveReview).not.toHaveBeenCalled();
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+    expect(screen.queryByText('Запуск не выполнен')).not.toBeInTheDocument();
+  });
+
+  it('saves a comment without assigning a grade and restores the blank grade on return', async () => {
+    mockUngradedQuestionGroup();
+    const drafts = new Map<string, { grade: number | null; comment: string }>();
+    mocks.saveReview.mockImplementation(async (id: string, grade: number | null, comment: string) => {
+      drafts.set(id, { grade, comment });
+    });
+    mocks.getReviewDraft.mockImplementation(async (id: string) => drafts.get(id) ?? null);
+    renderPage('/review/question-1');
+    await screen.findByText('Вы проверяете работу');
+    fireEvent.change(screen.getByLabelText(/^Комментарий студенту/), { target: { value: 'Проверить границы массива.' } });
+    expect(screen.getByRole('button', { name: 'Сохранить' })).toBeEnabled();
+    fireEvent.click(screen.getByRole('tab', { name: /№2 Задача 2/ }));
+    await waitFor(() => expect(screen.getByRole('tab', { name: /№2 Задача 2/ })).toHaveAttribute('aria-selected', 'true'));
+    expect(mocks.saveReview).toHaveBeenCalledWith('question-1', null, 'Проверить границы массива.');
+    expect(screen.getByLabelText(/^Комментарий студенту/)).toHaveValue('');
+    fireEvent.click(screen.getByRole('tab', { name: /№1 Задача 1/ }));
+    await waitFor(() => expect(screen.getByRole('tab', { name: /№1 Задача 1/ })).toHaveAttribute('aria-selected', 'true'));
+    expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(null);
+    expect(screen.getByLabelText(/^Комментарий студенту/)).toHaveValue('Проверить границы массива.');
+    expect(screen.getAllByRole('button', { name: 'Утвердить' }).every((button) => button.hasAttribute('disabled'))).toBe(true);
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+  });
+
+  it('waits for a pending start and stops it before releasing the previous question', async () => {
+    const questions = mockUngradedQuestionGroup();
+    let resolveCreate!: (value: unknown) => void;
+    mocks.createExperiment.mockImplementationOnce(() => new Promise((resolve) => { resolveCreate = resolve; }));
+    const runningSession = {
+      sessionId: 'b'.repeat(32), status: 'RUNNING', terminal: false, durationMs: 1,
+      stdout: '', stderr: '', outputTruncated: false, diagnostics: [],
+    };
+    mocks.startInteractiveExperiment.mockResolvedValue(runningSession);
+    mocks.getInteractiveExperiment.mockResolvedValue(runningSession);
+    renderPage('/review/question-1');
+    await screen.findByText('Вы проверяете работу');
+    fireEvent.click(screen.getByRole('button', { name: 'Компилировать и запустить код' }));
+    await waitFor(() => expect(mocks.createExperiment).toHaveBeenCalledWith('question-1'));
+    fireEvent.click(screen.getByRole('tab', { name: /№2 Задача 2/ }));
+    await act(async () => { await Promise.resolve(); });
+    expect(mocks.releaseClaim).not.toHaveBeenCalled();
+    expect(mocks.getSubmission).toHaveBeenCalledTimes(1);
+    await act(async () => { resolveCreate({
+      id: 'experiment-question-1', submissionId: 'question-1', revision: 0, changed: false,
+      files: questions[0].files, createdAt: '2026-08-25T12:00:00Z',
+    }); });
+    await waitFor(() => expect(screen.getByRole('tab', { name: /№2 Задача 2/ })).toHaveAttribute('aria-selected', 'true'));
+    expect(mocks.stopInteractiveExperiment).toHaveBeenCalledWith('experiment-question-1', runningSession.sessionId);
+    expect(mocks.stopInteractiveExperiment.mock.invocationCallOrder[0]).toBeLessThan(mocks.releaseClaim.mock.invocationCallOrder[0]);
+    expect(window.sessionStorage.getItem('eduprog:interactive-review:question-2')).toBeNull();
+    expect(screen.queryByText('Консоль программы')).not.toBeInTheDocument();
+    expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(null);
+  });
+
+  it('keeps the current claim when its running program cannot be stopped during a switch', async () => {
+    mockUngradedQuestionGroup();
+    const runningSession = {
+      sessionId: 'c'.repeat(32), status: 'RUNNING', terminal: false, durationMs: 1,
+      stdout: '', stderr: '', outputTruncated: false, diagnostics: [],
+    };
+    mocks.startInteractiveExperiment.mockResolvedValue(runningSession);
+    mocks.getInteractiveExperiment.mockResolvedValue(runningSession);
+    mocks.stopInteractiveExperiment.mockRejectedValue(new Error('Не удалось остановить программу.'));
+    renderPage('/review/question-1');
+    await screen.findByText('Вы проверяете работу');
+    fireEvent.click(screen.getByRole('button', { name: 'Компилировать и запустить код' }));
+    await screen.findByRole('button', { name: 'Остановить программу' });
+    fireEvent.click(screen.getByRole('tab', { name: /№2 Задача 2/ }));
+    expect(await screen.findByText('Задание не открыто')).toBeVisible();
+    expect(mocks.releaseClaim).not.toHaveBeenCalled();
+    expect(mocks.getSubmission).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('tab', { name: /№1 Задача 1/ })).toHaveAttribute('aria-selected', 'true');
   });
 
   it('saves a changed review and reserves the destination before releasing the current question', async () => {
@@ -373,7 +545,7 @@ describe('reviewed submission', () => {
     expect(screen.getAllByText('Коваленко А.').length).toBeGreaterThan(0);
     expect(screen.getByText(/версия 2/)).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: 'История' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'История' }));
     expect(screen.getByText('История решений')).toBeInTheDocument();
     expect(screen.getByText('Первоначальная проверка')).toBeInTheDocument();
     expect(screen.getByText('Сергеева Е.')).toBeInTheDocument();
@@ -450,12 +622,24 @@ describe('reviewed submission', () => {
     await screen.findByText('Работа проверена');
     fireEvent.click(screen.getByRole('button', { name: 'Открыть преподавательскую песочницу' }));
     await screen.findByRole('button', { name: 'Закрыть преподавательскую песочницу' });
-    fireEvent.click(screen.getByRole('button', { name: /Сравнить/ }));
+    const compare = screen.getByRole('button', { name: 'Сравнить' });
+    expect(compare).toHaveAttribute('aria-pressed', 'false');
+    fireEvent.click(compare);
+    expect(compare).toHaveAttribute('aria-pressed', 'true');
+    expect(compare).toHaveAttribute('title', 'Сравнение включено. Нажмите ещё раз, чтобы вернуться к редактору.');
 
     const diff = screen.getByTestId('diff-editor');
     expect(diff).toHaveAttribute('data-original', 'student utils');
     expect(diff).toHaveAttribute('data-modified', 'teacher utils');
     expect(screen.getAllByText(/utils\.cpp/)).toHaveLength(2);
+    fireEvent.click(compare);
+    expect(compare).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.queryByTestId('diff-editor')).not.toBeInTheDocument();
+    expect(screen.getByTestId('code-workspace')).toBeVisible();
+    fireEvent.click(compare);
+    fireEvent.click(screen.getByRole('button', { name: 'Закрыть преподавательскую песочницу' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Открыть преподавательскую песочницу' }));
+    expect(await screen.findByRole('button', { name: 'Сравнить' })).toHaveAttribute('aria-pressed', 'false');
   });
 
   it('keeps the file toggle in place and leaves a restoration control for the review panel', async () => {
@@ -531,7 +715,7 @@ describe('reviewed submission', () => {
     renderPage();
     await screen.findByText('Работа проверена');
 
-    expect(screen.getByRole('button', { name: 'Плагиат' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Плагиат' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Целостность' })).not.toBeInTheDocument();
   });
 
@@ -650,7 +834,7 @@ describe('reviewed submission', () => {
     fireEvent.change(stdin, { target: { value: '3' } });
     fireEvent.submit(stdin.closest('form')!);
     await waitFor(() => expect(mocks.sendInteractiveInput).toHaveBeenCalledWith('experiment-1', 'b'.repeat(32), '3'));
-    expect(screen.queryByText('› 3')).not.toBeInTheDocument();
+    expect(await screen.findByText('› 3')).toBeVisible();
     expect(screen.getByRole('button', { name: 'Передать строку программе' })).toHaveTextContent('Отправить');
     expect(screen.queryByRole('button', { name: /EOF/ })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Остановить программу' }));
@@ -660,10 +844,71 @@ describe('reviewed submission', () => {
     mocks.startInteractiveExperiment.mockResolvedValue(runningSession);
     fireEvent.click(screen.getByRole('button', { name: 'Компилировать и запустить код' }));
     await waitFor(() => expect(mocks.startInteractiveExperiment).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText('› 3')).not.toBeInTheDocument();
     await waitFor(() => expect(window.sessionStorage.getItem('eduprog:interactive-review:graded')).not.toBeNull());
     fireEvent.click(screen.getAllByRole('button', { name: 'Остановить программу' }).at(-1)!);
     await waitFor(() => expect(mocks.stopInteractiveExperiment).toHaveBeenCalledWith('experiment-1', 'b'.repeat(32)));
     await waitFor(() => expect(window.sessionStorage.getItem('eduprog:interactive-review:graded')).toBeNull());
+  });
+
+  it('keeps the entered values between output lines after the program finishes', async () => {
+    let run = {
+      sessionId: 'console-input-run', status: 'RUNNING', terminal: false, durationMs: 1,
+      stdout: 'Введите размер массива\n', stderr: '', outputTruncated: false, diagnostics: [],
+    };
+    mocks.startInteractiveExperiment.mockResolvedValue(run);
+    mocks.getInteractiveExperiment.mockImplementation(async () => run);
+    mocks.sendInteractiveInput.mockImplementation(async () => {
+      run = mocks.sendInteractiveInput.mock.calls.length === 1
+        ? { ...run, stdout: run.stdout + 'Введите элементы массива\n' }
+        : { ...run, status: 'SUCCESS', terminal: true, stdout: run.stdout + 'Итоговый массив: 1 2 3 4 5\n' };
+      return run;
+    });
+    const { container } = renderPage();
+    await screen.findByText('Работа проверена');
+    fireEvent.click(screen.getByRole('button', { name: 'Компилировать и запустить код' }));
+    await screen.findByText('Введите размер массива');
+    const input = screen.getByLabelText('Ввод программы');
+    fireEvent.change(input, { target: { value: '5' } });
+    fireEvent.submit(input.closest('form')!);
+    await screen.findByText('Введите элементы массива');
+    fireEvent.change(input, { target: { value: '1 2 3 4 5' } });
+    fireEvent.submit(input.closest('form')!);
+    await screen.findByText('Итоговый массив: 1 2 3 4 5');
+    expect([...container.querySelectorAll('.experiment-console__output pre')].map((entry) => entry.textContent)).toEqual([
+      'Введите размер массива', '› 5', 'Введите элементы массива', '› 1 2 3 4 5', 'Итоговый массив: 1 2 3 4 5',
+    ]);
+    expect(input).toBeDisabled();
+  });
+
+  it('echoes only acknowledged input, prevents double sends and preserves the next typed line', async () => {
+    const run = {
+      sessionId: 'pending-input-run', status: 'RUNNING', terminal: false, durationMs: 1,
+      stdout: 'Число: ', stderr: '', outputTruncated: false, diagnostics: [],
+    };
+    mocks.startInteractiveExperiment.mockResolvedValue(run);
+    mocks.getInteractiveExperiment.mockResolvedValue(run);
+    mocks.sendInteractiveInput.mockRejectedValueOnce(new Error('Не удалось отправить строку'));
+    renderPage();
+    await screen.findByText('Работа проверена');
+    fireEvent.click(screen.getByRole('button', { name: 'Компилировать и запустить код' }));
+    await screen.findByText('Число:');
+    const input = screen.getByLabelText('Ввод программы');
+    fireEvent.change(input, { target: { value: '3' } });
+    fireEvent.submit(input.closest('form')!);
+    await screen.findByText('Ввод не передан программе');
+    expect(screen.queryByText('› 3')).not.toBeInTheDocument();
+    expect(input).toHaveValue('3');
+    let resolveInput!: (value: typeof run) => void;
+    mocks.sendInteractiveInput.mockImplementation(() => new Promise((resolve) => { resolveInput = resolve; }));
+    fireEvent.submit(input.closest('form')!);
+    fireEvent.submit(input.closest('form')!);
+    expect(mocks.sendInteractiveInput).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('button', { name: 'Передать строку программе' })).toBeDisabled();
+    fireEvent.change(input, { target: { value: '9' } });
+    await act(async () => { resolveInput(run); });
+    expect(screen.getAllByText('› 3')).toHaveLength(1);
+    expect(input).toHaveValue('9');
   });
 
   it('reconnects to a live teacher session after reload without stopping it on unmount', async () => {
@@ -723,7 +968,7 @@ describe('reviewed submission', () => {
     renderPage();
     await screen.findByText('Работа проверена');
 
-    fireEvent.click(screen.getByRole('button', { name: 'ИИ' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'ИИ' }));
     expect(screen.getByText('Спросить о работе')).toBeInTheDocument();
     expect(screen.getByText(/Для вопросов закреплять работу за собой не нужно/)).toBeInTheDocument();
     expect(screen.getByLabelText(/Итоговый балл/)).toBeDisabled();
@@ -761,7 +1006,7 @@ describe('reviewed submission', () => {
     mocks.sendAiMessage.mockImplementationOnce(() => new Promise((resolve) => { finishFirst = resolve; }));
     renderPage('/review/question-1');
     await screen.findByRole('navigation', { name: 'Задания в ответе студента' });
-    fireEvent.click(screen.getByRole('button', { name: 'ИИ' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'ИИ' }));
     fireEvent.click(screen.getByRole('button', { name: 'Открыть чат' }));
     await waitFor(() => expect(screen.getByPlaceholderText('Вопрос о текущем коде…')).not.toBeDisabled());
     fireEvent.change(screen.getByPlaceholderText('Вопрос о текущем коде…'), { target: { value: 'Первый вопрос' } });
@@ -770,6 +1015,7 @@ describe('reviewed submission', () => {
 
     fireEvent.click(screen.getByRole('tab', { name: /№2 Массивы/ }));
     await screen.findByText('Задание 2 из 2');
+    fireEvent.click(screen.getByRole('tab', { name: 'ИИ' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Открыть чат' }));
     await waitFor(() => expect(screen.getByPlaceholderText('Вопрос о текущем коде…')).not.toBeDisabled());
     await act(async () => { finishFirst({ content: 'Ответ для первой задачи', citations: [] }); });
@@ -789,7 +1035,7 @@ describe('reviewed submission', () => {
     renderPage();
     const comment = await screen.findByLabelText('Комментарий студенту');
     fireEvent.change(comment, { target: { value: 'Проверить пустой ввод' } });
-    fireEvent.click(screen.getByRole('button', { name: 'ИИ' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'ИИ' }));
     fireEvent.click(screen.getByRole('button', { name: 'Открыть чат' }));
     await waitFor(() => expect(screen.getByPlaceholderText('Вопрос о текущем коде…')).not.toBeDisabled());
     fireEvent.change(screen.getByPlaceholderText('Вопрос о текущем коде…'), { target: { value: 'Верно ли замечание?' } });

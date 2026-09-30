@@ -58,6 +58,88 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
+describe('course and work filters', () => {
+  const queue: Submission[] = [
+    { ...items[0], courseId: 'course-a', courseTitle: 'Программирование на C++', assessmentId: 'essay-1', parentAssessmentId: 'quiz-a', parentAssessmentTitle: 'Контрольная №1' },
+    { ...items[1], courseId: 'course-a', courseTitle: 'Программирование на C++', assessmentId: 'quiz-b', assessmentTitle: 'Лабораторная №2' },
+    { ...items[2], status: 'UNGRADED', claim: undefined, courseId: 'course-b', courseTitle: 'Программирование на C++', assessmentId: 'quiz-c' },
+    { ...items[3], courseId: 'course-a', courseTitle: 'Программирование на C++', assessmentId: 'essay-2', parentAssessmentId: 'quiz-a', parentAssessmentTitle: 'Контрольная №1' },
+  ];
+  beforeEach(() => mocks.getSubmissions.mockResolvedValue(queue));
+
+  it('disables work selection until a course is chosen and keeps same-named courses separate', async () => {
+    renderPage('/submissions?assessment=quiz-a');
+    const course = await screen.findByRole('combobox', { name: 'Курс' });
+    const work = screen.getByRole('combobox', { name: 'Работа' });
+    expect(work).toBeDisabled();
+    expect(work).toHaveValue('');
+    expect(within(work).getAllByRole('option')).toHaveLength(1);
+    expect(within(course).getAllByRole('option')).toHaveLength(3);
+    expect(screen.getByText('Никита Орлов')).toBeInTheDocument();
+
+    fireEvent.change(course, { target: { value: 'course-a' } });
+    expect(work).toBeEnabled();
+    expect(work).toHaveValue('');
+    expect(screen.getByTestId('location')).toHaveTextContent('/submissions?course=course-a');
+    expect(screen.queryByText('Никита Орлов')).not.toBeInTheDocument();
+    expect(screen.getByText('Илья Морозов')).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: /Все сданные\s*3/ })).toBeInTheDocument();
+    expect(within(work).getAllByRole('option')).toHaveLength(3);
+
+    fireEvent.change(work, { target: { value: 'quiz-a' } });
+    expect(screen.getByText('Мария Воронова')).toBeInTheDocument();
+    expect(screen.getByText('Софья Лебедева')).toBeInTheDocument();
+    expect(screen.queryByText('Илья Морозов')).not.toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: /Все сданные\s*2/ })).toBeInTheDocument();
+  });
+
+  it('clears the selected work when changing or clearing the course', async () => {
+    renderPage('/submissions?course=course-a&assessment=quiz-a');
+    const course = await screen.findByRole('combobox', { name: 'Курс' });
+    fireEvent.change(course, { target: { value: 'course-b' } });
+    const work = screen.getByRole('combobox', { name: 'Работа' });
+    expect(work).toHaveValue('');
+    expect(within(work).queryByRole('option', { name: 'Лабораторная №2' })).not.toBeInTheDocument();
+    expect(screen.getByText('Никита Орлов')).toBeInTheDocument();
+    expect(screen.queryByText('Мария Воронова')).not.toBeInTheDocument();
+    fireEvent.change(work, { target: { value: 'quiz-c' } });
+    fireEvent.change(course, { target: { value: '' } });
+    expect(work).toHaveValue('');
+    expect(work).toBeDisabled();
+    expect(screen.getByText('Мария Воронова')).toBeInTheDocument();
+    expect(screen.getByTestId('location').textContent).toBe('/submissions');
+  });
+
+  it('combines saved filters with tabs and search, without changing the available options', async () => {
+    renderPage('/submissions?course=course-a&assessment=quiz-a&view=reviewed&q=Лебедева');
+    expect(await screen.findByText('Софья Лебедева')).toBeInTheDocument();
+    expect(screen.queryByText('Мария Воронова')).not.toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Работа' })).toHaveValue('quiz-a');
+    expect(within(screen.getByRole('combobox', { name: 'Работа' })).getAllByRole('option')).toHaveLength(3);
+    expect(screen.getByRole('tab', { name: /Ожидают проверки\s*1/ })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: /Проверенные\s*1/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Открыть следующую' })).toBeDisabled();
+    fireEvent.click(within(rowFor('Софья Лебедева')).getByRole('button', { name: /Открыть результат/ }));
+    expect(screen.getByTestId('location').textContent).toBe('/review/graded?course=course-a&assessment=quiz-a&view=reviewed&q=Лебедева');
+  });
+
+  it('opens the next submission only inside the selected course and search', async () => {
+    renderPage('/submissions?course=course-b&q=Никита');
+    fireEvent.click(await screen.findByRole('button', { name: 'Открыть следующую' }));
+    await waitFor(() => expect(mocks.claimSubmission).toHaveBeenCalledWith('other'));
+    expect(screen.getByTestId('location').textContent).toBe('/review/other?course=course-b&q=Никита');
+  });
+
+  it('keeps a filter with no remaining submissions instead of silently showing other work', async () => {
+    renderPage('/submissions?course=course-a&assessment=removed-work');
+    expect(await screen.findByText('По выбранным фильтрам работ нет')).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Работа' })).toHaveValue('removed-work');
+    expect(screen.getByRole('button', { name: 'Открыть следующую' })).toBeDisabled();
+    fireEvent.change(screen.getByRole('combobox', { name: 'Работа' }), { target: { value: '' } });
+    expect(screen.getByText('Мария Воронова')).toBeInTheDocument();
+  });
+});
+
 const importWarning: MoodleHistoryImportEvent = {
   id: 'import-1', aggregateId: 'assessment-1', assessmentTitle: 'Самостоятельная №1',
   state: 'PARTIAL', createdAt: '', updatedAt: '', receipt: {},
@@ -70,107 +152,33 @@ const importWarning: MoodleHistoryImportEvent = {
   }],
 };
 
-describe('import warning details and persistent acknowledgement', () => {
-  it.each(['PARTIAL', 'FAILED'])('does not show foreign student problems or a false empty-state error (%s)', async (state) => {
-    mocks.getSubmissions.mockResolvedValue([]);
-    mocks.getMoodleHistoryImportEvents.mockResolvedValue([{
-      ...importWarning, state, warnings: [], warningsDismissed: false,
-    }]);
-    renderPage();
-    expect(await screen.findByText('Сданных работ пока нет')).toBeInTheDocument();
-    expect(screen.queryByText('Синхронизация завершена с предупреждениями')).not.toBeInTheDocument();
-    expect(screen.queryByText('Часть прошлых сдач не загрузилась')).not.toBeInTheDocument();
-    expect(screen.queryByText('Общие данные синхронизации')).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Скрыть предупреждение' })).not.toBeInTheDocument();
-  });
-
-  it('lists affected students and opens the exact answer or Moodle attempt without claiming', async () => {
-    mocks.getMoodleHistoryImportEvents.mockResolvedValue([importWarning]);
-    renderPage('/submissions?view=pending');
-    const list = await screen.findByRole('list', { name: 'Ответы с проблемами синхронизации' });
-    expect(list).toHaveTextContent('Иван Иванов');
-    expect(list).toHaveTextContent('Попытка 142195 · Задание 2');
-    expect(list).toHaveTextContent('В архиве нет поддерживаемых исходников');
-    expect(within(list).getByRole('link', { name: 'Ответ в системе' })).toHaveAttribute('href', '/review/partial-answer?view=pending');
-    const external = within(list).getByRole('link', { name: 'Открыть в Moodle' });
-    expect(external).toHaveAttribute('href', importWarning.warnings![0].moodleUrl);
-    expect(external).toHaveAttribute('target', '_blank');
-    expect(external).toHaveAttribute('rel', 'noopener noreferrer');
-    expect(mocks.claimSubmission).not.toHaveBeenCalled();
-  });
-
-  it('keeps names and Moodle links when a submission was not imported at all', async () => {
-    mocks.getMoodleHistoryImportEvents.mockResolvedValue([{
-      ...importWarning, state: 'FAILED',
-      warnings: [{ ...importWarning.warnings![0], submissionId: undefined }],
-    }]);
-    renderPage();
-    expect(await screen.findByRole('alert')).toHaveTextContent('Иван Иванов');
-    expect(screen.getByRole('link', { name: 'Открыть в Moodle' })).toBeInTheDocument();
-    expect(screen.queryByRole('link', { name: 'Ответ в системе' })).not.toBeInTheDocument();
-  });
-
-  it('saves acknowledgement on the server and does not resurrect it after a stale poll or reload', async () => {
-    mocks.getMoodleHistoryImportEvents.mockResolvedValue([importWarning]);
-    const page = renderPage();
-    fireEvent.click(await screen.findByRole('button', { name: 'Скрыть предупреждение' }));
-    await waitFor(() => expect(screen.queryByText('Синхронизация завершена с предупреждениями')).not.toBeInTheDocument());
-    expect(mocks.dismissMoodleHistoryWarnings).toHaveBeenCalledWith('assessment-1', ['a'.repeat(64)]);
-    fireEvent(document, new Event('visibilitychange'));
-    await waitFor(() => expect(mocks.getMoodleHistoryImportEvents).toHaveBeenCalledTimes(3));
-    expect(screen.queryByText('Иван Иванов')).not.toBeInTheDocument();
-    expect(screen.getByText('Мария Воронова')).toBeInTheDocument();
-    page.unmount();
-    mocks.getMoodleHistoryImportEvents.mockResolvedValue([{ ...importWarning, warnings: [], warningsDismissed: true }]);
+describe('source warnings stay inside the individual review', () => {
+  it.each(['PARTIAL', 'FAILED', 'BLOCKED'])('does not show per-student %s warnings in the queue', async (state) => {
+    mocks.getMoodleHistoryImportEvents.mockResolvedValue([{ ...importWarning, state }]);
     renderPage();
     await screen.findByText('Мария Воронова');
-    expect(screen.queryByText('Синхронизация завершена с предупреждениями')).not.toBeInTheDocument();
-    expect(mocks.retryMoodleHistoryImport).not.toHaveBeenCalled();
+    expect(screen.queryByText('Иван Иванов')).not.toBeInTheDocument();
+    expect(screen.queryByText(/ARCHIVE_SOURCE_OMITTED/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Открыть в Moodle' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Скрыть предупреждение' })).not.toBeInTheDocument();
+    expect(mocks.dismissMoodleHistoryWarnings).not.toHaveBeenCalled();
   });
 
-  it('keeps a new warning arriving while a hide request is pending', async () => {
-    let finish: (ids: string[]) => void = () => {};
-    mocks.dismissMoodleHistoryWarnings.mockReturnValue(new Promise<string[]>((resolve) => { finish = resolve; }));
-    mocks.getMoodleHistoryImportEvents.mockResolvedValue([importWarning]);
-    renderPage();
-    fireEvent.click(await screen.findByRole('button', { name: 'Скрыть предупреждение' }));
-    expect(screen.getByRole('button', { name: 'Скрыть предупреждение' })).toBeDisabled();
-    mocks.getMoodleHistoryImportEvents.mockResolvedValue([{
-      ...importWarning, warnings: [...importWarning.warnings!, {
-        ...importWarning.warnings![0], id: 'b'.repeat(64), studentName: 'Пётр Петров', attemptId: '142196',
-      }],
-    }]);
-    fireEvent(document, new Event('visibilitychange'));
-    await screen.findByText('Пётр Петров');
-    await act(async () => { finish(['a'.repeat(64)]); });
-    await waitFor(() => expect(screen.queryByText('Иван Иванов')).not.toBeInTheDocument());
-    expect(screen.getByText('Пётр Петров')).toBeInTheDocument();
-    expect(screen.getByText('Синхронизация завершена с предупреждениями')).toBeInTheDocument();
-  });
-
-  it('does not hide or acknowledge a warning when saving fails', async () => {
-    mocks.getMoodleHistoryImportEvents.mockResolvedValue([importWarning]);
-    mocks.dismissMoodleHistoryWarnings.mockRejectedValue(new Error('network timeout'));
-    renderPage();
-    fireEvent.click(await screen.findByRole('button', { name: 'Скрыть предупреждение' }));
-    expect(await screen.findByText('Не удалось скрыть предупреждение')).toBeInTheDocument();
-    expect(screen.getByText('Иван Иванов')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Скрыть предупреждение' })).toBeEnabled();
-  });
-
-  it('shows all affected assessments and keeps an honest empty state after hiding warnings', async () => {
+  it.each(['PARTIAL', 'FAILED'])('does not misreport foreign student problems as an empty-state error (%s)', async (state) => {
     mocks.getSubmissions.mockResolvedValue([]);
-    mocks.getMoodleHistoryImportEvents.mockResolvedValue(Array.from({ length: 7 }, (_, index) => ({
-      ...importWarning, id: `import-${index}`, aggregateId: `assessment-${index}`, assessmentTitle: `Работа ${index}`,
-    })));
-    const page = renderPage();
-    expect(await screen.findByRole('region', { name: 'Работа 6' })).toBeInTheDocument();
-    expect(screen.getAllByRole('button', { name: 'Скрыть предупреждение' })).toHaveLength(7);
-    page.unmount();
-    mocks.getMoodleHistoryImportEvents.mockResolvedValue([{ ...importWarning, warnings: [], warningsDismissed: true }]);
+    mocks.getMoodleHistoryImportEvents.mockResolvedValue([{ ...importWarning, state, warnings: [], warningsDismissed: false }]);
+    renderPage();
+    expect(await screen.findByText('Сданных работ пока нет')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('keeps an honest empty state if answers could not be loaded, without student details', async () => {
+    mocks.getSubmissions.mockResolvedValue([]);
+    mocks.getMoodleHistoryImportEvents.mockResolvedValue([importWarning]);
     renderPage();
     expect(await screen.findByText('Список сдач пока не получен')).toBeInTheDocument();
     expect(screen.queryByText('Сданных работ пока нет')).not.toBeInTheDocument();
+    expect(screen.queryByText('Иван Иванов')).not.toBeInTheDocument();
   });
 });
 
@@ -210,7 +218,7 @@ describe('student submissions views', () => {
     }]);
     renderPage();
     await screen.findByText('Мария Воронова');
-    expect(screen.getByText(/Уже загруженные сдачи доступны для проверки/)).toBeInTheDocument();
+    if (state === 'PROCESSING') expect(screen.getByText(/Уже загруженные сдачи доступны для проверки/)).toBeInTheDocument();
     fireEvent.click(within(rowFor('Мария Воронова')).getByRole('button', { name: /^Открыть$/ }));
     expect(await screen.findByText('Экран проверки')).toBeInTheDocument();
     expect(mocks.claimSubmission).toHaveBeenCalledWith('ungraded');
@@ -225,8 +233,8 @@ describe('student submissions views', () => {
     }]);
     renderPage();
     await screen.findByText('Мария Воронова');
-    const warning = screen.getByText('Синхронизация завершена с предупреждениями').closest('[role="status"]');
-    expect(warning).toHaveTextContent('ARTIFACT_OMITTED');
+    expect(screen.queryByText('Синхронизация завершена с предупреждениями')).not.toBeInTheDocument();
+    expect(screen.queryByText(/ARTIFACT_OMITTED/)).not.toBeInTheDocument();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Открыть следующую' }));
     expect(await screen.findByText('Экран проверки')).toBeInTheDocument();
@@ -450,17 +458,15 @@ describe('student submissions views', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
-  it('names the work and actual cause rather than assuming every failure requires a login', async () => {
+  it('keeps import progress without exposing individual failures in the queue', async () => {
     mocks.getMoodleHistoryImportEvents.mockResolvedValue([
       { id: 'failed', aggregateId: 'assessment-1', assessmentTitle: 'Лабораторная №3', lastError: 'TIMEOUT: External service timed out', state: 'FAILED', createdAt: '', updatedAt: '' },
       { id: 'active', aggregateId: 'assessment-2', state: 'PROCESSING', createdAt: '', updatedAt: '' },
     ]);
     renderPage();
-    const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent('Лабораторная №3');
-    expect(alert).toHaveTextContent('Moodle не ответил вовремя');
-    expect(alert).toHaveTextContent('Другие работы продолжают загружаться');
-    expect(alert).not.toHaveTextContent('Проверьте вход');
+    expect(await screen.findByText('Загружаем прошлые сдачи из Moodle')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.queryByText('Лабораторная №3')).not.toBeInTheDocument();
   });
 
   it('explains an unrecognized Assignment table without treating it as no submissions', async () => {
@@ -471,10 +477,8 @@ describe('student submissions views', () => {
       state: 'FAILED', createdAt: '', updatedAt: '',
     }]);
     renderPage();
-    const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent('Задание №1');
-    expect(alert).toHaveTextContent('Не распознана таблица сдач Moodle');
-    expect(alert).toHaveTextContent('это не означает отсутствие работ');
+    expect(await screen.findByText('Список сдач пока не получен')).toBeInTheDocument();
+    expect(screen.queryByText(/ASSIGN_TABLE_NOT_FOUND/)).not.toBeInTheDocument();
     expect(screen.queryByText('Сданных работ пока нет')).not.toBeInTheDocument();
   });
 
@@ -485,8 +489,8 @@ describe('student submissions views', () => {
     }]);
     renderPage();
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('Часть прошлых сдач не загрузилась');
-    expect(screen.getByText('Список сдач пока не получен')).toBeInTheDocument();
+    expect(await screen.findByText('Список сдач пока не получен')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.queryByText('Сданных работ пока нет')).not.toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'К синхронизации работ' })).toHaveAttribute('href', '/courses');
   });
@@ -515,8 +519,8 @@ describe('student submissions views', () => {
     ]);
     renderPage();
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('Часть прошлых сдач не загрузилась');
-    expect(screen.getByText('Загружаем прошлые сдачи из Moodle')).toBeInTheDocument();
+    expect(await screen.findByText('Загружаем прошлые сдачи из Moodle')).toBeInTheDocument();
+    expect(screen.getByText('Список сдач пока не получен')).toBeInTheDocument();
     expect(screen.queryByText('Сданных работ пока нет')).not.toBeInTheDocument();
   });
 
@@ -542,7 +546,7 @@ describe('student submissions views', () => {
     expect(screen.getByText('Сдачи ещё загружаются')).toBeInTheDocument();
     expect(screen.queryByText('Сданных работ пока нет')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /Обновить список/ }));
-    expect(await screen.findByText('Часть прошлых сдач не загрузилась')).toBeInTheDocument();
+    expect(await screen.findByText('Список сдач пока не получен')).toBeInTheDocument();
     expect(screen.queryByText(/UNEXPECTED_|LMS_REAUTH_REQUIRED/)).not.toBeInTheDocument();
   });
 

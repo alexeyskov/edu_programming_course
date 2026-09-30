@@ -86,7 +86,7 @@ describe('plagiarism evidence panel', () => {
       </MemoryRouter>,
     );
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Плагиат' }));
+    fireEvent.click(await screen.findByRole('tab', { name: 'Плагиат' }));
 
     expect(await screen.findByText('Ответ подтверждён')).toBeInTheDocument();
     expect(screen.getByText('Ответ Moodle совпадает с отправленным через систему.')).toBeInTheDocument();
