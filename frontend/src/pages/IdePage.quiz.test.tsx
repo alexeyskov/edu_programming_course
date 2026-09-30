@@ -237,7 +237,7 @@ describe('student Moodle quiz question workspaces', () => {
     renderQuiz();
     await screen.findByLabelText('Код решения');
     expect(screen.queryByRole('tablist', { name: 'Выбор задачи' })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Завершить' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Завершить работу' })).toBeEnabled();
   });
 
   it('does not repeat standard question titles in the tabs', async () => {

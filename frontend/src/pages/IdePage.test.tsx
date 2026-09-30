@@ -84,6 +84,16 @@ beforeEach(() => {
 afterEach(() => { cleanup(); window.sessionStorage.clear(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe('student interactive console', () => {
+  it.each([true, false])('offers one clear completion action with hasTimeLimit=%s', async (hasTimeLimit) => {
+    mocks.getAttempt.mockResolvedValue({ ...attempt, hasTimeLimit });
+    renderPage();
+    await screen.findByTestId('code-workspace');
+    expect(screen.getByRole('button', { name: 'Завершить работу' })).toBeEnabled();
+    expect(screen.queryByRole('button', { name: 'Сохранить и выйти' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Сохранить и выйти/)).not.toBeInTheDocument();
+    expect(mocks.submitAttempt).not.toHaveBeenCalled();
+  });
+
   it.each([-4, 4])('uses backend time with a %s hour device offset, even after the device clock changes', async (offset) => {
     vi.useFakeTimers();
     const backend = Date.parse('2026-09-30T09:00:00Z');
@@ -125,9 +135,8 @@ describe('student interactive console', () => {
     renderPage();
     expect(await screen.findByTestId('code-workspace')).toHaveAttribute('data-read-only', 'false');
     fireEvent.click(screen.getByRole('button', { name: 'Изменить файл' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Сохранить и выйти' }));
-    expect(await screen.findByText('Вернулись к работе')).toBeInTheDocument();
-    expect(mocks.saveFile).toHaveBeenCalledOnce();
+    await waitFor(() => expect(mocks.saveFile).toHaveBeenCalledOnce());
+    expect(screen.getByTestId('code-workspace')).toHaveAttribute('data-read-only', 'false');
   });
 
   it('keeps the current code when reloading failed ancillary metadata', async () => {
@@ -137,8 +146,7 @@ describe('student interactive console', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Изменить файл' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Повторить загрузку дополнительных данных' }));
     await waitFor(() => expect(mocks.getHistory).toHaveBeenCalledTimes(2));
-    fireEvent.click(screen.getByRole('button', { name: 'Сохранить и выйти' }));
-    await screen.findByText('Вернулись к работе');
+    await waitFor(() => expect(mocks.saveFile).toHaveBeenCalledOnce());
     expect(mocks.getAttempt).toHaveBeenCalledOnce();
     expect(mocks.saveFile).toHaveBeenCalledWith('attempt-1', expect.objectContaining({ content: 'int main() { return 1; }' }), 0, 'typing', undefined, undefined);
   });
@@ -180,8 +188,7 @@ describe('student interactive console', () => {
     renderPage(); await screen.findByTestId('code-workspace');
     fireEvent.click(screen.getByRole('button', { name: 'Внутренняя вставка' }));
     fireEvent.click(screen.getByRole('button', { name: 'Изменить файл' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Сохранить и выйти' }));
-    await screen.findByText('Вернулись к работе');
+    await waitFor(() => expect(mocks.saveFile).toHaveBeenCalledTimes(2));
     expect(mocks.saveFile).toHaveBeenNthCalledWith(1, 'attempt-1', expect.objectContaining({ content: 'int main() {}int' }), 0, 'internal_paste', 'receipt-1', { offset: 13, deleteCount: 0 });
     expect(mocks.saveFile).toHaveBeenNthCalledWith(2, 'attempt-1', expect.objectContaining({ content: 'int main() { return 1; }' }), 1, 'typing', undefined, undefined);
   });
@@ -231,7 +238,7 @@ describe('student interactive console', () => {
     mocks.getAttempt.mockResolvedValue({ ...attempt, moodleSyncTimeoutSeconds: 300 });
     renderPage();
     await screen.findByTestId('code-workspace');
-    fireEvent.click(screen.getByRole('button', { name: 'Завершить' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Завершить работу' }));
     fireEvent.click(screen.getByRole('button', { name: 'Сдать ревизию 0' }));
     await waitFor(() => expect(mocks.submitAttempt).toHaveBeenCalledTimes(1));
   });
@@ -242,7 +249,7 @@ describe('student interactive console', () => {
     await screen.findByTestId('code-workspace');
     expect(screen.getAllByText('Без таймера')).toHaveLength(2);
     expect(screen.queryByText(/В сессии ·/)).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Завершить' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Завершить работу' }));
     expect(screen.queryByText('Время в сессии')).not.toBeInTheDocument();
     expect(screen.queryByText('Осталось времени')).not.toBeInTheDocument();
   });
@@ -255,28 +262,31 @@ describe('student interactive console', () => {
     expect(screen.getByText(/В сессии ·/)).toBeInTheDocument();
   });
 
-  it('saves and leaves without submitting the attempt, waiting for acknowledgement', async () => {
+  it('saves pending edits before completing the work, waiting for acknowledgement', async () => {
     let acknowledge!: (value: { revision: number }) => void;
     mocks.saveFile.mockReturnValue(new Promise((resolve) => { acknowledge = resolve; }));
     renderPage();
     await screen.findByTestId('code-workspace');
     fireEvent.click(screen.getByRole('button', { name: 'Изменить файл' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Сохранить и выйти' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Завершить работу' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Сдать ревизию 0' }));
     expect(screen.queryByText('Вернулись к работе')).not.toBeInTheDocument();
     expect(screen.getByTestId('code-workspace')).toHaveAttribute('data-read-only', 'true');
-    await act(async () => acknowledge({ revision: 1 }));
-    expect(await screen.findByText('Вернулись к работе')).toBeInTheDocument();
-    expect(mocks.saveFile).toHaveBeenCalledWith('attempt-1', expect.objectContaining({ content: 'int main() { return 1; }' }), 0, 'typing', undefined, undefined);
     expect(mocks.submitAttempt).not.toHaveBeenCalled();
+    await act(async () => acknowledge({ revision: 1 }));
+    expect(await screen.findByRole('heading', { name: 'Передаём работу в Moodle…' })).toBeInTheDocument();
+    expect(mocks.saveFile).toHaveBeenCalledWith('attempt-1', expect.objectContaining({ content: 'int main() { return 1; }' }), 0, 'typing', undefined, undefined);
+    expect(mocks.submitAttempt).toHaveBeenCalledWith('attempt-1', 1);
   });
 
-  it('stays with the code when save-and-exit fails', async () => {
+  it('keeps the code and does not submit when saving before completion fails', async () => {
     mocks.saveFile.mockRejectedValue(new Error('Network unavailable'));
     renderPage();
     await screen.findByTestId('code-workspace');
     fireEvent.click(screen.getByRole('button', { name: 'Изменить файл' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Сохранить и выйти' }));
-    expect(await screen.findByText('Не удалось сохранить работу')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Завершить работу' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Сдать ревизию 0' }));
+    expect(await screen.findByText('Не удалось завершить работу')).toBeInTheDocument();
     expect(screen.queryByText('Вернулись к работе')).not.toBeInTheDocument();
     expect(mocks.submitAttempt).not.toHaveBeenCalled();
   });
@@ -377,7 +387,7 @@ describe('student interactive console', () => {
     expect(run.nextElementSibling).toBe(close);
     expect(run.closest('.bottom-panel')).not.toBeNull();
     expect(run.closest('.ide-toolbar')).toBeNull();
-    expect(screen.getByRole('button', { name: 'Завершить' }).closest('.ide-toolbar')).not.toBeNull();
+    expect(screen.getByRole('button', { name: 'Завершить работу' }).closest('.ide-toolbar')).not.toBeNull();
     fireEvent.click(close);
     expect(screen.getByRole('button', { name: 'Запустить' })).toBe(run);
   });
@@ -437,7 +447,7 @@ describe('student interactive console', () => {
     renderPage();
     expect((await screen.findAllByText('Интерактивный ввод')).length).toBeGreaterThan(0);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Завершить' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Завершить работу' }));
 
     expect(screen.getByText('Последнее сохранение в Moodle')).toBeInTheDocument();
     expect(screen.queryByText('LMS checkpoint')).not.toBeInTheDocument();
@@ -461,7 +471,7 @@ describe('student interactive console', () => {
     renderPage();
     await screen.findByTestId('code-workspace');
 
-    fireEvent.click(screen.getByRole('button', { name: 'Завершить' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Завершить работу' }));
     fireEvent.click(screen.getByRole('button', { name: 'Сдать ревизию 0' }));
 
     expect(await screen.findByRole('heading', { name: 'Передаём работу в Moodle…' })).toBeInTheDocument();
@@ -488,7 +498,7 @@ describe('student interactive console', () => {
     renderPage();
     await screen.findByTestId('code-workspace');
 
-    fireEvent.click(screen.getByRole('button', { name: 'Завершить' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Завершить работу' }));
     fireEvent.click(screen.getByRole('button', { name: 'Сдать ревизию 0' }));
     await screen.findByRole('heading', { name: 'Передаём работу в Moodle…' });
     const slowTimer = timeoutSpy.mock.calls.find(([, delay]) => delay === 12_000)?.[0];
@@ -520,7 +530,7 @@ describe('student interactive console', () => {
     renderPage();
     await screen.findByTestId('code-workspace');
 
-    fireEvent.click(screen.getByRole('button', { name: 'Завершить' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Завершить работу' }));
     fireEvent.click(screen.getByRole('button', { name: 'Сдать ревизию 0' }));
 
     expect(await screen.findByText('Moodle подтвердил получение ответа и завершение попытки.')).toBeInTheDocument();
@@ -550,7 +560,7 @@ describe('student interactive console', () => {
     renderPage();
     await screen.findByTestId('code-workspace');
 
-    fireEvent.click(screen.getByRole('button', { name: 'Завершить' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Завершить работу' }));
     fireEvent.click(screen.getByRole('button', { name: 'Сдать ревизию 0' }));
     expect(await screen.findByRole('heading', { name: 'Moodle не подтвердил сдачу' })).toBeInTheDocument();
 

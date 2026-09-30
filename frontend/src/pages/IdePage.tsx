@@ -53,9 +53,7 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
   const mountedRef = useRef(true);
   const loadGenerationRef = useRef(0);
   const switchingQuestionRef = useRef(false);
-  const leavingRef = useRef(false);
   const submittingRef = useRef(false);
-  const [leaving, setLeaving] = useState(false);
   const [switchingQuestionId, setSwitchingQuestionId] = useState<string | null>(null);
   const [attempt, setAttempt] = useState<Attempt | null>(null);
   const [files, setFiles] = useState<WorkspaceFile[]>([]);
@@ -423,7 +421,7 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
     window.addEventListener('beforeunload', warn); return () => window.removeEventListener('beforeunload', warn);
   }, []);
   const locked = !attempt || attempt.status !== 'ACTIVE' || Boolean(now !== null && attempt.deadlineAt && new Date(attempt.deadlineAt).getTime() <= now);
-  const editorReadOnly = locked || Boolean(switchingQuestionId) || submitting || leaving;
+  const editorReadOnly = locked || Boolean(switchingQuestionId) || submitting;
   const untimed = attempt?.hasTimeLimit === false && !attempt.deadlineAt && !attempt.expectedEndAt;
   const quizQuestions = attempt?.quizSession?.questions ?? [];
   const multiQuestion = quizQuestions.length > 1;
@@ -431,7 +429,7 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
   const interactiveActive = Boolean(interactiveRun && !interactiveRun.terminal);
 
   function changeFile(fileId: string, content: string, source: 'typing' | 'internal_paste', receiptId?: string, pasteRange?: InternalPasteRange) {
-    if (!mountedRef.current || locked || !attempt || lmsFinalizedRef.current || switchingQuestionRef.current || leavingRef.current || submittingRef.current) return;
+    if (!mountedRef.current || locked || !attempt || lmsFinalizedRef.current || switchingQuestionRef.current || submittingRef.current) return;
     const updated = latestFiles.current.map((file) => file.id === fileId ? { ...file, content } : file);
     const changedFile = updated.find((file) => file.id === fileId);
     if (!changedFile) return;
@@ -505,7 +503,7 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
 
   async function switchQuestion(targetAttemptId: string) {
     const current = attemptRef.current;
-    if (!current || targetAttemptId === current.id || switchingQuestionRef.current || leavingRef.current || running || submitting || lmsFinalizedRef.current) return;
+    if (!current || targetAttemptId === current.id || switchingQuestionRef.current || running || submitting || lmsFinalizedRef.current) return;
     if (!current.quizSession?.questions.some((question) => question.attemptId === targetAttemptId)) return;
     switchingQuestionRef.current = true;
     setSwitchingQuestionId(targetAttemptId);
@@ -533,25 +531,6 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
         switchingQuestionRef.current = false;
         setSwitchingQuestionId(null);
       }
-    }
-  }
-
-  async function saveAndLeave() {
-    if (!attemptRef.current || leavingRef.current || switchingQuestionRef.current || submitting) return;
-    leavingRef.current = true;
-    setLeaving(true);
-    try {
-      await ensureSaved();
-      const active = interactiveRunRef.current;
-      if (active && !active.terminal) await api.stopInteractiveAttempt(attemptRef.current.id, active.sessionId);
-      if (mountedRef.current && !lmsFinalizedRef.current) navigate(`/assessments/${attemptRef.current.assessmentId}`);
-    } catch (caught) {
-      if (mountedRef.current && !handleLmsFinalizedError(caught)) {
-        toast.push('error', 'Не удалось сохранить работу', 'Не закрывайте вкладку: дождитесь сохранения или повторите попытку.');
-      }
-    } finally {
-      leavingRef.current = false;
-      if (mountedRef.current) setLeaving(false);
     }
   }
 
@@ -729,7 +708,7 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
   if (error || !attempt) return <InlineError message={error ?? 'Попытка не найдена'} retry={() => void load()} />;
   return <div className="ide-page">
     {metadataError && <div role="alert">Не удалось загрузить историю или данные курса. Код доступен для редактирования и сдачи. <Button variant="ghost" loading={metadataLoading} onClick={() => void loadMetadata(attempt, loadGenerationRef.current)}>Повторить загрузку дополнительных данных</Button></div>}
-    <div className="ide-toolbar"><div className="ide-title"><span><small>{locked ? 'Только чтение' : 'Активная попытка'}</small><strong>{attempt.title}</strong></span></div><div className="ide-status"><span className={cn('save-state', `save-state--${saveState}`)}><Cloud size={15} />{saveState === 'saved' ? `Сохранено · r${attempt.acknowledgedRevision}` : saveState === 'saving' ? 'Сохраняем…' : saveState === 'offline' ? 'Нет связи · очередь хранится в этой вкладке' : saveState === 'closed' ? 'Сеанс завершён в Moodle' : 'Ошибка сохранения'}</span>{untimed ? <span>Без таймера</span> : <span title={attempt.deadlineAt || attempt.expectedEndAt ? 'Примерное оставшееся время по текущей сессии Moodle' : 'Примерное время с начала сессии'}><Clock3 size={16} /><strong>{attempt.deadlineAt || attempt.expectedEndAt ? remaining : `В сессии · ${remaining}`}</strong></span>}{now !== null && <span className="server-time">Время сервера: {new Intl.DateTimeFormat('ru', { timeZone: 'UTC', hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(now)} UTC</span>}</div><div className="ide-actions">{!locked && <Button variant="ghost" loading={leaving} disabled={Boolean(switchingQuestionId) || submitting || running} onClick={() => void saveAndLeave()}>Сохранить и выйти</Button>}{attempt.aiEnabled && <Button variant="ghost" disabled={Boolean(switchingQuestionId)} onClick={() => setAiOpen(true)}><Bot size={17} /> Помощь ИИ</Button>}<Button onClick={() => setSubmitOpen(true)} disabled={editorReadOnly || running}><CircleStop size={16} /> {multiQuestion ? 'Завершить работу' : 'Завершить'}</Button></div></div>
+    <div className="ide-toolbar"><div className="ide-title"><span><small>{locked ? 'Только чтение' : 'Активная попытка'}</small><strong>{attempt.title}</strong></span></div><div className="ide-status"><span className={cn('save-state', `save-state--${saveState}`)}><Cloud size={15} />{saveState === 'saved' ? `Сохранено · r${attempt.acknowledgedRevision}` : saveState === 'saving' ? 'Сохраняем…' : saveState === 'offline' ? 'Нет связи · очередь хранится в этой вкладке' : saveState === 'closed' ? 'Сеанс завершён в Moodle' : 'Ошибка сохранения'}</span>{untimed ? <span>Без таймера</span> : <span title={attempt.deadlineAt || attempt.expectedEndAt ? 'Примерное оставшееся время по текущей сессии Moodle' : 'Примерное время с начала сессии'}><Clock3 size={16} /><strong>{attempt.deadlineAt || attempt.expectedEndAt ? remaining : `В сессии · ${remaining}`}</strong></span>}{now !== null && <span className="server-time">Время сервера: {new Intl.DateTimeFormat('ru', { timeZone: 'UTC', hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(now)} UTC</span>}</div><div className="ide-actions">{attempt.aiEnabled && <Button variant="ghost" disabled={Boolean(switchingQuestionId)} onClick={() => setAiOpen(true)}><Bot size={17} /> Помощь ИИ</Button>}<Button onClick={() => setSubmitOpen(true)} disabled={editorReadOnly || running}><CircleStop size={16} /> Завершить работу</Button></div></div>
     {multiQuestion && <nav className="ide-question-switcher" aria-label="Задачи работы" aria-busy={Boolean(switchingQuestionId)}>
       <span className="ide-question-switcher__label">{switchingQuestionId ? 'Сохраняем и переключаем…' : 'Задачи работы'}</span>
       <div className="ide-question-switcher__tabs" role="tablist" aria-label="Выбор задачи">
@@ -745,7 +724,7 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
           {statementOpen && <div><span className="eyebrow">Условие</span><h2>{attempt.title}</h2></div>}
         </header>
         {!statementOpen && <span className="condition-panel__rail-label" aria-hidden="true">Задание</span>}
-        <div id="attempt-condition" className="condition-body" hidden={!statementOpen}><p className="condition-statement">{attempt.statement || 'Текст условия пока не получен. Обновите страницу или сообщите преподавателю.'}</p><h3>Параметры рабочей области</h3><dl className="condition-facts"><div><dt>Файлы</dt><dd>{attempt.fileMode === 'MULTI' ? 'Многофайловый режим' : 'Один исходный файл'}</dd></div><div><dt>Срок</dt><dd>{untimed ? 'Без таймера' : attempt.deadlineAt || attempt.expectedEndAt ? `Около ${remaining}` : 'Контролируется Moodle'}</dd></div><div><dt>Помощник</dt><dd>{attempt.aiEnabled ? 'Доступен' : 'Отключён'}</dd></div></dl>{untimed && <p>Код сохраняется автоматически. Нажмите «Сохранить и выйти», чтобы продолжить позже. «Завершить» сдаёт работу.</p>}<div className="rules-card"><Info size={16} /><div><strong>Политика вставки</strong><p>{attempt.pastePolicy === 'STRICT' ? 'Копируйте код прямо из редактора. Его можно вставлять в другие файлы и задачи этой работы в рамках текущей попытки. Внешняя вставка запрещена.' : 'Вставка разрешена политикой этой работы.'}</p></div></div></div>
+        <div id="attempt-condition" className="condition-body" hidden={!statementOpen}><p className="condition-statement">{attempt.statement || 'Текст условия пока не получен. Обновите страницу или сообщите преподавателю.'}</p><h3>Параметры рабочей области</h3><dl className="condition-facts"><div><dt>Файлы</dt><dd>{attempt.fileMode === 'MULTI' ? 'Многофайловый режим' : 'Один исходный файл'}</dd></div><div><dt>Срок</dt><dd>{untimed ? 'Без таймера' : attempt.deadlineAt || attempt.expectedEndAt ? `Около ${remaining}` : 'Контролируется Moodle'}</dd></div><div><dt>Помощник</dt><dd>{attempt.aiEnabled ? 'Доступен' : 'Отключён'}</dd></div></dl>{untimed && <p>Код сохраняется автоматически. Нажмите «Завершить работу», чтобы сдать работу.</p>}<div className="rules-card"><Info size={16} /><div><strong>Политика вставки</strong><p>{attempt.pastePolicy === 'STRICT' ? 'Копируйте код прямо из редактора. Его можно вставлять в другие файлы и задачи этой работы в рамках текущей попытки. Внешняя вставка запрещена.' : 'Вставка разрешена политикой этой работы.'}</p></div></div></div>
       </aside>
       <section className={cn('ide-center', !bottomPanelOpen && 'ide-center--bottom-collapsed')}><div className="ide-editor">
         <aside className="workspace-files-rail" aria-label="Управление панелью файлов"><button type="button" title={filesPanelOpen ? 'Скрыть файлы' : 'Показать файлы'} aria-label={filesPanelOpen ? 'Скрыть файлы' : 'Показать файлы'} aria-controls="student-file-explorer" aria-expanded={filesPanelOpen} onClick={() => setFilesPanelOpen((value) => !value)}>{filesPanelOpen ? <PanelLeftClose size={18} /> : <PanelLeftOpen size={18} />}</button><span aria-hidden="true">Файлы</span></aside>
