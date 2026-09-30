@@ -205,12 +205,12 @@ export function CoursesPage() {
 
     <div className="filter-bar">
       <div className="search-input"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Найти работу" /></div>
-      <select aria-label="Тип работы" value={typeFilter} onChange={(event) => setTypeFilter(event.target.value)}>
+      <div className="filter-select"><select aria-label="Тип работы" value={typeFilter} onChange={(event) => setTypeFilter(event.target.value)}>
         <option value="ALL">Все типы</option><option value="LAB">Лабораторные</option><option value="INDEPENDENT">Самостоятельные</option><option value="CONTROL">Контрольные</option><option value="EXAM">Экзамены</option>
-      </select>
-      <select aria-label="Статус" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
+      </select></div>
+      <div className="filter-select"><select aria-label="Статус" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
         <option value="ALL">Все статусы</option>{primaryRole === 'TEACHER' && <option value="DRAFT">Не включена</option>}<option value="AVAILABLE">Доступно</option><option value="IN_PROGRESS">В работе</option><option value="GRADED">Проверено</option><option value="CLOSED">Закрыто</option>
-      </select>
+      </select></div>
     </div>
 
     <div className="course-detail-list">

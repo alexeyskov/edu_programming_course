@@ -53,6 +53,29 @@ describe('teacher courses page', () => {
   const course = { id: 'course-1', title: 'C++', shortName: 'C++', syncStatus: 'SYNCED', role: 'TEACHER' };
   const assessment = { id: 'assessment-1', courseId: 'course-1', title: 'Работа 1', kind: 'LAB', status: 'AVAILABLE', standard: 'C++20', fileMode: 'SINGLE' };
 
+  it('keeps both inset-arrow selectors accessible and combines their filters', async () => {
+    mocks.getCourses.mockResolvedValue([course]);
+    mocks.getAssessments.mockResolvedValue([
+      assessment,
+      { ...assessment, id: 'exam', title: 'Экзамен 1', kind: 'EXAM' },
+      { ...assessment, id: 'closed', title: 'Экзамен 2', kind: 'EXAM', status: 'CLOSED' },
+    ]);
+    render(<MemoryRouter><ToastProvider><CoursesPage /></ToastProvider></MemoryRouter>);
+    fireEvent.click(await screen.findByRole('button', { name: 'Развернуть список работ курса C++' }));
+    const type = screen.getByRole('combobox', { name: 'Тип работы' });
+    const status = screen.getByRole('combobox', { name: 'Статус' });
+    expect(type.parentElement).toHaveClass('filter-select');
+    expect(status.parentElement).toHaveClass('filter-select');
+    fireEvent.change(type, { target: { value: 'EXAM' } });
+    fireEvent.change(status, { target: { value: 'AVAILABLE' } });
+    expect(screen.getByRole('link', { name: /Экзамен 1/ })).toBeVisible();
+    expect(screen.queryByRole('link', { name: /Работа 1|Экзамен 2/ })).not.toBeInTheDocument();
+    fireEvent.change(type, { target: { value: 'ALL' } });
+    fireEvent.change(status, { target: { value: 'ALL' } });
+    expect(screen.getByRole('link', { name: /Работа 1/ })).toBeVisible();
+    expect(screen.getByRole('link', { name: /Экзамен 2/ })).toBeVisible();
+  });
+
   it('labels and filters a published Moodle work with every group revoked as not enabled', async () => {
     mocks.getCourses.mockResolvedValue([course]);
     mocks.getAssessments.mockResolvedValue([{ ...assessment, publicationStatus: 'PUBLISHED', policy: { moodle_metadata_read_only: true }, availabilityRules: [] }]);

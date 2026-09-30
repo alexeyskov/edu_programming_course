@@ -438,6 +438,7 @@ code, pre { font-family: 'JetBrains Mono', monospace; }
 .courses-page > .page-heading, .submissions-page > .page-heading, .task-bank-page > .page-heading { margin-bottom: 0; }
 .filter-bar { margin-bottom: 0; gap: 12px; }
 .filter-bar select { min-width: 164px; height: 44px; padding: 9px 34px 9px 12px; font-size: 12px; }
+.filter-bar .filter-select select { display: block; width: 100%; appearance: none; padding-right: 40px; }
 .search-input svg { left: 14px; top: 13px; }
 .search-input input { height: 44px; padding: 9px 12px 9px 42px; font-size: 12px; }
 .course-detail-list { gap: 20px; }
@@ -509,6 +510,7 @@ code, pre { font-family: 'JetBrains Mono', monospace; }
   .filter-bar { flex-wrap: wrap; }
   .filter-bar .search-input { flex: 1 0 100%; }
   .filter-bar select { min-width: 0; flex: 1; }
+  .filter-bar .filter-select { min-width: 0; flex: 1; }
   .queue-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
   .queue-stats .card { min-height: 76px; }
   .course-detail > header { flex-wrap: wrap; }
@@ -533,8 +535,8 @@ code, pre { font-family: 'JetBrains Mono', monospace; }
 .submission-filter > span { color: var(--muted); font-size: 12px; }
 .submission-filters .submission-filter select { width: 100%; min-width: 0; text-overflow: ellipsis; }
 .submission-filter select:disabled { opacity: .6; cursor: not-allowed; }
-.submission-filter { position: relative; }
-.submission-filter::after { content: ''; position: absolute; right: 16px; bottom: 19px; width: 7px; height: 7px; border-right: 1.5px solid var(--muted); border-bottom: 1.5px solid var(--muted); transform: rotate(45deg); pointer-events: none; }
+.submission-filter, .filter-select { position: relative; }
+.submission-filter::after, .filter-select::after { content: ''; position: absolute; right: 16px; bottom: 19px; width: 7px; height: 7px; border-right: 1.5px solid var(--muted); border-bottom: 1.5px solid var(--muted); transform: rotate(45deg); pointer-events: none; }
 .submission-filters .submission-filter select { appearance: none; padding-right: 40px; }
 .review-task { padding: 4px 0; }
 .review-task h3 { margin: 0 0 14px; font-size: 16px; }
