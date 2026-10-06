@@ -172,6 +172,7 @@ class AssessmentStudentRead(ReadModel):
 class AssessmentTeacherRead(AssessmentStudentRead):
     section_id: UUID | None = None
     teacher_ai_enabled: bool
+    ai_review_enabled: bool = False
     decision_support_enabled: bool
     policy: JsonObject = Field(default_factory=dict)
     items: list[AssessmentItemTeacherRead] = Field(default_factory=list)
@@ -179,6 +180,10 @@ class AssessmentTeacherRead(AssessmentStudentRead):
     created_by_id: UUID
     created_at: datetime
     updated_at: datetime
+
+
+class AIReviewPolicyUpdateRequest(MutationModel):
+    enabled: bool
 
 
 class AssessmentValidateRequest(EmptyMutation):

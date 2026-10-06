@@ -1,0 +1,10 @@
+.monaco-editor .ai-review-line {
+  background-color: rgba(177, 139, 66, 0.09);
+}
+
+.monaco-editor .ai-review-gutter {
+  border-left: 2px solid rgba(177, 139, 66, 0.7);
+  margin-left: 3px;
+}
+.ai-selection-action { padding: 7px 11px; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 3px 12px #0002; color: var(--purple); background: var(--surface); font: 600 13px/1.4 system-ui, sans-serif; cursor: pointer; }
+.ai-selection-action:hover, .ai-selection-action:focus-visible { border-color: var(--purple); background: var(--purple-soft); }

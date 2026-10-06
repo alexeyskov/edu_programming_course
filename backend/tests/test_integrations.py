@@ -629,6 +629,12 @@ async def test_ai_passes_the_complete_task_and_all_source_files(api_style, mode)
         if mode == "STUDENT":
             assert "Never write code" in system
             assert "short snippet" in system
+            assert "A selected fragment is only a focus marker" not in system
+        else:
+            assert "A selected fragment is only a focus marker" in system
+            assert "Silently account for selection boundaries" in system
+            assert "about clipping or highlighting artifacts" in system
+            assert "it exists in the complete source" in system
         reply = "Проверьте свойства: https://en.cppreference.com/w/cpp/string"
         result = (
             {"choices": [{"message": {"content": reply}}]} if api_style == "chat"

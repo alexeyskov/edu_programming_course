@@ -2,12 +2,23 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
 
-from app.models.attempts import Attempt, Snapshot, Submission, Workspace
+from app.api.reviews import get_submission
+from app.auth.context import AuthContext
+from app.models.attempts import (
+    Attempt,
+    EditEvent,
+    RunRequest,
+    Snapshot,
+    Submission,
+    Workspace,
+    WorkspaceFile,
+)
 from app.models.courses import Course
 from app.models.identity import ExternalPrincipal, LMSConnection
 from app.models.integration import LMSSubmissionFingerprint, SyncOutbox
@@ -256,6 +267,193 @@ def test_canonical_moodle_text_preserves_program_formatting() -> None:
 
     assert canonical_moodle_text_bytes(source) == (b"\tint main() {\n\n  return 0;\t \n}")
     assert canonical_moodle_text_bytes(source.encode()) == canonical_moodle_text_bytes(source)
+
+
+async def _local_writing_events(db):
+    delivery = await db.scalar(select(LMSSubmissionFingerprint))
+    snapshot = await db.get(Snapshot, delivery.snapshot_id)
+    snapshot.revision = 3
+    snapshot.created_at = delivery.delivered_at
+    path = "src/main.cpp"
+    main = WorkspaceFile(
+        workspace_id=snapshot.workspace_id, path=path,
+        content="int main() {}", content_hash="a" * 64,
+    )
+    deleted = WorkspaceFile(
+        workspace_id=snapshot.workspace_id, path="include/unused.h", content="",
+        content_hash="b" * 64, created_revision=1, deleted_revision=3,
+    )
+    db.add_all([main, deleted])
+    await db.flush()
+    snapshot.files = [{
+        "id": str(main.id), "path": path,
+        "content": main.content, "content_hash": main.content_hash,
+    }]
+    rows = [
+        (1, deleted, "FILE_CREATE", {
+            "type": "file_create", "path": deleted.path, "content_hash": "b" * 64,
+        }),
+        (2, main, "REPLACE_CONTENT", {
+            "type": "contiguous_delta", "offset": 0, "delete_count": 0,
+            "insert_text": main.content, "offset_encoding": "unicode_codepoint",
+            "previous_content_hash": "0" * 64, "content_hash": "a" * 64,
+        }),
+        (3, deleted, "FILE_DELETE", {
+            "type": "file_delete", "path": deleted.path, "content_hash": "b" * 64,
+        }),
+        (4, main, "REPLACE_CONTENT", {
+            "type": "contiguous_delta", "offset": 0, "delete_count": 0,
+            "insert_text": "// later", "offset_encoding": "unicode_codepoint",
+            "previous_content_hash": "a" * 64, "content_hash": "c" * 64,
+        }),
+    ]
+    for sequence, file, event_type, change in rows:
+        db.add(EditEvent(
+            workspace_id=snapshot.workspace_id, epoch=1, sequence=sequence,
+            client_request_id=f"history-{sequence}", event_type=event_type, file_id=file.id,
+            changes=[change], event_hash=f"{sequence:064x}",
+            received_at=delivery.delivered_at + timedelta(seconds=sequence - 4),
+        ))
+    for seconds, origin in [
+        (-1, "STUDENT_ATTEMPT"), (10, "STUDENT_ATTEMPT"), (-1, "TEACHER_EXPERIMENT"),
+    ]:
+        db.add(RunRequest(
+            attempt_id=delivery.attempt_id, requested_by_id=delivery.principal_id,
+            origin=origin, revision=3, build_profile="cpp-clang-c++20-multi",
+            created_at=delivery.delivered_at + timedelta(seconds=seconds),
+        ))
+    db.add(Snapshot(
+        workspace_id=snapshot.workspace_id, revision=4, manifest_hash="c" * 64,
+        files=[], reason="PERIODIC", created_at=delivery.delivered_at + timedelta(seconds=10),
+    ))
+    await db.flush()
+    return delivery
+
+
+async def _review_import(db, submission, attempt):
+    snapshot = await db.get(Snapshot, submission.snapshot_id)
+    snapshot.reason = "LMS_IMPORT"
+    await db.flush()
+    return await get_submission(submission.id, AuthContext(
+        principal_id=attempt.principal_id, display_name="System reviewer",
+        session_id=uuid.uuid4(), session_key="test", roles=("TEACHER",),
+        capabilities=("SYSTEM_SETTINGS",),
+    ), db)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["ESSAY_ONLINE_TEXT", "ASSIGN_FILE"])
+async def test_verified_moodle_readback_recovers_file_history_from_exact_local_snapshot(
+    db, transport,
+):
+    content = b"int main() {}"
+    response = {"answer_text": content.decode()} if transport == "ESSAY_ONLINE_TEXT" else {
+        "artifacts": [{
+            "filename": "submission.zip", "downloaded": True,
+            "content_base64": base64.b64encode(content).decode(),
+        }],
+    }
+    submission, attempt, _ = await _origin_case(
+        db, answer_transport=transport, delivered_content=content,
+        imported_receipt={
+            "lms_response_observations": historical_response_observations({
+                "responses": [response],
+            }),
+        },
+    )
+    await _local_writing_events(db)
+
+    result = await _review_import(db, submission, attempt)
+
+    assert result.origin_verification.state == "VERIFIED"
+    edits = [row for row in result.history if row.type == "edit"]
+    assert [(row.label, row.file_path, row.revision) for row in edits] == [
+        ("Создание файла", "include/unused.h", 1),
+        ("Изменение файла", "src/main.cpp", 2),
+        ("Удаление файла", "include/unused.h", 3),
+    ]
+    assert len([row for row in result.history if row.type == "run"]) == 1
+    assert max(row.revision for row in result.history) == 3
+    assert result.history[-1].label == "Синхронизировано с Moodle"
+    assert all(row.detail != "История редактирования в Moodle недоступна" for row in result.history)
+    # Read-back repairs display on every read without mutating the imported answer.
+    again = await _review_import(db, submission, attempt)
+    assert [row.id for row in again.history] == [row.id for row in result.history]
+    assert again.files == result.files == []
+    assert submission.source == "MOODLE_IMPORT"
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_history_is_available_without_a_local_submission(db):
+    observations = historical_response_observations({
+        "responses": [{"answer_text": "int main() {}"}],
+    })
+    submission, attempt, _ = await _origin_case(
+        db, imported_receipt={"lms_response_observations": observations},
+    )
+    delivery = await _local_writing_events(db)
+    local_submission = await db.get(Submission, delivery.submission_id)
+    delivery.submission_id = None
+    await db.flush()
+    await db.delete(local_submission)
+    await db.flush()
+
+    result = await _review_import(db, submission, attempt)
+
+    assert len([row for row in result.history if row.type == "edit"]) == 3
+    assert result.history[-1].label == "Синхронизировано с Moodle"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [
+    "changed", "incomplete", "other_attempt", "other_question",
+    "other_student", "other_course", "no_delivery", "missing_identity",
+])
+async def test_unverified_moodle_history_never_borrows_another_answer_history(db, case):
+    observations = historical_response_observations({
+        "responses": [{"answer_text": "int main() {}"}],
+    })
+    receipt = {"lms_response_observations": observations}
+    if case == "changed":
+        receipt["lms_response_observations"] = historical_response_observations({
+            "responses": [{"answer_text": "different code"}],
+        })
+    elif case == "incomplete":
+        receipt["lms_response_observations_complete"] = False
+    elif case == "other_attempt":
+        receipt["moodle_parent_attempt_id"] = "another-attempt"
+    elif case == "other_question":
+        receipt["moodle_response_id"] = "2"
+    elif case == "missing_identity":
+        receipt["lms_cmid"] = ""
+        receipt["lms_module"] = ""
+    submission, attempt, assessment = await _origin_case(db, imported_receipt=receipt)
+    delivery = await _local_writing_events(db)
+    if case == "other_student":
+        principal = await db.get(ExternalPrincipal, attempt.principal_id)
+        other = ExternalPrincipal(
+            connection_id=principal.connection_id, external_subject="other", display_name="Other",
+        )
+        db.add(other)
+        await db.flush()
+        delivery.principal_id = other.id
+    elif case == "other_course":
+        course = await db.get(Course, assessment.course_id)
+        other = Course(
+            connection_id=course.connection_id, external_id="another-course", title="Other",
+        )
+        db.add(other)
+        await db.flush()
+        delivery.course_id = other.id
+    elif case == "no_delivery":
+        await db.delete(delivery)
+    await db.flush()
+
+    result = await _review_import(db, submission, attempt)
+
+    assert len(result.history) == 1
+    assert result.history[0].label == "Импортировано из Moodle"
+    assert result.history[0].detail == "История редактирования в Moodle недоступна"
 
 
 def test_historical_response_observations_cover_essay_and_exact_file() -> None:

@@ -176,6 +176,7 @@ export interface Assessment {
   standard: string;
   pastePolicy: 'STRICT' | 'ALLOW';
   aiEnabled: boolean;
+  aiReviewEnabled?: boolean;
   reviewRequired?: boolean;
   decisionSupportEnabled?: boolean;
   availabilityRules?: AvailabilityRule[];
@@ -185,6 +186,32 @@ export interface Assessment {
   taskVersionIds?: string[];
   policy?: Record<string, unknown>;
   requiresLiveLmsPreparation?: boolean;
+}
+
+export interface AiCodeFinding {
+  path: string;
+  line: number;
+  endLine?: number;
+  severity: 'warning' | 'info' | 'error';
+  message: string;
+}
+
+export interface AiCodeReview {
+  id?: string;
+  enabled: boolean;
+  automatic?: boolean;
+  state: 'DISABLED' | 'UNAVAILABLE' | 'NOT_STARTED' | 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+  attemptCount?: number;
+  maxAttempts?: number;
+  summary: string;
+  recommendedGrade?: number | null;
+  recommendedComment?: string;
+  recommendationStatus?: 'NONE' | 'PENDING' | 'APPROVED' | 'DISCARDED';
+  moodleRefreshState?: string;
+  moodleRefreshError?: string;
+  findings: AiCodeFinding[];
+  model?: string;
+  error?: string;
 }
 
 export interface InternalPasteRange {
@@ -295,11 +322,26 @@ export interface ClientContext {
   deviceType?: 'DESKTOP' | 'MOBILE' | 'TABLET' | 'BOT' | string;
 }
 
+export interface HistoryEditDetail {
+  operation: 'insert' | 'delete' | 'replace' | 'create' | 'remove' | 'unchanged';
+  offset?: number;
+  deleteCount?: number;
+  insertText?: string | null;
+  deletedText?: string | null;
+  startLine?: number;
+  startColumn?: number;
+  endLine?: number;
+  endColumn?: number;
+}
+
 export interface HistoryEvent {
   id: string;
   type: 'edit' | 'run' | 'snapshot' | 'paste_blocked' | 'internal_paste' | 'submit';
   label: string;
   detail?: string;
+  fileId?: string;
+  filePath?: string;
+  editDetails?: HistoryEditDetail[];
   at: string;
   revision: number;
   client?: ClientContext;
@@ -376,6 +418,7 @@ export interface Submission {
   history: HistoryEvent[];
   latestDecision?: ReviewDecisionSummary;
   decisionHistory: ReviewDecisionSummary[];
+  moodleFeedbackComment?: string;
   reviewGroup?: SubmissionReviewGroup;
   originVerification?: {
     state: 'VERIFIED' | 'EXTERNAL_ORIGIN' | 'MISMATCH' | 'PENDING' | 'UNAVAILABLE';
@@ -478,6 +521,19 @@ export interface SimilarityAnalysis {
   completedAt?: string;
   error?: string;
   matches: SimilarityMatch[];
+}
+
+export interface AiChatCleanupCounts {
+  threads: number;
+  teacherThreads: number;
+  studentThreads: number;
+  messages: number;
+}
+
+export interface AiChatCleanupPreview extends AiChatCleanupCounts {
+  closedBefore: string;
+  graceSeconds: number;
+  protectedThreads: number;
 }
 
 export interface SystemSettings {

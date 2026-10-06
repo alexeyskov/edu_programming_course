@@ -49,7 +49,8 @@ export function formatPublicationIssues(issues: PublicationIssue[]): string {
 }
 
 export function AssessmentIntroPage() {
-  const { primaryRole } = useAuth();
+  const { primaryRole, session } = useAuth();
+  const canManageAiReview = session?.capabilities.includes('SYSTEM_SETTINGS') ?? false;
   const { assessmentId = '' } = useParams();
   const [assessment, setAssessment] = useState<Assessment | null>(null);
   const [loading, setLoading] = useState(true);
@@ -99,10 +100,56 @@ export function AssessmentIntroPage() {
       <div className="intro-facts"><div><Clock3 /><span><small>Продолжительность</small><strong>{item.durationMinutes ? `${item.durationMinutes} минут` : 'Без ограничения'}</strong></span></div><div><FileCode2 /><span><small>{lmsManaged ? 'Формат ответа' : 'Рабочая область'}</small><strong>{lmsManaged ? `Уточняется при запуске · ${item.standard}` : `${item.fileMode === 'MULTI' ? 'Несколько файлов' : 'Один файл'} · ${item.standard}`}</strong></span></div><div><ShieldCheck /><span><small>Правило вставки</small><strong>{item.pastePolicy === 'STRICT' ? 'Только внутри попытки' : 'Разрешена'}</strong></span></div></div>
       {lmsManaged && item.durationMinutes && <p className="schedule-copy">Указан лимит Moodle. Время решения уточняется при запуске с учётом настроек для вашей учётной записи и резерва на отправку; этот резерв вычитается из таймера Quiz.</p>}
       {item.startsAt && <p className="schedule-copy">Открытие: {formatDate(item.startsAt)}{item.deadlineAt && ` · закрытие: ${formatDate(item.deadlineAt)}`}</p>}
-      {primaryRole === 'TEACHER' ? <div className="teacher-intro-actions"><p>Название, условие, сроки, максимальный балл и число попыток загружаются из Moodle. В Мехмат.Практикуме вы выбираете группы преподавателя и разрешаете или запрещаете ИИ-помощь. Возможность сдачи для конкретного студента и способ отправки проверяются непосредственно в Moodle при запуске.</p>{item.publicationStatus !== 'CLOSED' && <div><Button size="lg" onClick={() => setEditing(true)}><ShieldCheck size={16} /> {item.publicationStatus === 'DRAFT' ? 'Настроить доступ' : 'Изменить доступ'}</Button></div>}</div> : <><div className="self-check"><CheckCircle2 /><span><strong>Интерфейс готов к началу</strong><small>{lmsManaged ? 'При запуске Moodle проверит доступность работы именно для вашей учётной записи.' : 'Окончательную доступность, срок и число попыток проверит сервер.'}</small></span></div>{item.attemptId ? <Button size="lg" loading={starting} onClick={() => lmsManaged ? void start() : navigate(`/ide/${item.attemptId}`)}>Продолжить попытку</Button> : <Button size="lg" loading={starting} disabled={!lmsManaged && (notOpened || closed)} onClick={() => void start()}>{!lmsManaged && closed ? 'Работа закрыта' : !lmsManaged && notOpened ? `Откроется ${formatDate(item.startsAt)}` : 'Начать попытку'}</Button>}</>}
+      {primaryRole === 'TEACHER' || canManageAiReview ? <div className="teacher-intro-actions">
+        <p>Название, условие, сроки, максимальный балл и число попыток загружаются из Moodle. В Мехмат.Практикуме вы выбираете группы преподавателя и разрешаете или запрещаете ИИ-помощь. Возможность сдачи для конкретного студента и способ отправки проверяются непосредственно в Moodle при запуске.</p>
+        {canManageAiReview && <AssessmentAiReviewPolicy key={item.id} assessment={item} onUpdated={(updated) => setAssessment((current) => current?.id === updated.id ? updated : current)} />}
+        {item.publicationStatus !== 'CLOSED' && <div><Button size="lg" onClick={() => setEditing(true)}><ShieldCheck size={16} /> {item.publicationStatus === 'DRAFT' ? 'Настроить доступ' : 'Изменить доступ'}</Button></div>}
+      </div> : <><div className="self-check"><CheckCircle2 /><span><strong>Интерфейс готов к началу</strong><small>{lmsManaged ? 'При запуске Moodle проверит доступность работы именно для вашей учётной записи.' : 'Окончательную доступность, срок и число попыток проверит сервер.'}</small></span></div>{item.attemptId ? <Button size="lg" loading={starting} onClick={() => lmsManaged ? void start() : navigate(`/ide/${item.attemptId}`)}>Продолжить попытку</Button> : <Button size="lg" loading={starting} disabled={!lmsManaged && (notOpened || closed)} onClick={() => void start()}>{!lmsManaged && closed ? 'Работа закрыта' : !lmsManaged && notOpened ? `Откроется ${formatDate(item.startsAt)}` : 'Начать попытку'}</Button>}</>}
     </Card>
     {editing && <MoodlePublicationEditor assessment={item} onUpdated={setAssessment} onClose={() => setEditing(false)} />}
   </div>;
+}
+
+function AssessmentAiReviewPolicy({ assessment, onUpdated }: { assessment: Assessment; onUpdated(value: Assessment): void }) {
+  const [enabled, setEnabled] = useState(assessment.aiReviewEnabled ?? false);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const savingRef = useRef(false);
+  const activeRef = useRef(true);
+  useEffect(() => {
+    activeRef.current = true;
+    return () => { activeRef.current = false; };
+  }, []);
+  useEffect(() => { setEnabled(assessment.aiReviewEnabled ?? false); }, [assessment.aiReviewEnabled]);
+
+  async function changePolicy(next: boolean) {
+    if (savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true); setSaved(false); setError(null); setEnabled(next);
+    try {
+      const updated = await api.setAssessmentAiReviewPolicy(assessment.id, next);
+      if (!activeRef.current) return;
+      setEnabled(updated.aiReviewEnabled ?? false);
+      onUpdated(updated);
+      setSaved(true);
+    } catch (caught) {
+      if (!activeRef.current) return;
+      setEnabled(assessment.aiReviewEnabled ?? false);
+      setError(caught instanceof Error ? caught.message : 'Настройка ИИ-проверки не сохранена');
+    } finally {
+      savingRef.current = false;
+      if (activeRef.current) setSaving(false);
+    }
+  }
+
+  return <section className="moodle-group-picker" style={{ marginBottom: 16 }} aria-label="ИИ-проверка работ">
+    <header><strong>Помощь преподавателю при проверке</strong><small>Для всех задач этой работы. ИИ отмечает возможные ошибки в коде и предлагает рекомендации преподавателю, но не выставляет оценку.</small><small>При включении в очередь также попадут уже сданные работы без итоговой оценки.</small></header>
+    <label className="option-check"><input type="checkbox" aria-label="Автоматическая ИИ-проверка" checked={enabled} disabled={saving} onChange={(event) => void changePolicy(event.target.checked)} /><span><strong>Автоматическая ИИ-проверка</strong><small>Анализ запускается сразу после сдачи студентом, а для ответов из Moodle — после синхронизации. Готовый результат сохраняется для проверки преподавателем.</small></span></label>
+    <small>По умолчанию выключено. Для анализа ИИ должен быть включён и настроен в общих настройках системы. Настройка не включает ИИ-помощника студентам.</small>
+    {error && <InlineError title="Не удалось сохранить настройку" message={error} />}
+    {(saving || saved) && <small role="status">{saving ? 'Сохраняем настройку…' : 'Настройка сохранена'}</small>}
+  </section>;
 }
 
 function MoodlePublicationEditor({ assessment, onUpdated, onClose }: { assessment: Assessment; onUpdated(value: Assessment): void; onClose(): void }) {

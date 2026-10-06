@@ -16,7 +16,7 @@ from app.db.base import utcnow
 from app.db.session import get_db
 from app.integrations.delivery_profile import project_activity_delivery_transport
 from app.integrations.moodle_modes import moodle_auth_mode
-from app.models.attempts import Attempt
+from app.models.attempts import Attempt, Submission
 from app.models.courses import (
     Course,
     CourseGroup,
@@ -34,6 +34,7 @@ from app.models.enums import (
 )
 from app.models.identity import LMSConnection
 from app.models.integration import ExternalMapping, SyncOutbox
+from app.models.review import ReviewDecision
 from app.models.tasks import (
     Assessment,
     AssessmentItem,
@@ -42,6 +43,7 @@ from app.models.tasks import (
     TaskVersion,
 )
 from app.schemas.assessments import (
+    AIReviewPolicyUpdateRequest,
     AssessmentCreateRequest,
     AssessmentItemCreateRequest,
     AssessmentItemTeacherRead,
@@ -69,6 +71,7 @@ from app.schemas.tasks import (
     parse_hidden_test_manifest,
     valid_single_file_starter_paths,
 )
+from app.services.ai_review import ai_review_policy_assessment, enqueue_ai_code_review
 from app.services.common import (
     DomainError,
     canonical_hash,
@@ -83,6 +86,7 @@ from app.services.moodle_source import (
 )
 from app.services.policy import (
     MembershipContext,
+    assessment_review_scope_ids,
     effective_assessment_policy,
     ensure_assessment_available,
     publication_group_ids_for_teacher,
@@ -1161,9 +1165,7 @@ async def _assessment_student_read(
 ) -> AssessmentStudentRead:
     effective = await effective_assessment_policy(db, assessment, membership)
     assessment_policy = assessment.policy if isinstance(assessment.policy, dict) else {}
-    requires_live_lms_preparation = (
-        assessment_policy.get("moodle_metadata_read_only") is True
-    )
+    requires_live_lms_preparation = assessment_policy.get("moodle_metadata_read_only") is True
     # Only an active attempt is a resumable IDE session.  Returning the most
     # recent terminal/imported attempt here makes the student course links
     # bypass the start endpoint and opens an intentionally read-only
@@ -1208,6 +1210,7 @@ async def _assessment_teacher_read(
     db: AsyncSession,
     assessment: Assessment,
 ) -> AssessmentTeacherRead:
+    ai_policy = await ai_review_policy_assessment(db, assessment)
     items = list(
         (
             await db.scalars(
@@ -1241,6 +1244,7 @@ async def _assessment_teacher_read(
         paste_policy=assessment.paste_policy,
         student_ai_enabled=assessment.student_ai_enabled,
         teacher_ai_enabled=assessment.teacher_ai_enabled,
+        ai_review_enabled=ai_policy.ai_review_enabled,
         review_required=assessment.review_required,
         decision_support_enabled=assessment.decision_support_enabled,
         autosubmit=assessment.autosubmit,
@@ -1304,10 +1308,7 @@ async def list_course_assessments(
     rows = [
         row
         for row in rows
-        if not (
-            isinstance(row.policy, dict)
-            and row.policy.get("historical_import_only") is True
-        )
+        if not (isinstance(row.policy, dict) and row.policy.get("historical_import_only") is True)
     ]
     if membership.membership.role == CourseRole.TEACHER.value:
         return [await _assessment_teacher_read(db, row) for row in rows]
@@ -1426,6 +1427,47 @@ async def update_assessment(
         setattr(assessment, name, value)
     if managed_mapping is None:
         await _sync_assessment_mapping(db, assessment)
+    await db.commit()
+    return await _assessment_teacher_read(db, assessment)
+
+
+@router.patch("/assessments/{assessment_id}/ai-review-policy", response_model=AssessmentTeacherRead)
+async def update_ai_review_policy(
+    assessment_id: uuid.UUID,
+    payload: AIReviewPolicyUpdateRequest,
+    context: CurrentAuth,
+    db: DBSession,
+) -> AssessmentTeacherRead:
+    # This is an administrator-only local policy, not Moodle visibility or student AI help.
+    if not context.has_capability("SYSTEM_SETTINGS"):
+        raise _error(403, "SYSTEM_SETTINGS_REQUIRED", "Administrator access is required")
+    assessment = await db.scalar(
+        select(Assessment).where(Assessment.id == assessment_id).with_for_update()
+    )
+    if assessment is None:
+        raise _error(404, "ASSESSMENT_NOT_FOUND", "Assessment was not found")
+    ai_policy = await ai_review_policy_assessment(db, assessment)
+    newly_enabled = payload.enabled and not ai_policy.ai_review_enabled
+    ai_policy.ai_review_enabled = payload.enabled
+    if payload.enabled:
+        # Backfill only this activity's existing ungraded submissions; no
+        # provider calls or automatic changes to already approved decisions.
+        scope = await assessment_review_scope_ids(db, ai_policy.id)
+        reviewed = select(ReviewDecision.submission_id).where(ReviewDecision.status == "APPLIED")
+        submissions = await db.scalars(
+            select(Submission)
+            .join(
+                Attempt,
+                Attempt.id == Submission.attempt_id,
+            )
+            .where(
+                Attempt.assessment_id.in_(scope),
+                Attempt.state != AttemptState.VOID.value,
+                Submission.id.not_in(reviewed),
+            )
+        )
+        for submission in submissions:
+            await enqueue_ai_code_review(db, submission, retry_failed=newly_enabled)
     await db.commit()
     return await _assessment_teacher_read(db, assessment)
 
@@ -1984,13 +2026,15 @@ async def publish_assessment(
                     "GROUP_SCOPE_REQUIRED",
                     "A teacher may enable work only for Moodle groups assigned to them",
                 )
-            editable_group_external_ids = set(await db.scalars(
-                select(CourseGroup.external_id).where(
-                    CourseGroup.course_id == assessment.course_id,
-                    CourseGroup.id.in_(allowed_group_ids),
-                    CourseGroup.active.is_(True),
+            editable_group_external_ids = set(
+                await db.scalars(
+                    select(CourseGroup.external_id).where(
+                        CourseGroup.course_id == assessment.course_id,
+                        CourseGroup.id.in_(allowed_group_ids),
+                        CourseGroup.active.is_(True),
+                    )
                 )
-            ))
+            )
         # Revoking access must not depend on Moodle confirming grading settings.
         if requested_group_ids:
             _require_confirmed_quiz_grading_for_publication(managed_mapping)

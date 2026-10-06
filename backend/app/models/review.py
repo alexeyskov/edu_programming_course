@@ -63,6 +63,9 @@ class ReviewDraft(UUIDTimestampModel):
     owner_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("core_externalprincipal.id", ondelete="RESTRICT"), index=True
     )
+    ai_review_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("core_aicodereview.id", ondelete="SET NULL"), nullable=True,
+    )
     revision: Mapped[int] = mapped_column(Integer, default=1)
     grade: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
     comment: Mapped[str] = mapped_column(Text, default="")

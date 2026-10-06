@@ -7,7 +7,7 @@ from uuid import UUID
 from pydantic import AnyHttpUrl, Field, StringConstraints, field_validator
 
 from app.models.enums import ChatMode
-from app.schemas.common import MutationModel, ReadModel, Revision
+from app.schemas.common import MutationModel, ReadModel, Revision, Score
 
 
 class StudentAIThreadCreateRequest(MutationModel):
@@ -78,7 +78,56 @@ class AIAvailabilityRead(ReadModel):
     reason: Annotated[str, StringConstraints(max_length=1_000)] = ""
 
 
+class AICodeReviewRequest(MutationModel):
+    retry: bool = False
+
+
+class AICodeReviewFinding(MutationModel):
+    path: Annotated[str, StringConstraints(min_length=1, max_length=512)]
+    line: int = Field(ge=1, strict=True)
+    end_line: int | None = Field(default=None, ge=1, strict=True)
+    severity: Literal["warning", "info", "error"]
+    message: Annotated[str, StringConstraints(min_length=1, max_length=2_000)]
+
+
+class AICodeReviewReport(MutationModel):
+    summary: Annotated[str, StringConstraints(min_length=1, max_length=6_000)]
+    findings: list[AICodeReviewFinding] = Field(max_length=100)
+    recommended_grade: Score | None = None
+    recommended_comment: Annotated[str, StringConstraints(max_length=6_000)] = ""
+
+
+class AICodeReviewDiscardRequest(MutationModel):
+    review_id: UUID
+
+
+class AICodeReviewRead(ReadModel):
+    # Availability of reviewing this submission, not the automatic assessment opt-in.
+    enabled: bool
+    automatic: bool = False
+    id: UUID | None = None
+    recommendation_status: Literal["NONE", "PENDING", "APPROVED", "DISCARDED"] = "NONE"
+    moodle_refresh_state: str = ""
+    moodle_refresh_error: str = ""
+    state: Literal[
+        "DISABLED", "UNAVAILABLE", "NOT_STARTED", "QUEUED", "RUNNING", "COMPLETED", "FAILED"
+    ]
+    attempt_count: int = Field(default=0, ge=0)
+    max_attempts: int = 3
+    summary: str = ""
+    recommended_grade: Score | None = None
+    recommended_comment: str = ""
+    findings: list[AICodeReviewFinding] = Field(default_factory=list)
+    model: str = ""
+    error: str = ""
+
+
 __all__ = [
+    "AICodeReviewDiscardRequest",
+    "AICodeReviewFinding",
+    "AICodeReviewRead",
+    "AICodeReviewReport",
+    "AICodeReviewRequest",
     "AIAvailabilityRead",
     "ChatMessageCreateRequest",
     "ChatMessageRead",

@@ -7,6 +7,7 @@ from uuid import UUID
 from pydantic import (
     AliasChoices,
     AnyHttpUrl,
+    AwareDatetime,
     Field,
     SecretStr,
     StringConstraints,
@@ -62,6 +63,31 @@ class SystemSettingsUpdateRequest(MutationModel):
         if self.model_fields_set == {"revision"}:
             raise ValueError("at least one setting must be supplied")
         return self
+
+
+class AIChatCleanupCountsRead(ReadModel):
+    threads: int = Field(ge=0)
+    teacher_threads: int = Field(ge=0)
+    student_threads: int = Field(ge=0)
+    messages: int = Field(ge=0)
+
+
+class AIChatCleanupPreviewRead(AIChatCleanupCountsRead):
+    closed_before: AwareDatetime
+    grace_seconds: int = Field(ge=1)
+    protected_threads: int = Field(ge=0)
+
+
+class AIChatCleanupRequest(MutationModel):
+    closed_before: AwareDatetime
+    confirm: bool = Field(strict=True)
+
+    @field_validator("confirm")
+    @classmethod
+    def require_confirmation(cls, value: bool) -> bool:
+        if not value:
+            raise ValueError("explicit confirmation is required")
+        return value
 
 
 class SystemSettingRead(ReadModel):
@@ -162,6 +188,9 @@ class AuditEntryRead(ReadModel):
 
 
 __all__ = [
+    "AIChatCleanupCountsRead",
+    "AIChatCleanupPreviewRead",
+    "AIChatCleanupRequest",
     "AuditEntryRead",
     "ServiceHealthRead",
     "ServiceStatus",

@@ -123,6 +123,9 @@ load_host_environment() {
     LLM_API_ADDRESS LLM_API_KEY LLM_MODEL LLM_THINKING
     MOODLE_SYNC_TIMEOUT
     AI_ENABLED AI_BASE_URL AI_API_KEY AI_MODEL AI_API_STYLE
+    AI_TIMEOUT_SECONDS AI_STREAM_IDLE_TIMEOUT_SECONDS
+    AI_MAX_RESPONSE_BYTES AI_MAX_STREAM_BYTES AI_MAX_OUTPUT_CHARS AI_TEACHER_MAX_OUTPUT_CHARS
+    HTTP_PROXY HTTPS_PROXY NO_PROXY CONTAINER_HTTP_PROXY CONTAINER_HTTPS_PROXY
   )
   for key in "${allowed_keys[@]}"; do
     if [[ -n "${!key+x}" ]]; then
@@ -401,12 +404,14 @@ diagnose_ai() {
   printf 'LLM_MODEL=%s\n' "${LLM_MODEL:-}"
   printf 'LLM_THINKING=%s\n' "${LLM_THINKING:-provider default}"
   printf 'AI_API_STYLE=%s\n' "${AI_API_STYLE:-}"
+  printf 'AI_TIMEOUT_SECONDS=%s\n' "${AI_TIMEOUT_SECONDS:-180}"
+  printf 'AI_STREAM_IDLE_TIMEOUT_SECONDS=%s\n' "${AI_STREAM_IDLE_TIMEOUT_SECONDS:-60}"
   printf 'LLM_API_KEY=%s\n' "$launcher_key_status"
 
   if compose ps --status running --services 2>/dev/null | grep -qx backend; then
     log "effective AI configuration inside the running backend"
     compose exec -T backend python -c \
-      "from app.core.config import get_settings; s=get_settings(); print('AI_ENABLED=' + str(s.ai_enabled)); print('LLM_API_ADDRESS=' + s.ai_base_url); print('LLM_MODEL=' + s.ai_model); print('AI_API_STYLE=' + s.ai_api_style); print('LLM_THINKING=' + str(s.llm_thinking)); print('LLM_API_KEY=' + ('configured' if s.ai_api_key.get_secret_value() else 'not configured'))"
+      "from app.core.config import get_settings; s=get_settings(); print('AI_ENABLED=' + str(s.ai_enabled)); print('LLM_API_ADDRESS=' + s.ai_base_url); print('LLM_MODEL=' + s.ai_model); print('AI_API_STYLE=' + s.ai_api_style); print('LLM_THINKING=' + str(s.llm_thinking)); print('AI_TIMEOUT_SECONDS=' + str(s.ai_timeout_seconds)); print('AI_STREAM_IDLE_TIMEOUT_SECONDS=' + str(getattr(s, 'ai_stream_idle_timeout_seconds', 'not supported'))); print('LLM_API_KEY=' + ('configured' if s.ai_api_key.get_secret_value() else 'not configured'))"
   else
     log "backend is not running; only launcher values are shown"
   fi

@@ -1,0 +1,19 @@
+.ai-chat-cleanup > .muted { margin-top: 0; }
+.ai-chat-cleanup__counts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 20px 0;
+}
+.ai-chat-cleanup__counts > div {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px;
+}
+.ai-chat-cleanup__counts dt { color: var(--muted); font-size: 13px; }
+.ai-chat-cleanup__counts dd { margin: 6px 0 0; font-size: 22px; font-weight: 700; }
+.ai-chat-cleanup__actions { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 20px; }
+@media (max-width: 600px) {
+  .ai-chat-cleanup__counts { grid-template-columns: 1fr; }
+}

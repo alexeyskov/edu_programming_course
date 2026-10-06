@@ -1,12 +1,14 @@
 import Editor, { type BeforeMount, type OnMount } from '@monaco-editor/react';
 import type * as Monaco from 'monaco-editor';
 import { ChevronRight, FileCode2, FilePlus2, Folder, LockKeyhole, PanelLeftClose, Trash2, X } from 'lucide-react';
-import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
+import { forwardRef, useEffect, useId, useImperativeHandle, useMemo, useRef, useState } from 'react';
 import { useTheme } from '../context/ThemeContext';
 import { cn, cppKeywords, languageForPath, workspaceIdentifiers } from '../lib/utils';
 import { installEditorClipboardGuard, type EditorClipboardSession } from '../lib/editorClipboard';
-import type { Diagnostic, InternalPasteRange, WorkspaceFile } from '../types';
+import { installAiSelectionAction, type AiCodeSelection } from '../lib/editorAiSelection';
+import type { AiCodeFinding, Diagnostic, InternalPasteRange, WorkspaceFile } from '../types';
 import { Badge, Button } from './ui';
+import './aiAnnotations.css';
 
 export interface CodeWorkspaceHandle {
   openDiagnostic(diagnostic: Diagnostic): void;
@@ -36,6 +38,9 @@ interface Props {
   clipboardScopeId?: string;
   clipboardSession?: EditorClipboardSession;
   diagnostics?: Diagnostic[];
+  aiFindings?: AiCodeFinding[];
+  onAskAi?(finding: AiCodeFinding): void;
+  onAskAiSelection?(selection: AiCodeSelection): void;
   highlights?: CodeHighlight[];
   theme?: 'light' | 'dark';
   experiment?: boolean;
@@ -53,7 +58,7 @@ const severityMap: Record<Diagnostic['severity'], Monaco.MarkerSeverity> = {
 export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function CodeWorkspace({
   files, activeFileId, onActiveFile, onChange, onCreateFile, onDeleteFile, canDeleteFile,
   readOnly = false, strictPaste = false,
-  scopeId, diagnostics = [], highlights = [], theme: requestedTheme, experiment = false, explorerVisible = true, explorerId,
+  scopeId, diagnostics = [], aiFindings = [], onAskAi, onAskAiSelection, highlights = [], theme: requestedTheme, experiment = false, explorerVisible = true, explorerId,
   onExplorerCollapse, onPasteBlocked, onInternalCopy, clipboardScopeId, clipboardSession,
 }, ref) {
   const { theme: applicationTheme } = useTheme();
@@ -61,6 +66,16 @@ export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function Cod
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
   const monacoRef = useRef<typeof Monaco | null>(null);
   const highlightDecorationsRef = useRef<Monaco.editor.IEditorDecorationsCollection | null>(null);
+  const aiMarkerOwner = `ai-review-${useId()}`;
+  const aiAskCommand = `eduprog.ask-ai.${useId().replace(/:/g, '')}`;
+  const aiActionRef = useRef<Monaco.IDisposable>();
+  const aiConfigRef = useRef({ aiFindings, onAskAi, scopeId, readOnly, experiment });
+  aiConfigRef.current = { aiFindings, onAskAi, scopeId, readOnly, experiment };
+  const aiSelectionRef = useRef<ReturnType<typeof installAiSelectionAction>>();
+  const selectionConfigRef = useRef({ scopeId, readOnly, experiment, onAsk: onAskAiSelection });
+  selectionConfigRef.current = { scopeId, readOnly, experiment, onAsk: onAskAiSelection };
+  const aiModelRef = useRef<Monaco.editor.ITextModel | null>(null);
+  const aiDecorationsRef = useRef<Monaco.editor.IEditorDecorationsCollection | null>(null);
   const clipboardRootRef = useRef<HTMLDivElement | null>(null);
   const internalPasteRef = useRef(false);
   const internalPasteReceiptRef = useRef<string>();
@@ -120,6 +135,91 @@ export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function Cod
 
   useEffect(() => { setHighlights(); }, [setHighlights, activeFileId]);
 
+  const refreshAiAction = useMemo(() => () => {
+    const editor = editorRef.current;
+    const monaco = monacoRef.current;
+    const config = aiConfigRef.current;
+    if (!editor || !monaco) return;
+    if (!config.onAskAi || !config.readOnly || config.experiment) {
+      aiActionRef.current?.dispose();
+      aiActionRef.current = undefined;
+      return;
+    }
+    if (aiActionRef.current) return;
+    aiActionRef.current = editor.addAction({
+      id: aiAskCommand, label: 'Спросить у ИИ',
+      run: (_editor, requestedScope: unknown, path: unknown, index: unknown, fingerprint: unknown) => {
+        const current = aiConfigRef.current;
+        if (!current.readOnly || current.experiment || !current.onAskAi) return;
+        if (requestedScope !== current.scopeId || typeof path !== 'string' || typeof index !== 'number' || !Number.isInteger(index)) return;
+        const finding = current.aiFindings[index];
+        if (!finding || finding.path !== path || fingerprint !== `${finding.line}:${finding.endLine}:${finding.message}`) return;
+        if (editor.getModel()?.uri.toString() !== monaco.Uri.parse(`inmemory:///${current.scopeId}/${path}`).toString()) return;
+        current.onAskAi(finding);
+      },
+    });
+  }, [aiAskCommand]);
+  useEffect(() => { refreshAiAction(); }, [refreshAiAction, onAskAi, readOnly, experiment]);
+
+  const clearAiAnnotations = useMemo(() => () => {
+    const previous = aiModelRef.current;
+    if (previous && !previous.isDisposed()) monacoRef.current?.editor.setModelMarkers(previous, aiMarkerOwner, []);
+    aiModelRef.current = null;
+    aiDecorationsRef.current?.clear();
+    aiDecorationsRef.current = null;
+  }, [aiMarkerOwner]);
+
+  const setAiAnnotations = useMemo(() => () => {
+    clearAiAnnotations();
+    const editor = editorRef.current;
+    const monaco = monacoRef.current;
+    const model = editor?.getModel();
+    if (!editor || !monaco || !model || model.isDisposed() || !active) return;
+    // A model change may precede the React effect. Never decorate the previous file/scope.
+    if (model.uri.toString() !== monaco.Uri.parse(`inmemory:///${scopeId}/${active.path}`).toString()) return;
+    const findings = aiFindings.filter((item) => item.path === active.path
+      && Number.isInteger(item.line) && item.line >= 1 && item.line <= model.getLineCount()
+      && (item.endLine === undefined || (Number.isInteger(item.endLine) && item.endLine >= item.line && item.endLine <= model.getLineCount()))
+      && ['warning', 'info', 'error'].includes(item.severity)
+      && typeof item.message === 'string' && item.message.trim().length > 0);
+    if (!findings.length) return;
+    // addAction registers an editor-prefixed command, not the descriptor ID.
+    const hoverCommand = onAskAi && readOnly && !experiment ? editor.getAction(aiAskCommand)?.id : undefined;
+    const annotations = findings.map((item) => ({
+      range: {
+        startLineNumber: item.line, startColumn: 1,
+        endLineNumber: item.endLine ?? item.line,
+        endColumn: model.getLineMaxColumn(item.endLine ?? item.line),
+      },
+      message: `Ответ ИИ: ${item.message.trim().slice(0, 4000)}`,
+      findingIndex: aiFindings.indexOf(item),
+      fingerprint: `${item.line}:${item.endLine}:${item.message}`,
+      severity: severityMap[item.severity],
+    }));
+    aiModelRef.current = model;
+    monaco.editor.setModelMarkers(model, aiMarkerOwner, annotations.map((item) => ({
+      ...item.range, severity: item.severity, message: item.message, source: 'Ответ ИИ',
+    })));
+    aiDecorationsRef.current = editor.createDecorationsCollection(annotations.map((item) => ({
+      range: item.range,
+      options: {
+        isWholeLine: true,
+        className: 'ai-review-line',
+        linesDecorationsClassName: 'ai-review-gutter',
+        hoverMessage: {
+          value: item.message.replace(/[\\`*_{}[\]()<>#+.!|~-]/g, '\\$&') + (hoverCommand
+            ? `\n\n[Спросить у ИИ](command:${hoverCommand}?${encodeURIComponent(JSON.stringify([scopeId, active.path, item.findingIndex, item.fingerprint]))})` : ''),
+          // Trust only our own draft-opening action, never model-provided commands or HTML.
+          isTrusted: hoverCommand ? { enabledCommands: [hoverCommand] } : false, supportHtml: false,
+        },
+      },
+    })));
+  }, [active, aiFindings, aiMarkerOwner, aiAskCommand, onAskAi, readOnly, experiment, clearAiAnnotations, scopeId]);
+  const refreshAiAnnotationsRef = useRef(setAiAnnotations);
+  refreshAiAnnotationsRef.current = setAiAnnotations;
+  useEffect(() => { setAiAnnotations(); return clearAiAnnotations; }, [setAiAnnotations, clearAiAnnotations]);
+  useEffect(() => { aiSelectionRef.current?.refresh(); }, [scopeId, readOnly, experiment, onAskAiSelection, active?.path]);
+
   useImperativeHandle(ref, () => ({
     openDiagnostic(diagnostic) {
       const file = files.find((item) => item.id === diagnostic.fileId || item.path === diagnostic.path);
@@ -166,7 +266,10 @@ export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function Cod
   };
 
   const handleMount: OnMount = (editor, monaco) => {
-    editorRef.current = editor; monacoRef.current = monaco; setMarkers(); setHighlights();
+    editorRef.current = editor; monacoRef.current = monaco;
+    aiSelectionRef.current = installAiSelectionAction(editor, monaco, () => ({ ...selectionConfigRef.current, path: activeRef.current?.path }));
+    refreshAiAction(); setMarkers(); setHighlights(); setAiAnnotations();
+    const aiModelListener = editor.onDidChangeModel(() => refreshAiAnnotationsRef.current());
     const completionProvider = (language: 'c' | 'cpp') => monaco.languages.registerCompletionItemProvider(language, {
       provideCompletionItems(model, position) {
         const scopePrefix = `inmemory:///${pasteConfigRef.current.scopeId}/`;
@@ -201,6 +304,12 @@ export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function Cod
       }
     }, clipboardSession);
     editor.onDidDispose(() => {
+      aiSelectionRef.current?.dispose();
+      aiSelectionRef.current = undefined;
+      aiActionRef.current?.dispose();
+      aiActionRef.current = undefined;
+      clearAiAnnotations();
+      aiModelListener.dispose();
       highlightDecorationsRef.current?.clear();
       highlightDecorationsRef.current = null;
       completionProviders.forEach((provider) => provider.dispose());
@@ -219,7 +328,13 @@ export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function Cod
   return <div ref={clipboardRootRef} className={cn('code-workspace', experiment && 'code-workspace--experiment', !explorerVisible && 'code-workspace--explorer-hidden')}>
     <aside id={explorerId} className="file-explorer" hidden={!explorerVisible}><header><span>Файлы</span><span className="file-explorer__actions">{onCreateFile && !readOnly && <button onClick={onCreateFile} title="Создать файл" aria-label="Создать файл"><FilePlus2 size={15} /></button>}{onExplorerCollapse && <button onClick={onExplorerCollapse} title="Скрыть панель файлов" aria-label="Скрыть файлы"><PanelLeftClose size={15} /></button>}</span></header><div className="folder-label"><ChevronRight size={14} /><Folder size={15} /><span>workspace</span></div><div className="file-list">{files.map((file) => <div key={file.id} className={cn('file-entry', file.id === activeFileId && 'is-active')}><button className="file-entry__open" onClick={() => onActiveFile(file.id)}><FileCode2 size={15} /><span>{file.path}</span>{file.readOnly && <LockKeyhole size={12} />}</button>{onDeleteFile && !readOnly && !file.readOnly && (canDeleteFile?.(file) ?? files.length > 1) && <button className="file-entry__delete" onClick={() => onDeleteFile(file)} title={`Удалить ${file.path}`} aria-label={`Удалить ${file.path}`}><Trash2 size={13} /></button>}</div>)}</div><footer><span>Файлов: {files.length}</span></footer></aside>
     <section className="editor-stage"><div className="editor-tabs">{openFiles.map((id) => { const file = files.find((item) => item.id === id); return file ? <button key={id} className={cn(id === activeFileId && 'is-active')} onClick={() => onActiveFile(id)}><FileCode2 size={14} /><span>{file.path.split('/').at(-1)}</span>{openFiles.length > 1 && <X size={13} onClick={(event) => { event.stopPropagation(); closeTab(id); }} />}</button> : null; })}<span className="editor-tabs__fill" /></div>
-      <Editor path={`inmemory:///${scopeId}/${active.path}`} value={active.content} language={active.language ?? languageForPath(active.path)} beforeMount={beforeMount} onMount={handleMount} onChange={(value) => onChange(active.id, value ?? '', internalPasteRef.current ? 'internal_paste' : 'typing', internalPasteRef.current ? internalPasteReceiptRef.current : undefined, internalPasteRef.current ? internalPasteRangeRef.current : undefined)} theme={theme === 'dark' ? 'eduprog-dark' : 'eduprog-light'} options={{ readOnly: readOnly || active.readOnly, readOnlyMessage: { value: 'Редактирование недоступно в режиме чтения.' }, minimap: { enabled: true, maxColumn: 80 }, fontSize: 14, lineHeight: 23, fontFamily: "'JetBrains Mono', 'SFMono-Regular', Consolas, monospace", fontLigatures: true, padding: { top: 14, bottom: 18 }, smoothScrolling: true, cursorSmoothCaretAnimation: 'on', automaticLayout: true, scrollBeyondLastLine: false, bracketPairColorization: { enabled: true }, guides: { bracketPairs: true, indentation: true }, suggest: { showSnippets: false }, quickSuggestions: !readOnly, inlineSuggest: { enabled: false }, contextmenu: !strictPaste, pasteAs: { enabled: !strictPaste }, dropIntoEditor: { enabled: !strictPaste }, dragAndDrop: !strictPaste, wordWrap: 'off', renderValidationDecorations: 'on' }} />
+      <Editor path={`inmemory:///${scopeId}/${active.path}`} value={active.content} language={active.language ?? languageForPath(active.path)} beforeMount={beforeMount} onMount={handleMount}
+        onChange={(value) => onChange(active.id, value ?? '', internalPasteRef.current ? 'internal_paste' : 'typing', internalPasteRef.current ? internalPasteReceiptRef.current : undefined, internalPasteRef.current ? internalPasteRangeRef.current : undefined)}
+        theme={theme === 'dark' ? 'eduprog-dark' : 'eduprog-light'} options={{
+          // Keep clickable teacher AI hovers outside the editor row's overflow clip.
+          fixedOverflowWidgets: Boolean(onAskAi || onAskAiSelection),
+          readOnly: readOnly || active.readOnly, readOnlyMessage: { value: 'Редактирование недоступно в режиме чтения.' }, minimap: { enabled: true, maxColumn: 80 }, fontSize: 14, lineHeight: 23, fontFamily: "'JetBrains Mono', 'SFMono-Regular', Consolas, monospace", fontLigatures: true, padding: { top: 14, bottom: 18 }, smoothScrolling: true, cursorSmoothCaretAnimation: 'on', automaticLayout: true, scrollBeyondLastLine: false, bracketPairColorization: { enabled: true }, guides: { bracketPairs: true, indentation: true }, suggest: { showSnippets: false }, quickSuggestions: !readOnly, inlineSuggest: { enabled: false }, contextmenu: !strictPaste, pasteAs: { enabled: !strictPaste }, dropIntoEditor: { enabled: !strictPaste }, dragAndDrop: !strictPaste, wordWrap: 'off', renderValidationDecorations: 'on',
+        }} />
     </section>
   </div>;
 });

@@ -24,6 +24,7 @@ from app.core.credential_crypto import (
     BROWSER_STATE_CREDENTIAL_KIND,
     encrypt_moodle_browser_state,
 )
+from app.models.analysis import AICodeReview
 from app.models.attempts import Attempt, Snapshot, Submission, Workspace, WorkspaceFile
 from app.models.courses import Course, CourseMembership
 from app.models.enums import AttemptState, CourseRole, SyncOutboxState
@@ -656,6 +657,36 @@ def test_imported_grade_normalizes_and_caps_remote_scales() -> None:
         "DIRECT_LOCAL_SCALE_CLAMPED",
     )
     assert _imported_grade("-1", "100", Decimal("10")) == (None, None)
+
+
+@pytest.mark.parametrize("grade, comment, expected_jobs", [
+    ("0", "", 0), ("8", "Проверено", 0),
+    (None, "Алгоритм неверный", 0), (None, "", 1),
+])
+async def test_moodle_feedback_is_imported_before_deciding_whether_to_queue_ai(
+    app_bundle, grade, comment, expected_jobs,
+):
+    _, sessions, _ = app_bundle
+    ids = await _seed_history_target(sessions)
+    item = {**_finished_item(), "grade": grade, "comment": comment}
+    async with sessions() as db, db.begin():
+        course = await db.get(Course, ids["course_id"])
+        assessment = await db.get(Assessment, ids["assessment_id"])
+        assessment.ai_review_enabled = True
+        for _ in range(2):
+            await materialize_historical_submissions(
+                db, course=course, assessment=assessment,
+                actor_external_subject="42", items=[item],
+            )
+        submission = await db.scalar(select(Submission))
+        assert submission.external_receipt["moodle_review"]["comment"] == comment
+        assert await db.scalar(select(func.count(AICodeReview.id))) == expected_jobs
+        decision = await db.scalar(select(ReviewDecision).where(ReviewDecision.status == "APPLIED"))
+        if grade is None:
+            assert decision is None
+        else:
+            assert decision.grade == Decimal(grade)
+            assert decision.comment == comment
 
 
 async def test_materialize_creates_idempotent_submission_and_imported_applied_grade(
@@ -2615,6 +2646,47 @@ async def test_ungraded_refresh_supersedes_an_erroneous_imported_grade(app_bundl
     assert decisions[0].lms_export_state == "IMPORTED"
     assert decisions[0].status == "SUPERSEDED"
     assert applied == []
+
+
+@pytest.mark.parametrize("export_state", ["DELIVERED", "PENDING", "FAILED", "BLOCKED"])
+async def test_moodle_correction_has_priority_after_local_grade_was_delivered(
+    app_bundle, export_state,
+) -> None:
+    _, sessions, _ = app_bundle
+    ids = await _seed_history_target(sessions)
+    item = {**_finished_item(), "grade": "8", "comment": "Согласовано преподавателем"}
+    async with sessions() as db, db.begin():
+        course = await db.get(Course, ids["course_id"])
+        assessment = await db.get(Assessment, ids["assessment_id"])
+        await materialize_historical_submissions(
+            db, course=course, assessment=assessment, actor_external_subject="42", items=[item],
+        )
+        original = await db.scalar(select(ReviewDecision))
+        original.lms_export_state = export_state
+        original.criterion_scores = {}
+        await db.flush()
+        # An unchanged read-back of our export must not duplicate its decision.
+        await materialize_historical_submissions(
+            db, course=course, assessment=assessment, actor_external_subject="42", items=[item],
+        )
+        assert await db.scalar(select(func.count(ReviewDecision.id))) == 1
+        corrected = {**item, "grade": "0", "comment": "Исправлено в Moodle"}
+        for _ in range(2):
+            await materialize_historical_submissions(
+                db, course=course, assessment=assessment,
+                actor_external_subject="42", items=[corrected],
+            )
+        applied = await db.scalar(select(ReviewDecision).where(ReviewDecision.status == "APPLIED"))
+        if export_state == "DELIVERED":
+            assert applied.grade == Decimal("0")
+            assert applied.comment == "Исправлено в Moodle"
+            assert applied.lms_export_state == "IMPORTED"
+            assert original.status == "SUPERSEDED"
+            assert await db.scalar(select(func.count(ReviewDecision.id))) == 2
+        else:
+            assert applied.id == original.id
+            assert applied.grade == Decimal("8")
+            assert applied.lms_export_state == export_state
 
 
 async def test_materialize_skips_in_progress_attempt(app_bundle) -> None:

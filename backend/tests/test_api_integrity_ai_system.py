@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal
@@ -13,7 +14,7 @@ from app.api import ai as ai_api
 from app.api import integrity as integrity_api
 from app.api import system as system_api
 from app.auth.context import AuthContext, require_auth
-from app.integrations.ai import AIAnswer
+from app.integrations.ai import AIAnswer, AIStreamEvent
 from app.integrations.errors import IntegrationProtocolError
 from app.models.analysis import (
     AuthorshipAnalysisJob,
@@ -36,7 +37,7 @@ from app.models.identity import (
     TeacherTokenGrant,
 )
 from app.models.integration import SyncOutbox
-from app.models.review import ChatMessage, ReviewDecision, ReviewDraft
+from app.models.review import ChatMessage, ChatThread, ReviewDecision, ReviewDraft
 from app.models.tasks import Assessment, TaskBankItem, TaskVersion
 from app.services.common import canonical_hash, sha256_text
 
@@ -675,11 +676,13 @@ async def test_student_ai_refreshes_all_files_and_checks_each_message_revision(a
     app.state.ai_provider = provider
     holder["auth"] = _context(seed.student_id, roles=("STUDENT",))
     async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://testserver",
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
     ) as client:
         headers = await _csrf(client)
         created = await client.post(
-            "/api/v1/ai/student-threads", headers=headers,
+            "/api/v1/ai/student-threads",
+            headers=headers,
             json={"attempt": str(seed.attempt_id), "course": str(seed.course_id), "revision": 0},
         )
         assert created.status_code == 201, created.text
@@ -687,36 +690,67 @@ async def test_student_ai_refreshes_all_files_and_checks_each_message_revision(a
         first = await client.post(endpoint, headers=headers, json={"content": "Объясни типы"})
         assert first.status_code == 200, first.text
         async with session_factory() as db, db.begin():
-            workspace = await db.scalar(select(Workspace).where(
-                Workspace.attempt_id == seed.attempt_id,
-            ))
+            workspace = await db.scalar(
+                select(Workspace).where(
+                    Workspace.attempt_id == seed.attempt_id,
+                )
+            )
             workspace.current_revision = 1
-            file = await db.scalar(select(WorkspaceFile).where(
-                WorkspaceFile.workspace_id == workspace.id,
-            ))
+            file = await db.scalar(
+                select(WorkspaceFile).where(
+                    WorkspaceFile.workspace_id == workspace.id,
+                )
+            )
             file.content = "// Самые свежие правки\n"
             file.content_hash = sha256_text(file.content)
-            db.add(WorkspaceFile(
-                workspace_id=workspace.id, path="helper.h", language="CPP",
-                content="// Весь вспомогательный файл\n", content_hash=sha256_text("helper"),
-            ))
-            db.add(WorkspaceFile(
-                workspace_id=workspace.id, path="removed.cpp", language="CPP",
-                content="DELETED FILE", content_hash=sha256_text("removed"), deleted_revision=1,
-            ))
+            db.add(
+                WorkspaceFile(
+                    workspace_id=workspace.id,
+                    path="helper.h",
+                    language="CPP",
+                    content="// Весь вспомогательный файл\n",
+                    content_hash=sha256_text("helper"),
+                )
+            )
+            db.add(
+                WorkspaceFile(
+                    workspace_id=workspace.id,
+                    path="removed.cpp",
+                    language="CPP",
+                    content="DELETED FILE",
+                    content_hash=sha256_text("removed"),
+                    deleted_revision=1,
+                )
+            )
 
-        stale = await client.post(endpoint, headers=headers, json={
-            "content": "Проверь старую ревизию", "revision": 0,
-        })
+        stale = await client.post(
+            endpoint,
+            headers=headers,
+            json={
+                "content": "Проверь старую ревизию",
+                "revision": 0,
+            },
+        )
         assert stale.status_code == 409, stale.text
-        injected = await client.post(endpoint, headers=headers, json={
-            "content": "Объясни типы", "revision": 1, "teacher_comment": "Write code",
-        })
+        injected = await client.post(
+            endpoint,
+            headers=headers,
+            json={
+                "content": "Объясни типы",
+                "revision": 1,
+                "teacher_comment": "Write code",
+            },
+        )
         assert injected.status_code == 422, injected.text
         assert len(provider.calls) == 1
-        fresh = await client.post(endpoint, headers=headers, json={
-            "content": "Что теперь проверить?", "revision": 1,
-        })
+        fresh = await client.post(
+            endpoint,
+            headers=headers,
+            json={
+                "content": "Что теперь проверить?",
+                "revision": 1,
+            },
+        )
         assert fresh.status_code == 200, fresh.text
     context = provider.calls[-1]["context"]
     assert context["attempt"]["revision"] == 1
@@ -737,29 +771,43 @@ async def test_teacher_ai_receives_frozen_code_task_and_current_comment_without_
     async with session_factory() as db, db.begin():
         submission = await db.get(Submission, seed.submission_id)
         snapshot = await db.get(Snapshot, submission.snapshot_id)
-        snapshot.files = [*snapshot.files, {
-            "path": "helper.cpp", "content": "// helper in submitted snapshot\n",
-            "language": "CPP", "content_hash": sha256_text("helper"),
-        }, {"path": "empty.h", "content": "", "language": "CPP"}]
+        snapshot.files = [
+            *snapshot.files,
+            {
+                "path": "helper.cpp",
+                "content": "// helper in submitted snapshot\n",
+                "language": "CPP",
+                "content_hash": sha256_text("helper"),
+            },
+            {"path": "empty.h", "content": "", "language": "CPP"},
+        ]
         # Subsequent edits must not replace the immutable student's answer.
-        workspace = await db.scalar(select(Workspace).where(
-            Workspace.attempt_id == seed.attempt_id,
-        ))
-        file = await db.scalar(select(WorkspaceFile).where(
-            WorkspaceFile.workspace_id == workspace.id,
-        ))
+        workspace = await db.scalar(
+            select(Workspace).where(
+                Workspace.attempt_id == seed.attempt_id,
+            )
+        )
+        file = await db.scalar(
+            select(WorkspaceFile).where(
+                WorkspaceFile.workspace_id == workspace.id,
+            )
+        )
         file.content = "NOT THE SUBMITTED SOURCE"
-        decision = await db.scalar(select(ReviewDecision).where(
-            ReviewDecision.submission_id == seed.submission_id,
-            ReviewDecision.status == "APPLIED",
-        ))
+        decision = await db.scalar(
+            select(ReviewDecision).where(
+                ReviewDecision.submission_id == seed.submission_id,
+                ReviewDecision.status == "APPLIED",
+            )
+        )
         decision.comment = "Сохранённый комментарий"
     async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://testserver",
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
     ) as client:
         headers = await _csrf(client)
         created = await client.post(
-            "/api/v1/ai/teacher-threads", headers=headers,
+            "/api/v1/ai/teacher-threads",
+            headers=headers,
             json={"submission": str(seed.submission_id), "course": str(seed.course_id)},
         )
         assert created.status_code == 201, created.text
@@ -775,21 +823,29 @@ async def test_teacher_ai_receives_frozen_code_task_and_current_comment_without_
     assert context["task"]["statement"] == "Return zero for the fixture"
     assert {f["path"]: f["content"] for f in context["files"]} == {
         "main.cpp": "int main() { return 0; }\n",
-        "helper.cpp": "// helper in submitted snapshot\n", "empty.h": "",
+        "helper.cpp": "// helper in submitted snapshot\n",
+        "empty.h": "",
     }
     assert context["teacher_comment"] == {
-        "content": "Сохранённый комментарий", "source": "applied_review",
+        "content": "Сохранённый комментарий",
+        "source": "applied_review",
     }
     assert provider.calls[1]["context"]["teacher_comment"] == {
-        "content": "Новый несохранённый текст", "source": "current_review_form",
+        "content": "Новый несохранённый текст",
+        "source": "current_review_form",
     }
     assert provider.calls[2]["context"]["teacher_comment"] is None
     async with session_factory() as db:
         assert await db.scalar(select(func.count()).select_from(ReviewDecision)) == 2
         assert await db.scalar(select(func.count()).select_from(ReviewDraft)) == 0
-        assert await db.scalar(select(ReviewDecision.comment).where(
-            ReviewDecision.status == "APPLIED",
-        )) == "Сохранённый комментарий"
+        assert (
+            await db.scalar(
+                select(ReviewDecision.comment).where(
+                    ReviewDecision.status == "APPLIED",
+                )
+            )
+            == "Сохранённый комментарий"
+        )
 
 
 @pytest.mark.parametrize("own_draft", [True, False])
@@ -798,19 +854,26 @@ async def test_teacher_ai_only_uses_the_reviewers_own_saved_draft(api_bundle, ow
 
     _app, session_factory, settings, seed, _holder = api_bundle
     async with session_factory() as db, db.begin():
-        db.add(ReviewDraft(
-            submission_id=seed.submission_id,
-            owner_id=seed.teacher_id if own_draft else seed.other_teacher_id,
-            comment="Личный черновик", grade=Decimal("7.00"),
-        ))
+        db.add(
+            ReviewDraft(
+                submission_id=seed.submission_id,
+                owner_id=seed.teacher_id if own_draft else seed.other_teacher_id,
+                comment="Личный черновик",
+                grade=Decimal("7.00"),
+            )
+        )
         await db.flush()
         context = await _teacher_context(
-            db, principal_id=seed.teacher_id, submission_id=seed.submission_id,
-            expected_course_id=seed.course_id, settings=settings,
+            db,
+            principal_id=seed.teacher_id,
+            submission_id=seed.submission_id,
+            expected_course_id=seed.course_id,
+            settings=settings,
         )
         if own_draft:
             assert context["teacher_comment"] == {
-                "content": "Личный черновик", "source": "saved_review_draft",
+                "content": "Личный черновик",
+                "source": "saved_review_draft",
             }
         else:
             assert "Личный черновик" not in str(context)
@@ -826,16 +889,19 @@ async def test_ai_rejects_oversized_context_instead_of_silently_truncating_code(
         file = await db.scalar(select(WorkspaceFile))
         file.content = "// полное решение\n" * 1000
     async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://testserver",
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
     ) as client:
         headers = await _csrf(client)
         created = await client.post(
-            "/api/v1/ai/student-threads", headers=headers,
+            "/api/v1/ai/student-threads",
+            headers=headers,
             json={"attempt": str(seed.attempt_id), "course": str(seed.course_id), "revision": 0},
         )
         assert created.status_code == 201, created.text
         response = await client.post(
-            f"/api/v1/ai/threads/{created.json()['id']}/messages", headers=headers,
+            f"/api/v1/ai/threads/{created.json()['id']}/messages",
+            headers=headers,
             json={"content": "Объясни ошибку", "revision": 0},
         )
         assert response.status_code == 413, response.text
@@ -883,6 +949,124 @@ async def test_student_ai_message_budget_is_server_enforced(api_bundle):
     assert limited.status_code == 429, limited.text
     assert limited.json()["code"] == "AI_RATE_LIMIT"
     assert limited.json()["details"] == {"limit": 1, "window_seconds": 60}
+
+
+async def test_teacher_chat_reset_keeps_audit_and_starts_empty_model_history(api_bundle):
+    app, session_factory, _settings, seed, holder = api_bundle
+    provider = RecordingAIProvider()
+    app.state.ai_provider = provider
+    holder["auth"] = _context(seed.teacher_id, roles=("TEACHER",))
+    async with session_factory() as db, db.begin():
+        untouched = [
+            ChatThread(
+                owner_id=seed.other_teacher_id,
+                mode="TEACHER",
+                course_id=seed.course_id,
+                submission_id=seed.submission_id,
+            ),
+            ChatThread(
+                owner_id=seed.teacher_id,
+                mode="TEACHER",
+                course_id=seed.other_course_id,
+            ),
+            ChatThread(
+                owner_id=seed.teacher_id,
+                mode="STUDENT",
+                course_id=seed.course_id,
+                attempt_id=seed.attempt_id,
+            ),
+        ]
+        db.add_all(untouched)
+        await db.flush()
+        untouched_ids = [thread.id for thread in untouched]
+        decisions_before = list((await db.scalars(select(ReviewDecision.id))).all())
+        outbox_before = list((await db.scalars(select(SyncOutbox.id))).all())
+    payload = {"submission": str(seed.submission_id), "course": str(seed.course_id)}
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        headers = await _csrf(client)
+        original = await client.post("/api/v1/ai/teacher-threads", json=payload, headers=headers)
+        original_id = original.json()["id"]
+        old_message = await client.post(
+            f"/api/v1/ai/threads/{original_id}/messages",
+            headers=headers,
+            json={"content": "Старый вопрос"},
+        )
+        assert old_message.status_code == 200, old_message.text
+        reset = await client.post("/api/v1/ai/teacher-threads/reset", json=payload, headers=headers)
+        assert reset.status_code == 201, reset.text
+        new_id = reset.json()["id"]
+        assert new_id != original_id
+        assert len(provider.calls) == 1  # Clearing is not a paid model request.
+        listed = await client.get(f"/api/v1/ai/threads?course_id={seed.course_id}&mode=TEACHER")
+        assert listed.json()[0]["id"] == new_id
+        assert listed.json()[0]["status"] == "OPEN"
+        empty = await client.get(f"/api/v1/ai/threads/{new_id}/messages")
+        assert empty.json() == []
+        archived = await client.get(f"/api/v1/ai/threads/{original_id}/messages")
+        assert [message["content"] for message in archived.json()] == [
+            "Старый вопрос",
+            "Explanation 1",
+        ]
+        closed = await client.post(
+            f"/api/v1/ai/threads/{original_id}/messages",
+            headers=headers,
+            json={"content": "Нельзя продолжить старый диалог"},
+        )
+        assert closed.status_code == 409, closed.text
+        sent = await client.post(
+            f"/api/v1/ai/threads/{new_id}/messages",
+            headers=headers,
+            json={"content": "Новый вопрос"},
+        )
+        assert sent.status_code == 200, sent.text
+    assert len(provider.calls) == 2
+    assert provider.calls[-1]["history"] == []
+    assert provider.calls[-1]["context"]["files"]
+    assert provider.calls[-1]["context"]["task"]
+    async with session_factory() as db:
+        assert (await db.get(ChatThread, uuid.UUID(original_id))).status == "CLOSED"
+        for ident in untouched_ids:
+            assert (await db.get(ChatThread, ident)).status == "OPEN"
+        assert list((await db.scalars(select(ReviewDecision.id))).all()) == decisions_before
+        assert list((await db.scalars(select(SyncOutbox.id))).all()) == outbox_before
+
+
+@pytest.mark.parametrize("actor", ["student", "other_teacher", "wrong_course", "disabled"])
+async def test_teacher_chat_reset_requires_current_access_and_keeps_data_on_failure(
+    api_bundle, actor
+):
+    app, session_factory, _settings, seed, holder = api_bundle
+    provider = RecordingAIProvider()
+    app.state.ai_provider = provider
+    holder["auth"] = _context(seed.teacher_id, roles=("TEACHER",))
+    payload = {"submission": str(seed.submission_id), "course": str(seed.course_id)}
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        headers = await _csrf(client)
+        created = await client.post("/api/v1/ai/teacher-threads", json=payload, headers=headers)
+        assert created.status_code == 201, created.text
+        old_id = uuid.UUID(created.json()["id"])
+        if actor == "student":
+            holder["auth"] = _context(seed.student_id, roles=("STUDENT",))
+        elif actor == "other_teacher":
+            holder["auth"] = _context(seed.other_teacher_id, roles=("TEACHER",))
+        elif actor == "wrong_course":
+            payload["course"] = str(seed.other_course_id)
+        else:
+            async with session_factory() as db, db.begin():
+                assessment = await db.get(Assessment, seed.assessment_id)
+                assessment.teacher_ai_enabled = False
+        denied = await client.post(
+            "/api/v1/ai/teacher-threads/reset", json=payload, headers=headers
+        )
+        assert denied.status_code in (403, 404), denied.text
+    assert not provider.calls
+    async with session_factory() as db:
+        assert (await db.get(ChatThread, old_id)).status == "OPEN"
+        assert await db.scalar(select(func.count()).select_from(ChatThread)) == 1
 
 
 async def test_system_settings_can_audit_teacher_chat_but_cannot_mutate_it(api_bundle):
@@ -1131,3 +1315,100 @@ async def test_system_revision_and_scoped_outbox_retry(api_bundle):
     assert retried.json()["attempts"] == 0
     assert superseded.status_code == 409
     assert superseded.json()["code"] == "GRADE_DECISION_SUPERSEDED"
+
+
+@pytest.mark.parametrize("fail", [False, True])
+async def test_teacher_stream_persists_only_a_completed_answer_and_uses_server_context(
+    api_bundle, fail
+):
+    app, session_factory, _settings, seed, holder = api_bundle
+
+    class StreamingProvider(RecordingAIProvider):
+        async def stream_answer(self, **kwargs):
+            answer = await self.answer(**kwargs)
+            yield AIStreamEvent("thinking", summary="указатели и память")
+            yield AIStreamEvent("delta", text="**Начало** ")
+            if fail:
+                raise IntegrationProtocolError("Provider interrupted the stream")
+            yield AIStreamEvent("delta", text=answer.content)
+            yield AIStreamEvent(
+                "done",
+                answer=AIAnswer(
+                    content="**Начало** " + answer.content,
+                    citations=answer.citations,
+                    model=answer.model,
+                ),
+            )
+
+    provider = StreamingProvider()
+    app.state.ai_provider = provider
+    holder["auth"] = _context(seed.teacher_id, roles=("TEACHER",))
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        headers = await _csrf(client)
+        created = await client.post(
+            "/api/v1/ai/teacher-threads",
+            headers=headers,
+            json={"submission": str(seed.submission_id), "course": str(seed.course_id)},
+        )
+        thread_id = created.json()["id"]
+        response = await client.post(
+            f"/api/v1/ai/threads/{thread_id}/messages?stream=true",
+            headers=headers,
+            json={
+                "content": "Объясни выделенный фрагмент",
+                "teacher_comment": "Текущий комментарий",
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert response.headers["content-type"].startswith("text/event-stream")
+        assert response.headers["x-accel-buffering"] == "no"
+        events = [
+            (frame.splitlines()[0][7:], json.loads(frame.splitlines()[1][6:]))
+            for frame in response.text.strip().split("\n\n")
+        ]
+        assert events[0][0] == "thinking"
+        assert ("thinking", {"summary": "указатели и память"}) in events
+        assert any(kind == "delta" for kind, _ in events)
+        assert events[-1][0] == ("error" if fail else "done")
+        stored = (await client.get(f"/api/v1/ai/threads/{thread_id}/messages")).json()
+    assert provider.calls[0]["context"]["task"]["statement"] == "Return zero for the fixture"
+    assert provider.calls[0]["context"]["files"][0]["content"] == "int main() { return 0; }\n"
+    assert provider.calls[0]["context"]["teacher_comment"]["content"] == "Текущий комментарий"
+    assert [item["role"] for item in stored] == (["USER"] if fail else ["USER", "ASSISTANT"])
+    assert all("указатели и память" not in item["content"] for item in stored)
+    if not fail:
+        assert events[-1][1]["content"] == stored[-1]["content"]
+    async with session_factory() as db:
+        assert await db.scalar(select(func.count(ReviewDraft.id))) == 0
+
+
+async def test_stream_auth_csrf_and_rate_budget_are_checked_before_provider(api_bundle):
+    app, _factory, settings, seed, holder = api_bundle
+    provider = RecordingAIProvider()
+    app.state.ai_provider = provider
+    settings.ai_teacher_rate_limit_messages = 1
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        headers = await _csrf(client)
+        created = await client.post(
+            "/api/v1/ai/teacher-threads",
+            headers=headers,
+            json={"submission": str(seed.submission_id), "course": str(seed.course_id)},
+        )
+        endpoint = f"/api/v1/ai/threads/{created.json()['id']}/messages?stream=true"
+        rejected = await client.post(endpoint, json={"content": "Missing CSRF"})
+        assert rejected.status_code == 403
+        holder["auth"] = _context(seed.other_teacher_id, roles=("TEACHER",))
+        rejected = await client.post(endpoint, headers=headers, json={"content": "Wrong owner"})
+        assert rejected.status_code == 404
+        assert provider.calls == []
+        holder["auth"] = _context(seed.teacher_id, roles=("TEACHER",))
+        assert (
+            await client.post(endpoint, headers=headers, json={"content": "Check"})
+        ).status_code == 200
+        rejected = await client.post(endpoint, headers=headers, json={"content": "Check again"})
+        assert rejected.status_code == 429
+        assert len(provider.calls) == 1

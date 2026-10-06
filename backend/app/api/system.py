@@ -34,6 +34,9 @@ from app.models.integration import AuditEntry, SyncOutbox, SystemSetting
 from app.models.review import ReviewDecision
 from app.models.tasks import Assessment
 from app.schemas.system import (
+    AIChatCleanupCountsRead,
+    AIChatCleanupPreviewRead,
+    AIChatCleanupRequest,
     ServiceHealthRead,
     SyncOutboxRead,
     SyncOutboxRetryRequest,
@@ -45,6 +48,7 @@ from app.schemas.system import (
     TeacherAccessTokenSecretRead,
     TeacherAccessTokenUpdateRequest,
 )
+from app.services.ai_chat_cleanup import preview_chat_cleanup, purge_closed_chats
 from app.services.common import DomainError
 from app.services.policy import (
     require_membership,
@@ -131,6 +135,37 @@ async def get_system_settings(
 ) -> SystemSettingsRead:
     settings: Settings = request.app.state.settings
     return await _settings_read(db, settings)
+
+
+@router.get("/system/ai-chat-cleanup", response_model=AIChatCleanupPreviewRead)
+async def get_ai_chat_cleanup(
+    _admin: SystemAdmin, request: Request, db: Database,
+) -> AIChatCleanupPreviewRead:
+    return await preview_chat_cleanup(db, request.app.state.settings)
+
+
+@router.post("/system/ai-chat-cleanup", response_model=AIChatCleanupCountsRead)
+async def clean_up_ai_chats(
+    body: AIChatCleanupRequest, admin: SystemAdmin, request: Request, db: Database,
+) -> AIChatCleanupCountsRead:
+    try:
+        async with db.begin():
+            result = await purge_closed_chats(
+                db, request.app.state.settings, closed_before=body.closed_before,
+            )
+            db.add(AuditEntry(
+                actor_id=admin.principal_id,
+                action="ai_chats.cleaned_up",
+                object_type="ChatThread",
+                request_id=str(getattr(request.state, "request_id", ""))[:100],
+                metadata_json={
+                    **result.model_dump(),
+                    "closed_before": body.closed_before.isoformat(),
+                },
+            ))
+        return result
+    except DomainError as exc:
+        _domain_error(exc)
 
 
 @router.patch("/system/settings", response_model=SystemSettingsRead)

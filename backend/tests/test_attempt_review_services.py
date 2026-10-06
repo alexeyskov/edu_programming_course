@@ -598,6 +598,7 @@ async def test_official_submission_history_excludes_teacher_experiment_runs(db):
         revision=snapshot.revision,
         build_profile="cpp-clang-c++20-multi",
         client_context={"ip_address": "203.0.113.13", "browser": "Safari"},
+        created_at=submission.submitted_at - timedelta(seconds=1),
     )
     private_run = RunRequest(
         origin=RunOrigin.TEACHER_EXPERIMENT.value,
@@ -607,7 +608,15 @@ async def test_official_submission_history_excludes_teacher_experiment_runs(db):
         revision=snapshot.revision,
         build_profile="cpp-clang-c++20-multi",
     )
-    db.add_all([student_run, private_run])
+    later_run = RunRequest(
+        origin=RunOrigin.STUDENT_ATTEMPT.value,
+        attempt_id=attempt.id,
+        requested_by_id=student.id,
+        revision=snapshot.revision,
+        build_profile="cpp-clang-c++20-multi",
+        created_at=submission.submitted_at + timedelta(seconds=1),
+    )
+    db.add_all([student_run, private_run, later_run])
     await db.flush()
 
     history = await _submission_history(
@@ -619,6 +628,7 @@ async def test_official_submission_history_excludes_teacher_experiment_runs(db):
     history_ids = {event.id for event in history}
     assert student_run.id in history_ids
     assert private_run.id not in history_ids
+    assert later_run.id not in history_ids
     run_history = next(event for event in history if event.id == student_run.id)
     assert run_history.client is not None
     assert run_history.client.ip_address == "203.0.113.13"

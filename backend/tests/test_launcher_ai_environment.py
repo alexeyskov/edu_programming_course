@@ -128,6 +128,12 @@ def test_launcher_loads_new_host_settings_without_exposing_keys(tmp_path, thinki
         'LLM_API_ADDRESS="http://host.docker.internal:11434/api"\n'
         f'LLM_API_KEY="{api_key}"\nLLM_MODEL="Maternion/minicpm5:2b-q4_K_M"\n'
         f"LLM_THINKING={thinking}\n"
+        'AI_TIMEOUT_SECONDS=180\nAI_STREAM_IDLE_TIMEOUT_SECONDS=60\n'
+        'HTTP_PROXY="http://127.0.0.1:10809"\n'
+        'HTTPS_PROXY="http://127.0.0.1:10809"\n'
+        'CONTAINER_HTTP_PROXY="http://host.docker.internal:10809"\n'
+        'CONTAINER_HTTPS_PROXY="http://host.docker.internal:10809"\n'
+        'NO_PROXY="moodle.example.edu"\n'
         'MOODLE_SYNC_TIMEOUT="600"\n'
         'AI_API_KEY="stale-ai-secret"\nAI_MODEL="stale-ai-model"\n'
         'OPENROUTER_API_KEY="stale-router-secret"\nOPENROUTER_MODEL="stale-router-model"\n'
@@ -143,13 +149,25 @@ if [ "$1" = "volume" ]; then exit 1; fi
 printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \\
   "$LLM_API_ADDRESS" "$LLM_API_KEY" "$LLM_MODEL" "$LLM_THINKING" \\
   "$AI_ENABLED" "$AI_API_STYLE" "$MOODLE_SYNC_TIMEOUT" > "$EDUPROG_CAPTURE_FILE"
+printf '%s\\n%s\\n%s\\n%s\\n%s\\n' \\
+  "$HTTP_PROXY" "$HTTPS_PROXY" "$CONTAINER_HTTP_PROXY" \\
+  "$CONTAINER_HTTPS_PROXY" "$NO_PROXY" >> "$EDUPROG_CAPTURE_FILE"
 """
     )
     fake_docker.chmod(fake_docker.stat().st_mode | stat.S_IXUSR)
     environment = {
         name: value
         for name, value in os.environ.items()
-        if not name.startswith(("LLM_", "AI_", "OPENROUTER_")) and name != "MOODLE_SYNC_TIMEOUT"
+        if not name.startswith(("LLM_", "AI_", "OPENROUTER_"))
+        and name
+        not in {
+            "MOODLE_SYNC_TIMEOUT",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+            "CONTAINER_HTTP_PROXY",
+            "CONTAINER_HTTPS_PROXY",
+        }
     }
     environment.update(
         {
@@ -175,8 +193,15 @@ printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \\
         "true",
         "auto",
         "600",
+        "http://127.0.0.1:10809",
+        "http://127.0.0.1:10809",
+        "http://host.docker.internal:10809",
+        "http://host.docker.internal:10809",
+        "moodle.example.edu",
     ]
     assert f"LLM_THINKING={thinking}" in result.stdout
+    assert "AI_TIMEOUT_SECONDS=180" in result.stdout
+    assert "AI_STREAM_IDLE_TIMEOUT_SECONDS=60" in result.stdout
     assert "LLM_API_KEY=" + ("configured" if api_key else "not configured") in result.stdout
     for secret in (api_key, "stale-ai-secret", "stale-router-secret"):
         if secret:
@@ -185,7 +210,8 @@ printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \\
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="Docker Compose is optional locally")
 @pytest.mark.parametrize("new_names", [False, True])
-def test_real_compose_interpolation_of_provider_settings(new_names):
+@pytest.mark.parametrize("proxy_mode", ["none", "generic", "container"])
+def test_real_compose_interpolation_of_provider_settings(new_names, proxy_mode):
     environment = {
         "PATH": os.environ["PATH"],
         "APP_SECRET_KEY": "test-only-secret",
@@ -202,6 +228,21 @@ def test_real_compose_interpolation_of_provider_settings(new_names):
         "AI_API_STYLE": "responses",
         "MOODLE_SYNC_TIMEOUT": "600",
     }
+    if proxy_mode != "none":
+        environment.update(
+            {
+                "HTTP_PROXY": "http://127.0.0.1:10809",
+                "HTTPS_PROXY": "http://127.0.0.1:10809",
+                "NO_PROXY": "moodle.example.edu,other-internal-service",
+            }
+        )
+    if proxy_mode == "container":
+        environment.update(
+            {
+                "CONTAINER_HTTP_PROXY": "http://host.docker.internal:10809",
+                "CONTAINER_HTTPS_PROXY": "http://host.docker.internal:10809",
+            }
+        )
     if new_names:
         environment.update(
             {
@@ -242,6 +283,25 @@ def test_real_compose_interpolation_of_provider_settings(new_names):
         assert config["LLM_MODEL"] == ("local/model" if new_names else "old-test-model")
         assert config["LLM_THINKING"] == ("0" if new_names else "")
         assert config["AI_API_STYLE"] == ("auto" if new_names else "responses")
+        for key in ("HTTP_PROXY", "HTTPS_PROXY"):
+            assert config[key] == environment.get(f"CONTAINER_{key}", environment.get(key, ""))
+        bypass = set(config["NO_PROXY"].split(","))
+        assert {
+            "localhost",
+            "127.0.0.1",
+            "::1",
+            "backend",
+            "postgres",
+            "runner",
+            "moodle-browser",
+            "sync-worker",
+            "deadline-worker",
+            "host.docker.internal",
+        } <= bypass
+        if proxy_mode != "none":
+            assert {"moodle.example.edu", "other-internal-service"} <= bypass
         assert "host.docker.internal=host-gateway" in services[name]["extra_hosts"]
     for name in ("frontend", "runner", "sync-worker", "deadline-worker", "moodle-browser"):
         assert "LLM_API_KEY" not in services[name].get("environment", {})
+        assert "HTTP_PROXY" not in services[name].get("environment", {})
+        assert "HTTPS_PROXY" not in services[name].get("environment", {})

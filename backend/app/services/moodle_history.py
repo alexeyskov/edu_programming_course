@@ -44,6 +44,7 @@ from app.models.identity import ExternalPrincipal, MoodleCredential
 from app.models.integration import ExternalMapping, SyncOutbox
 from app.models.review import ReviewDecision
 from app.models.tasks import Assessment, AssessmentItem, TaskBankItem, TaskVersion
+from app.services.ai_review import enqueue_ai_code_review
 from app.services.common import canonical_hash, language_for_path, validate_source_path
 from app.services.moodle_attempt_reconciliation import (
     deleted_quiz_attempt_ids,
@@ -917,6 +918,17 @@ async def _sync_imported_decision(
         item.get("grade_max"),
         assessment.max_score,
     )
+    comment = str(item.get("comment") or "")[:50_000]
+    # A teacher may leave feedback without a numeric mark. Keep that feedback
+    # without inventing a grade or treating it as a missing human review.
+    submission.external_receipt = {
+        **dict(submission.external_receipt or {}),
+        "moodle_review": {
+            "grade": format(grade, "f") if grade is not None else None,
+            "comment": comment,
+            "reviewer_name": " ".join(str(item.get("reviewer_name") or "").split())[:255],
+        },
+    }
     imported = list(
         (
             await db.scalars(
@@ -927,14 +939,15 @@ async def _sync_imported_decision(
         ).all()
     )
     latest = imported[0] if imported else None
-    # Never overwrite a teacher's local re-check with a later Moodle refresh.
-    if latest is not None and latest.lms_export_state != "IMPORTED":
+    # Keep an explicitly approved local re-check while its export is pending
+    # (or failed). Once delivered, Moodle becomes authoritative again: a
+    # subsequent manual correction there must not remain hidden locally.
+    if latest is not None and latest.lms_export_state not in {"IMPORTED", "DELIVERED"}:
         return
     if grade is None:
         if latest is not None:
             latest.status = "SUPERSEDED"
         return
-    comment = str(item.get("comment", ""))[:50_000]
     criterion_scores = {
         "source": "MOODLE_HISTORY",
         # Preserve the remote scale verbatim for auditability.  The local
@@ -948,9 +961,13 @@ async def _sync_imported_decision(
     }
     if (
         latest is not None
+        and latest.status == "APPLIED"
         and latest.grade == grade
         and latest.comment == comment
-        and latest.criterion_scores == criterion_scores
+        and (
+            latest.lms_export_state == "DELIVERED"
+            or latest.criterion_scores == criterion_scores
+        )
     ):
         return
     if latest is not None:
@@ -1825,6 +1842,8 @@ async def _materialize_flat_historical_submissions(
                     course=course,
                     item=item,
                 )
+                await db.flush()
+                await enqueue_ai_code_review(db, submission)
             stats = stats.add("unchanged")
             continue
         converted = (prepared_sources or {}).get(external_id)
@@ -2132,6 +2151,10 @@ async def _materialize_flat_historical_submissions(
             course=course,
             item=item,
         )
+        # Both a new import and a changed immutable snapshot get an independent
+        # advisory job. The unique snapshot key keeps repeat imports idempotent.
+        await db.flush()
+        await enqueue_ai_code_review(db, submission)
     await db.flush()
     return stats
 

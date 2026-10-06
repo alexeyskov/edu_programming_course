@@ -9,6 +9,8 @@ import { SettingsPage } from './SettingsPage';
 
 const mocks = vi.hoisted(() => ({
   getSettings: vi.fn(),
+  getAiChatCleanup: vi.fn(),
+  cleanUpAiChats: vi.fn(),
   updateSettings: vi.fn(),
   getHealth: vi.fn(),
   getCourseCatalog: vi.fn(),
@@ -35,6 +37,8 @@ vi.mock('../lib/api', async (importOriginal) => {
     ...original,
     api: {
     getSettings: mocks.getSettings,
+    getAiChatCleanup: mocks.getAiChatCleanup,
+    cleanUpAiChats: mocks.cleanUpAiChats,
     updateSettings: mocks.updateSettings,
     getHealth: mocks.getHealth,
     getCourseCatalog: mocks.getCourseCatalog,
@@ -140,6 +144,10 @@ beforeEach(() => {
   authState.elevated = true;
   Object.values(mocks).forEach((mock) => mock.mockReset());
   mocks.getSettings.mockResolvedValue(settings);
+  mocks.getAiChatCleanup.mockResolvedValue({
+    threads: 0, teacherThreads: 0, studentThreads: 0, messages: 0,
+    closedBefore: '2026-10-05T09:55:00Z', graceSeconds: 300, protectedThreads: 0,
+  });
   mocks.updateSettings.mockResolvedValue(settings);
   mocks.getHealth.mockResolvedValue({ status: 'ok', database: 'ok', build: 'test' });
   mocks.getCourseCatalog.mockResolvedValue([course]);
@@ -157,6 +165,15 @@ beforeEach(() => {
 });
 
 describe('administrator elevation renewal', () => {
+  it('returns to administrator token entry if chat cleanup access expires', async () => {
+    mocks.getAiChatCleanup.mockRejectedValue(new ApiError(403, 'CAPABILITY_REQUIRED', 'Missing SYSTEM_SETTINGS'));
+    renderSettings();
+    expect(await screen.findByRole('heading', { name: 'Возобновление доступа' })).toBeInTheDocument();
+    expect(mocks.invalidateElevation).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('heading', { name: 'Очистка переписок с ИИ' })).not.toBeInTheDocument();
+    expect(mocks.cleanUpAiChats).not.toHaveBeenCalled();
+  });
+
   it('offers a local token step-up when settings are opened without an active elevation', async () => {
     const rememberedToken = 'remembered-admin-token';
     saveRememberedToken('adminToken', rememberedToken);
@@ -167,6 +184,8 @@ describe('administrator elevation renewal', () => {
     expect(await screen.findByRole('heading', { name: 'Возобновление доступа' })).toBeInTheDocument();
     expect(screen.getByLabelText('Токен администратора')).toHaveValue(rememberedToken);
     expect(mocks.getSettings).not.toHaveBeenCalled();
+    expect(mocks.getAiChatCleanup).not.toHaveBeenCalled();
+    expect(mocks.cleanUpAiChats).not.toHaveBeenCalled();
 
     fireEvent.submit(screen.getByLabelText('Токен администратора').closest('form')!);
     await waitFor(() => expect(mocks.elevate).toHaveBeenCalledWith(rememberedToken));

@@ -6,9 +6,12 @@ import {
 import { languageForPath, unwrapList } from './utils';
 import { createUuid } from './uuid';
 import type {
-  Assessment, AssessmentPublicationTargets, AssessmentSyncStatus, Attempt, AttemptStatus, AuthConnection, AuthorshipAnalysis, AvailabilityRule, Course, CourseCatalogEntry, CourseGroup, CourseSyncStatus, Diagnostic, EvidenceReport, HiddenTestManifestV1, HistoryEvent, InteractiveRun, LmsActivity, Role, RunResult,
+  AiCodeReview, Assessment, AssessmentPublicationTargets, AssessmentSyncStatus, Attempt, AttemptStatus, AuthConnection, AuthorshipAnalysis, AvailabilityRule, Course, CourseCatalogEntry, CourseGroup, CourseSyncStatus, Diagnostic, EvidenceReport, HiddenTestManifestV1, HistoryEvent, InteractiveRun, LmsActivity, Role, RunResult,
   CourseImportJob, InternalPasteRange, MoodleHistoryImportEvent, Session, SimilarityAnalysis, SimilarityComparison, SimilarityMatch, Submission, SystemHealth, SystemSettings, TaskBankItem, TaskVersion, TeacherAccessToken, TeacherAccessTokenIssued, TeacherExperiment, WorkspaceFile,
 } from '../types';
+
+import type { AiChatCleanupCounts, AiChatCleanupPreview } from '../types';
+import { readAiStream, type AiStreamEvent } from './aiStream';
 
 type DemoMode = 'always' | 'auto' | 'never';
 const envMode = import.meta.env.VITE_DEMO_MODE;
@@ -50,6 +53,8 @@ const LOCALIZED_API_ERROR_MESSAGES: Readonly<Record<string, string>> = {
   INVALID_RESPONSE: 'Внешний сервис вернул неожиданный ответ.',
   RESPONSE_TOO_LARGE: 'Ответ внешнего сервиса слишком большой.',
   AI_CONTEXT_TOO_LARGE: 'Условие и код целиком не помещаются в лимит контекста ИИ. Обратитесь к администратору для увеличения лимита.',
+  SYSTEM_SETTINGS_REQUIRED: 'Для изменения настройки нужен действующий административный доступ.',
+  AI_REVIEW_CONTEXT_MISSING: 'Не удалось сопоставить сдачу с заданием. Повторите синхронизацию работы.',
   LMS_IMPORT_REQUIRES_CONFIGURATION: 'Импортированная работа ещё не готова. Синхронизируйте курс с Moodle.',
   MOODLE_SOURCE_UNCONFIRMED: 'Moodle не подтвердил все параметры работы. Повторите синхронизацию курса.',
   MOODLE_QUIZ_GRADING_METHOD_UNCONFIRMED: 'Не удалось подтвердить метод оценивания теста Moodle. Повторите синхронизацию курса.',
@@ -225,6 +230,33 @@ function apiError(status: number, body: Record<string, unknown>): ApiError {
     body.trace_id ? String(body.trace_id) : undefined,
     issues,
   );
+}
+
+async function requestAiStream(
+  path: string, body: string,
+  options: { signal?: AbortSignal; onEvent(event: AiStreamEvent): void },
+  retryCsrf = true,
+): Promise<import('./aiStream').AiChatMessage> {
+  await ensureCsrf(false, options.signal);
+  return withRequestDeadline(options.signal, EXTERNAL_OPERATION_TIMEOUT_MS, async (signal) => {
+    const response = await fetch(`${apiBase}${path}`, {
+      method: 'POST', body, signal, credentials: 'include',
+      headers: { Accept: 'text/event-stream', 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken! },
+    });
+    const returnedCsrf = response.headers.get('X-CSRFToken');
+    if (returnedCsrf) csrfToken = returnedCsrf;
+    if (!response.ok) {
+      const error = apiError(response.status, await response.json().catch(() => ({})));
+      // Only rejected CSRF requests can be resent; never retry a started model request.
+      if (response.status === 403 && error.code === 'CSRF_FAILED' && retryCsrf) {
+        await ensureCsrf(true, signal);
+        return requestAiStream(path, body, { ...options, signal }, false);
+      }
+      if (response.status === 401) window.dispatchEvent(new CustomEvent(AUTH_UNAUTHORIZED_EVENT));
+      throw error;
+    }
+    return readAiStream(response, options.onEvent, (detail) => apiError(502, detail));
+  });
 }
 
 async function withDemo<T>(real: () => Promise<T>, demo: () => T | Promise<T>): Promise<T> {
@@ -411,6 +443,7 @@ function mapAssessment(raw: any, courseId: string): Assessment {
     standard: String(raw.standard ?? raw.language_standard ?? task?.language_standard ?? 'C/C++'),
     pastePolicy: ['ALLOW', 'UNRESTRICTED'].includes(String(raw.paste_policy).toUpperCase()) ? 'ALLOW' : 'STRICT',
     aiEnabled: Boolean(raw.ai_enabled ?? raw.student_ai_enabled), submissionsCount: raw.submissions_count, uncheckedCount: raw.unchecked_count,
+    aiReviewEnabled: raw.ai_review_enabled === true,
     reviewRequired: raw.review_required === undefined ? undefined : Boolean(raw.review_required),
     decisionSupportEnabled: raw.decision_support_enabled === undefined ? undefined : Boolean(raw.decision_support_enabled),
     availabilityRules: raw.availability_rules === undefined ? undefined : unwrapList<any>(raw.availability_rules).map(mapAvailabilityRule),
@@ -418,6 +451,29 @@ function mapAssessment(raw: any, courseId: string): Assessment {
     taskVersionIds: unwrapList<any>(raw.items ?? []).map((item) => item.task_version ?? item.task?.id).filter((value) => value !== undefined && value !== null).map(String),
     policy: raw.policy && typeof raw.policy === 'object' ? raw.policy as Record<string, unknown> : undefined,
     requiresLiveLmsPreparation: Boolean(raw.requires_live_lms_preparation),
+  };
+}
+
+function mapAiCodeReview(raw: any): AiCodeReview {
+  return {
+    id: raw.id || undefined,
+    enabled: raw.enabled === true,
+    automatic: raw.automatic === true,
+    state: raw.state,
+    attemptCount: Number(raw.attempt_count ?? 0),
+    maxAttempts: Number(raw.max_attempts ?? 3),
+    summary: String(raw.summary ?? ''),
+    recommendedGrade: raw.recommended_grade == null ? null : Number(raw.recommended_grade),
+    recommendedComment: String(raw.recommended_comment ?? ''),
+    recommendationStatus: raw.recommendation_status ?? 'NONE',
+    moodleRefreshState: raw.moodle_refresh_state || undefined,
+    moodleRefreshError: raw.moodle_refresh_error || undefined,
+    findings: unwrapList<any>(raw.findings ?? []).map((finding) => ({
+      path: String(finding.path), line: Number(finding.line),
+      endLine: finding.end_line == null ? undefined : Number(finding.end_line),
+      severity: finding.severity, message: String(finding.message),
+    })),
+    model: raw.model || undefined, error: raw.error || undefined,
   };
 }
 
@@ -678,6 +734,7 @@ function mapSubmission(raw: any): Submission {
     claim: raw.claim ? { id: String(raw.claim.id), ownerId: String(raw.claim.owner_id), ownerName: String(raw.claim.owner_name), expiresAt: raw.claim.lease_expires_at ?? raw.claim.expires_at, mine: Boolean(raw.claim.mine) } : undefined,
     files: unwrapList<any>(raw.files ?? []).map(mapFile), history: mapHistory(raw.history ?? []),
     latestDecision, decisionHistory, reviewGroup: mapSubmissionReviewGroup(raw),
+    moodleFeedbackComment: String(raw.moodle_feedback_comment ?? ''),
     originVerification: rawOrigin && typeof rawOrigin === 'object' ? {
       state: String(rawOrigin.state ?? 'UNAVAILABLE').toUpperCase() as NonNullable<Submission['originVerification']>['state'],
       transport: rawOrigin.transport ? String(rawOrigin.transport) : undefined,
@@ -699,11 +756,18 @@ function mapReviewDecision(raw: any) {
 
 function mapHistory(items: any[]): HistoryEvent[] {
   return items.map((item, index) => {
-    const eventType = String(item.event_type ?? item.type ?? 'TEXT_EDIT').toUpperCase();
+    const edit = item.event && typeof item.event === 'object' ? item.event : item;
+    const eventType = String(edit.event_type ?? item.type ?? 'TEXT_EDIT').toUpperCase();
     const explicitType = String(item.type ?? '').toLowerCase();
     const type: HistoryEvent['type'] = ['edit', 'run', 'snapshot', 'paste_blocked', 'internal_paste', 'submit'].includes(explicitType)
       ? explicitType as HistoryEvent['type']
-      : eventType.includes('RUN') ? 'run' : eventType.includes('SNAPSHOT') ? 'snapshot' : eventType.includes('SUBMIT') ? 'submit' : item.source === 'INTERNAL_PASTE' ? 'internal_paste' : 'edit';
+      : eventType.includes('RUN') ? 'run' : eventType.includes('SNAPSHOT') ? 'snapshot' : eventType.includes('SUBMIT') ? 'submit' : edit.source === 'INTERNAL_PASTE' ? 'internal_paste' : 'edit';
+    const pathChange = Array.isArray(edit.changes) ? edit.changes.find((change: any) => typeof change?.path === 'string') : undefined;
+    const filePath = item.file_path ?? pathChange?.path;
+    const changes = Array.isArray(item.edit_details) && item.edit_details.length ? item.edit_details
+      : Array.isArray(edit.changes) ? edit.changes.filter((change: any) => change?.type === 'contiguous_delta').map((change: any) => ({
+        ...change, operation: change.delete_count > 0 ? change.insert_text ? 'replace' : 'delete' : change.insert_text ? 'insert' : 'unchanged',
+      })) : [];
     const rawClient = item.client ?? item.client_context;
     const client = rawClient && typeof rawClient === 'object' ? {
       ipAddress: rawClient.ip_address ? String(rawClient.ip_address) : undefined,
@@ -716,11 +780,33 @@ function mapHistory(items: any[]): HistoryEvent[] {
       id: String(item.id ?? `history-${index}`), type,
       label: item.label ?? (type === 'internal_paste' ? 'Внутренняя вставка' : eventType.startsWith('FILE_') ? 'Изменена структура файлов' : 'Изменён код'),
       detail: item.detail ?? `${item.source ?? 'TYPING'} · последовательность ${item.sequence ?? item.revision ?? 0}`,
+      fileId: edit.file_id ? String(edit.file_id) : undefined,
+      filePath: typeof filePath === 'string' ? filePath : undefined,
+      editDetails: changes.filter((change: any) => ['insert', 'delete', 'replace', 'create', 'remove', 'unchanged'].includes(change?.operation)).map((change: any) => ({
+        operation: change.operation,
+        offset: Number.isInteger(change.offset) && change.offset >= 0 ? change.offset : undefined,
+        deleteCount: Number.isInteger(change.delete_count) && change.delete_count >= 0 ? change.delete_count : undefined,
+        insertText: typeof change.insert_text === 'string' ? change.insert_text : null,
+        deletedText: typeof change.deleted_text === 'string' ? change.deleted_text : null,
+        startLine: Number.isInteger(change.start_line) && change.start_line > 0 ? change.start_line : undefined,
+        startColumn: Number.isInteger(change.start_column) && change.start_column > 0 ? change.start_column : undefined,
+        endLine: Number.isInteger(change.end_line) && change.end_line > 0 ? change.end_line : undefined,
+        endColumn: Number.isInteger(change.end_column) && change.end_column > 0 ? change.end_column : undefined,
+      })),
       at: item.at ?? item.received_at ?? item.created_at ?? new Date().toISOString(),
       revision: Number(item.revision ?? item.sequence ?? 0),
       client,
     };
   });
+}
+
+function mapAiChatCleanupCounts(raw: any): AiChatCleanupCounts {
+  return {
+    threads: Number(raw.threads),
+    teacherThreads: Number(raw.teacher_threads),
+    studentThreads: Number(raw.student_threads),
+    messages: Number(raw.messages),
+  };
 }
 
 function mapSettings(raw: any): SystemSettings {
@@ -981,6 +1067,15 @@ export const api = {
     }), ''),
     () => {
       assessmentState = assessmentState.map((item) => item.id === assessmentId ? { ...item, aiEnabled: studentAiEnabled ?? item.aiEnabled, publicationStatus: 'PUBLISHED', status: 'AVAILABLE' } : item);
+      return cloneDemo(assessmentState.find((item) => item.id === assessmentId)!);
+    },
+  ),
+  setAssessmentAiReviewPolicy: (assessmentId: string, enabled: boolean) => withDemo(
+    async () => mapAssessment(await request(`/assessments/${assessmentId}/ai-review-policy`, {
+      method: 'PATCH', body: JSON.stringify({ enabled }),
+    }), ''),
+    () => {
+      assessmentState = assessmentState.map((item) => item.id === assessmentId ? { ...item, aiReviewEnabled: enabled } : item);
       return cloneDemo(assessmentState.find((item) => item.id === assessmentId)!);
     },
   ),
@@ -1249,6 +1344,22 @@ export const api = {
     () => [...warningIds],
   ),
   getSubmission: (id: string) => withDemo(async () => mapSubmission(await request(`/submissions/${id}`)), () => cloneDemo(submissionsState.find((item) => item.id === id) ?? submissionsState[0])),
+  getAiCodeReview: (submissionId: string) => withDemo(
+    async () => mapAiCodeReview(await request(`/ai/submissions/${submissionId}/code-review`)),
+    (): AiCodeReview => ({ enabled: false, state: 'DISABLED', summary: '', findings: [] }),
+  ),
+  startAiCodeReview: (submissionId: string, retry = false) => withDemo(
+    async () => mapAiCodeReview(await request(`/ai/submissions/${submissionId}/code-review`, {
+      method: 'POST', body: JSON.stringify(retry ? { retry: true } : {}), timeoutMs: EXTERNAL_OPERATION_TIMEOUT_MS,
+    })),
+    (): AiCodeReview => ({ enabled: false, state: 'DISABLED', summary: '', findings: [] }),
+  ),
+  discardAiCodeReview: (submissionId: string, reviewId: string) => withDemo(
+    async () => mapAiCodeReview(await request(`/ai/submissions/${submissionId}/code-review/discard`, {
+      method: 'POST', body: JSON.stringify({ review_id: reviewId }),
+    })),
+    (): AiCodeReview => ({ id: reviewId, enabled: true, state: 'NOT_STARTED', recommendationStatus: 'DISCARDED', summary: '', findings: [] }),
+  ),
   getEvidenceRuns: (submissionId: string) => withDemo(
     async () => unwrapList<any>(await request(`/submissions/${submissionId}/evidence-runs?limit=50`)).map(mapEvidenceReport),
     () => cloneDemo(evidenceState.filter((report) => report.submissionId === submissionId)),
@@ -1310,15 +1421,15 @@ export const api = {
     const raw = await request<any>(`/review-claims/${claimId}/heartbeat`, { method: 'POST', body: '{}' });
     return { id: String(raw.id), ownerId: String(raw.owner?.id ?? raw.owner_id), ownerName: String(raw.owner?.display_name ?? raw.owner_name), expiresAt: raw.lease_expires_at ?? raw.expires_at, mine: true };
   }, () => ({ id: claimId, ownerId: 'teacher-demo', ownerName: teacherSession.displayName, expiresAt: inFuture(300), mine: true })),
-  saveReview: (submissionId: string, grade: number | null, comment: string) => withDemo(
-    () => request(`/submissions/${submissionId}/review-draft`, { method: 'PUT', body: JSON.stringify({ grade, comment }) }), () => ({ grade, comment, revision: 2 }),
+  saveReview: (submissionId: string, grade: number | null, comment: string, aiReviewId?: string) => withDemo(
+    () => request(`/submissions/${submissionId}/review-draft`, { method: 'PUT', body: JSON.stringify({ grade, comment, ...(aiReviewId ? { ai_review_id: aiReviewId } : {}) }) }), () => ({ grade, comment, aiReviewId, revision: 2 }),
   ),
   getReviewDraft: (submissionId: string) => withDemo(async () => {
     const raw = await request<any | null>(`/submissions/${submissionId}/review-draft`);
-    return raw ? { grade: raw.grade == null ? null : Number(raw.grade), comment: String(raw.comment ?? '') } : null;
+    return raw ? { grade: raw.grade == null ? null : Number(raw.grade), comment: String(raw.comment ?? ''), aiReviewId: raw.ai_review_id ? String(raw.ai_review_id) : undefined } : null;
   }, () => null),
-  finalizeReview: (submissionId: string, grade: number, comment: string) => withDemo(
-    async () => { const raw = await request<any>(`/submissions/${submissionId}/review-decisions`, { method: 'POST', headers: { 'Idempotency-Key': createUuid() }, body: JSON.stringify({ grade, comment }) }); return { id: String(raw.id), grade: Number(raw.grade ?? grade), comment: String(raw.comment ?? comment), lmsExportState: raw.lms_export_state ? String(raw.lms_export_state) : undefined }; },
+  finalizeReview: (submissionId: string, grade: number, comment: string, aiReviewId?: string) => withDemo(
+    async () => { const raw = await request<any>(`/submissions/${submissionId}/review-decisions`, { method: 'POST', headers: { 'Idempotency-Key': createUuid() }, body: JSON.stringify({ grade, comment, ...(aiReviewId ? { ai_review_id: aiReviewId } : {}) }) }); return { id: String(raw.id), grade: Number(raw.grade ?? grade), comment: String(raw.comment ?? comment), lmsExportState: raw.lms_export_state ? String(raw.lms_export_state) : undefined }; },
     () => {
       const decision = { id: createUuid(), reviewerName: teacherSession.displayName, grade, comment, revision: 1, reviewedAt: new Date().toISOString(), lmsExportState: 'PENDING' };
       submissionsState = submissionsState.map((item) => item.id === submissionId ? { ...item, status: 'GRADED', score: grade, claim: undefined, latestDecision: decision, decisionHistory: [decision, ...item.decisionHistory] } : item);
@@ -1373,6 +1484,10 @@ export const api = {
     () => request<{ id: string }>('/ai/teacher-threads', { method: 'POST', body: JSON.stringify({ submission: submissionId, course: courseId }) }),
     () => ({ id: `teacher-ai-${submissionId}` }),
   ),
+  resetTeacherAiThread: (submissionId: string, courseId: string) => withDemo(
+    () => request<{ id: string }>('/ai/teacher-threads/reset', { method: 'POST', body: JSON.stringify({ submission: submissionId, course: courseId }) }),
+    () => ({ id: `teacher-ai-${submissionId}-${createUuid()}` }),
+  ),
   getTeacherAiThreads: (courseId: string) => withDemo(
     async () => unwrapList<any>(await request(`/ai/threads?course_id=${encodeURIComponent(courseId)}&mode=TEACHER&limit=100`)).map((raw) => ({
       id: String(raw.id), submissionId: raw.submission_id ? String(raw.submission_id) : undefined,
@@ -1397,7 +1512,41 @@ export const api = {
       : 'Это демонстрационный ответ без результатов серверной проверки. В рабочем режиме помощник анализирует точный снимок сдачи и возвращает вывод со ссылками на доступные проверки.',
     citations: [{ title: 'cppreference · Statements', url: 'https://en.cppreference.com/w/cpp/language/statements' }],
   })),
+  sendAiMessageStream: async (
+    threadId: string, content: string, context: { teacherComment?: string },
+    options: { signal?: AbortSignal; onEvent(event: AiStreamEvent): void },
+  ) => {
+    if (demoMode === 'always') {
+      options.signal?.throwIfAborted();
+      options.onEvent({ type: 'thinking' });
+      const answer = await api.sendAiMessage(threadId, content, context);
+      options.signal?.throwIfAborted();
+      options.onEvent({ type: 'delta', text: answer.content });
+      return answer;
+    }
+    return requestAiStream(`/ai/threads/${threadId}/messages?stream=true`, JSON.stringify({ content, teacher_comment: context.teacherComment }), options);
+  },
   getSettings: () => withDemo(async () => mapSettings(await request('/system/settings')), () => cloneDemo(settingsState)),
+  // Destructive maintenance must never fall back to simulated success on errors.
+  getAiChatCleanup: async (): Promise<AiChatCleanupPreview> => {
+    if (demoMode === 'always') return {
+      threads: 0, teacherThreads: 0, studentThreads: 0, messages: 0,
+      closedBefore: new Date(Date.now() - 300_000).toISOString(), graceSeconds: 300, protectedThreads: 0,
+    };
+    const raw = await request<any>('/system/ai-chat-cleanup');
+    return {
+      ...mapAiChatCleanupCounts(raw),
+      closedBefore: raw.closed_before,
+      graceSeconds: Number(raw.grace_seconds),
+      protectedThreads: Number(raw.protected_threads),
+    };
+  },
+  cleanUpAiChats: async (closedBefore: string): Promise<AiChatCleanupCounts> => {
+    if (demoMode === 'always') return { threads: 0, teacherThreads: 0, studentThreads: 0, messages: 0 };
+    return mapAiChatCleanupCounts(await request('/system/ai-chat-cleanup', {
+      method: 'POST', body: JSON.stringify({ closed_before: closedBefore, confirm: true }),
+    }));
+  },
   getHealth: (): Promise<SystemHealth> => withDemo(async () => {
     const raw = await request<any>('/system/health');
     return { status: raw.status === 'ok' ? 'ok' : raw.status === 'degraded' ? 'degraded' : 'down', database: String(raw.database ?? 'error'), build: String(raw.build ?? 'unknown') } as SystemHealth;
@@ -1408,7 +1557,7 @@ export const api = {
   ),
 };
 
-export const apiNormalizers = { mapSession, mapCourse, mapCourseSyncStatus, mapCourseCatalogEntry, mapAssessment, mapAssessmentPublicationTargets, mapAttempt, mapRun, mapDiagnostics, mapSettings, mapHistory, mapSubmission, mapExperiment, mapAuthorshipAnalysis, mapSimilarityAnalysis, mapTaskVersion, mapEvidenceReport };
+export const apiNormalizers = { mapSession, mapCourse, mapCourseSyncStatus, mapCourseCatalogEntry, mapAssessment, mapAssessmentPublicationTargets, mapAttempt, mapRun, mapDiagnostics, mapSettings, mapHistory, mapSubmission, mapExperiment, mapAuthorshipAnalysis, mapSimilarityAnalysis, mapTaskVersion, mapEvidenceReport, mapAiCodeReview };
 
 function inFuture(seconds: number): string { return new Date(Date.now() + seconds * 1000).toISOString(); }
 function toSnakeSettings(value: SystemSettings) {

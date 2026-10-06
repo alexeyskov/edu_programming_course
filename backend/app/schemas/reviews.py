@@ -113,6 +113,7 @@ class SubmissionTeacherRead(SubmissionListItemRead):
     assigned_task_version_id: UUID | None
     task_statement: str = ""
     source_warnings: list[SubmissionSourceWarningRead] = Field(default_factory=list)
+    moodle_feedback_comment: str = ""
     snapshot_id: UUID
     revision: Revision
     source: Annotated[str, StringConstraints(min_length=1, max_length=32)]
@@ -131,6 +132,7 @@ class ReviewDraftUpsertRequest(MutationModel):
     grade: Score | None = None
     comment: Annotated[str, StringConstraints(max_length=50_000)] = ""
     criterion_scores: JsonObject = Field(default_factory=dict)
+    ai_review_id: UUID | None = None
 
 
 class ReviewDraftRead(ReadModel):
@@ -141,6 +143,7 @@ class ReviewDraftRead(ReadModel):
     grade: Score | None = None
     comment: str
     criterion_scores: JsonObject = Field(default_factory=dict)
+    ai_review_id: UUID | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -150,6 +153,7 @@ class ReviewDecisionCreateRequest(MutationModel):
     comment: Annotated[str, StringConstraints(max_length=50_000)] = ""
     criterion_scores: JsonObject = Field(default_factory=dict)
     evidence_ids: list[UUID] = Field(default_factory=list, max_length=10_000)
+    ai_review_id: UUID | None = None
 
 
 class ReviewDecisionRead(ReadModel):

@@ -25,6 +25,7 @@ from app.models.enums import AttemptState, CourseRole, LMSProvider, SyncOutboxSt
 from app.models.identity import ExternalPrincipal, LMSConnection
 from app.models.integration import SyncOutbox
 from app.models.tasks import Assessment, TaskVersion
+from app.services.ai_review import enqueue_ai_code_review
 from app.services.client_context import client_context_for_hash, normalize_client_context
 from app.services.common import (
     DomainError,
@@ -36,6 +37,7 @@ from app.services.common import (
     validate_source_path,
 )
 from app.services.delivery_profile import resolve_assessment_workspace_delivery_profile
+from app.services.edit_history import describe_delta
 from app.services.moodle_quiz_runtime import (
     PreparedMoodleAssignment,
     PreparedMoodleQuizAttempt,
@@ -1030,6 +1032,7 @@ async def replace_file_content(
             "insert_text": inserted,
             "offset_encoding": "unicode_codepoint",
         }
+    delta.update(describe_delta(previous_content, delta))
     delta.update(
         {
             "previous_content_hash": previous_hash,
@@ -1222,6 +1225,7 @@ async def create_workspace_file(
     change = {
         "type": "file_create",
         "path": normalized_path,
+        "content": content,
         "content_hash": file.content_hash,
         "request_hash": semantic_hash,
     }
@@ -1342,6 +1346,7 @@ async def delete_workspace_file(
     change = {
         "type": "file_delete",
         "path": file.path,
+        "deleted_text": file.content,
         "content_hash": file.content_hash,
         "request_hash": semantic_hash,
     }
@@ -1580,6 +1585,7 @@ async def _submit_single_attempt(
     attempt.submitted_at = now
     attempt.submission_source = normalized_source
     await db.flush()
+    await enqueue_ai_code_review(db, submission)
     if enqueue:
         await enqueue_checkpoint(
             db,

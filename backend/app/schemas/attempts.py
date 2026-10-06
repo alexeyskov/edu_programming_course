@@ -229,14 +229,28 @@ class EditEventRead(ReadModel):
     client: ClientContextRead | None = None
 
 
+class HistoryEditDetailRead(ReadModel):
+    operation: Literal["insert", "delete", "replace", "create", "remove", "unchanged"]
+    offset: int | None = Field(default=None, ge=0)
+    delete_count: int | None = Field(default=None, ge=0)
+    insert_text: str | None = None
+    deleted_text: str | None = None
+    start_line: int | None = Field(default=None, ge=1)
+    start_column: int | None = Field(default=None, ge=1)
+    end_line: int | None = Field(default=None, ge=1)
+    end_column: int | None = Field(default=None, ge=1)
+
+
 class AttemptHistoryEventRead(ReadModel):
     id: UUID
     type: Literal["edit", "run", "snapshot", "paste_blocked", "internal_paste", "submit"]
     label: Annotated[str, StringConstraints(min_length=1, max_length=255)]
     detail: Annotated[str, StringConstraints(max_length=2_000)] | None = None
+    file_path: Annotated[str, StringConstraints(max_length=512)] | None = None
     at: datetime
     revision: Revision
     event: EditEventRead | None = None
+    edit_details: list[HistoryEditDetailRead] = Field(default_factory=list)
     client: ClientContextRead | None = None
 
 

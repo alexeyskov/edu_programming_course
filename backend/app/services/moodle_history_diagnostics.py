@@ -30,6 +30,10 @@ WARNING_MESSAGES = {
     "HISTORY_IMPORT_WARNING": "При загрузке отдельных данных Moodle возникли предупреждения.",
 }
 ERROR_MESSAGES = {
+    "MOODLE_AUTHENTICATION_FAILED": (
+        "Истекла сессия Moodle. Выйдите и снова войдите в Практикум через Moodle, "
+        "затем повторите синхронизацию работы."
+    ),
     "LMS_REAUTH_REQUIRED": "Истекла сессия преподавателя в Moodle. Войдите повторно.",
     "CREDENTIAL_EXPIRED": "Истекла сессия преподавателя в Moodle. Войдите повторно.",
     "MISSING_CREDENTIAL": "Не найдена сессия преподавателя Moodle. Войдите повторно.",

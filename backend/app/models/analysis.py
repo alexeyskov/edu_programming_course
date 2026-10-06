@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -15,12 +16,67 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import UUIDTimestampModel, utcnow
 from app.models.enums import AnalysisState, AuthorshipAnalysisState, PlagiarismCaseState
 from app.models.types import JSONValue
+
+
+class AICodeReview(UUIDTimestampModel):
+    """Cached advisory report on an immutable submission, never a grading decision."""
+
+    __tablename__ = "core_aicodereview"
+    __table_args__ = (
+        UniqueConstraint("submission_id", "snapshot_id", name="unique_ai_review_snapshot"),
+        Index("core_ai_review_state_created_idx", "state", "created_at"),
+        CheckConstraint(
+            "state IN ('QUEUED', 'RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED')",
+            name="ai_review_state",
+        ),
+        CheckConstraint("attempt_count >= 0", name="ai_review_attempt_count"),
+    )
+
+    submission_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("core_submission.id", ondelete="RESTRICT"),
+        index=True,
+    )
+    snapshot_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("core_snapshot.id", ondelete="RESTRICT"),
+    )
+    requested_by_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("core_externalprincipal.id", ondelete="RESTRICT"),
+        index=True,
+    )
+    manual_requested: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    requested_with_system_access: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false()
+    )
+    manifest_hash: Mapped[str] = mapped_column(String(64))
+    state: Mapped[str] = mapped_column(String(16), default="QUEUED")
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    run_token: Mapped[str] = mapped_column(String(32), default=lambda: uuid.uuid4().hex)
+    prompt_version: Mapped[str] = mapped_column(String(64), default="code-review-v2")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    recommended_grade: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
+    recommended_comment: Mapped[str] = mapped_column(Text, default="", server_default="")
+    approved_decision_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("core_reviewdecision.id", ondelete="RESTRICT"), nullable=True,
+    )
+    discarded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    moodle_refresh_outbox_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("core_syncoutbox.id", ondelete="SET NULL"), nullable=True,
+    )
+    moodle_refresh_error: Mapped[str] = mapped_column(Text, default="", server_default="")
+    findings: Mapped[list[Any]] = mapped_column(JSONValue, default=list)
+    model: Mapped[str] = mapped_column(String(200), default="")
+    error: Mapped[str] = mapped_column(Text, default="")
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class AuthorshipAnalysisJob(UUIDTimestampModel):

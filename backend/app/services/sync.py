@@ -560,7 +560,7 @@ async def run_scheduler_iteration(
     """Maintain roots in short independent transactions, without external I/O.
 
     Do not hold the first student's Attempt/Workspace locks while processing
-    the rest of a class. Catalog and answer imports are exclusively manual.
+    the rest of a class. Catalog and answer imports require a teacher action.
     A broken attempt must not prevent
     other students' deadline submissions from being committed.
     """

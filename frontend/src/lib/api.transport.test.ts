@@ -19,6 +19,108 @@ afterEach(() => {
 });
 
 describe('API transport security contract', () => {
+  it('previews closed AI chats read-only and purges only the explicitly confirmed cutoff with CSRF', async () => {
+    const cutoff = '2026-10-05T09:55:00Z';
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({
+        threads: 5, teacher_threads: 2, student_threads: 3, messages: 47,
+        closed_before: cutoff, grace_seconds: 300, protected_threads: 1,
+      }))
+      .mockResolvedValueOnce(jsonResponse({ csrf_token: 'cleanup-csrf' }))
+      .mockResolvedValueOnce(jsonResponse({ threads: 5, teacher_threads: 2, student_threads: 3, messages: 47 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    await expect(api.getAiChatCleanup()).resolves.toEqual({
+      threads: 5, teacherThreads: 2, studentThreads: 3, messages: 47,
+      closedBefore: cutoff, graceSeconds: 300, protectedThreads: 1,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await expect(api.cleanUpAiChats(cutoff)).resolves.toEqual({
+      threads: 5, teacherThreads: 2, studentThreads: 3, messages: 47,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const [url, init] = fetchMock.mock.calls[2];
+    expect(url).toBe('/api/v1/system/ai-chat-cleanup');
+    expect(init.method).toBe('POST');
+    expect(init.credentials).toBe('include');
+    expect(init.headers.get('X-CSRFToken')).toBe('cleanup-csrf');
+    expect(JSON.parse(init.body)).toEqual({ closed_before: cutoff, confirm: true });
+  });
+
+  it('does not hide cleanup failure behind demo fallback or automatically repeat deletion', async () => {
+    vi.stubEnv('VITE_DEMO_MODE', 'auto');
+    try {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(jsonResponse({ csrf_token: 'cleanup-csrf' }))
+        .mockResolvedValueOnce(jsonResponse({ detail: { code: 'UNAVAILABLE', message: 'Unavailable' } }, 503));
+      vi.stubGlobal('fetch', fetchMock);
+      const { api } = await freshApi();
+      await expect(api.cleanUpAiChats('2026-10-05T09:55:00Z')).rejects.toMatchObject({ status: 503 });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('maps the persisted AI retry budget without issuing another request', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ enabled: true, state: 'QUEUED', attempt_count: 2, max_attempts: 3, error: '', findings: [] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    await expect(api.getAiCodeReview('submission-1')).resolves.toMatchObject({ state: 'QUEUED', attemptCount: 2, maxAttempts: 3, error: undefined });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('sends the approved AI report identity so the server can reject a discarded report', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ csrf_token: 'c'.repeat(32) }))
+      .mockResolvedValueOnce(jsonResponse({ id: 'decision', grade: '7.5', comment: 'Проверьте ввод.', lms_export_state: 'PENDING' }, 201));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    await api.finalizeReview('submission-1', 7.5, 'Проверьте ввод.', 'report-1');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][1]).toMatchObject({ method: 'POST', body: JSON.stringify({ grade: 7.5, comment: 'Проверьте ввод.', ai_review_id: 'report-1' }) });
+    expect(new Headers(fetchMock.mock.calls[1][1].headers).get('X-CSRFToken')).toBe('c'.repeat(32));
+  });
+
+  it('discards only the requested AI review with CSRF and without exporting grades', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ csrf_token: 'c'.repeat(32) }))
+      .mockResolvedValueOnce(jsonResponse({ id: 'report-1', enabled: true, state: 'NOT_STARTED', recommendation_status: 'DISCARDED', findings: [] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    const report = await api.discardAiCodeReview('submission-1', 'report-1');
+    expect(report).toMatchObject({ recommendationStatus: 'DISCARDED', state: 'NOT_STARTED' });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][0]).toContain('/ai/submissions/submission-1/code-review/discard');
+    expect(fetchMock.mock.calls[1][1]).toMatchObject({ method: 'POST', body: JSON.stringify({ review_id: 'report-1' }) });
+    expect(new Headers(fetchMock.mock.calls[1][1].headers).get('X-CSRFToken')).toBe('c'.repeat(32));
+  });
+
+  it('resets only the requested teacher conversation with CSRF and without requesting an AI answer', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ csrf_token: 'c'.repeat(32) }))
+      .mockResolvedValueOnce(jsonResponse({ id: 'thread-new' }, 201));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    await expect(api.resetTeacherAiThread('submission-1', 'course-1')).resolves.toEqual({ id: 'thread-new' });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][0]).toMatch(/ai\/teacher-threads\/reset$/);
+    expect(fetchMock.mock.calls[1][1]).toMatchObject({ method: 'POST', credentials: 'include', body: JSON.stringify({ submission: 'submission-1', course: 'course-1' }) });
+    expect(new Headers(fetchMock.mock.calls[1][1].headers).get('X-CSRFToken')).toBe('c'.repeat(32));
+  });
+
+  it('streams teacher chat with CSRF, credentials and explicit context, without automatic retries', async () => {
+    const events = 'event: thinking\ndata: {}\n\nevent: delta\ndata: {"text":"Ответ"}\n\nevent: done\ndata: {"id":"reply-1","content":"Ответ","citations":[]}\n\n';
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ csrf_token: 'c'.repeat(32) }))
+      .mockResolvedValueOnce(new Response(events, { headers: { 'Content-Type': 'text/event-stream' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    const onEvent = vi.fn();
+    const result = await api.sendAiMessageStream('thread-1', 'Вопрос', { teacherComment: 'Мой комментарий' }, { onEvent });
+    expect(result.content).toBe('Ответ');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][0]).toMatch(/threads\/thread-1\/messages\?stream=true$/);
+    expect(fetchMock.mock.calls[1][1]).toMatchObject({ method: 'POST', credentials: 'include', headers: { 'X-CSRFToken': 'c'.repeat(32), Accept: 'text/event-stream' }, body: JSON.stringify({ content: 'Вопрос', teacher_comment: 'Мой комментарий' }) });
+    expect(onEvent.mock.calls.map(([event]) => event)).toEqual([{ type: 'thinking' }, { type: 'delta', text: 'Ответ' }]);
+  });
+
   it('keeps comment-only review drafts ungraded instead of converting null into zero', async () => {
     const draft = { grade: null, comment: 'Проверить границы массива.' };
     const fetchMock = vi.fn()

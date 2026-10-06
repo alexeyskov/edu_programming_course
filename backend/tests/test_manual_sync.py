@@ -211,6 +211,7 @@ async def test_status_does_not_hide_failed_detail_behind_successful_inventory(ap
 
 @pytest.mark.parametrize("error_code", [
     "TIMEOUT", "INVALID_RESPONSE", "UNEXPECTED_VALUEERROR", "private-secret",
+    "MOODLE_AUTHENTICATION_FAILED",
 ])
 async def test_failed_import_status_exposes_only_safe_failure_category(app_bundle, error_code):
     _, sessions, settings = app_bundle

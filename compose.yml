@@ -45,10 +45,19 @@ x-backend-environment: &backend-environment
   LLM_MODEL: ${LLM_MODEL:-${AI_MODEL:-${OPENROUTER_MODEL:-gpt-5-mini}}}
   LLM_THINKING: ${LLM_THINKING:-}
   AI_API_STYLE: ${AI_API_STYLE:-auto}
-  AI_TIMEOUT_SECONDS: ${AI_TIMEOUT_SECONDS:-45}
+  # Host tools may use 127.0.0.1; containers need the Docker host gateway.
+  # HTTPX reads these variables for both AI chat and background code analysis.
+  HTTP_PROXY: ${CONTAINER_HTTP_PROXY:-${HTTP_PROXY:-}}
+  HTTPS_PROXY: ${CONTAINER_HTTPS_PROXY:-${HTTPS_PROXY:-}}
+  # Internal RPC and health checks must never go through the external proxy.
+  NO_PROXY: localhost,127.0.0.1,::1,backend,postgres,runner,moodle-browser,sync-worker,deadline-worker,host.docker.internal${NO_PROXY:+,${NO_PROXY}}
+  AI_TIMEOUT_SECONDS: ${AI_TIMEOUT_SECONDS:-180}
+  AI_STREAM_IDLE_TIMEOUT_SECONDS: ${AI_STREAM_IDLE_TIMEOUT_SECONDS:-60}
   AI_MAX_RESPONSE_BYTES: ${AI_MAX_RESPONSE_BYTES:-1048576}
+  AI_MAX_STREAM_BYTES: ${AI_MAX_STREAM_BYTES:-67108864}
   AI_MAX_CONTEXT_BYTES: ${AI_MAX_CONTEXT_BYTES:-262144}
   AI_MAX_OUTPUT_CHARS: ${AI_MAX_OUTPUT_CHARS:-12000}
+  AI_TEACHER_MAX_OUTPUT_CHARS: ${AI_TEACHER_MAX_OUTPUT_CHARS:-131072}
   AI_HISTORY_MESSAGES: ${AI_HISTORY_MESSAGES:-20}
   AI_STUDENT_RATE_LIMIT_MESSAGES: ${AI_STUDENT_RATE_LIMIT_MESSAGES:-10}
   AI_TEACHER_RATE_LIMIT_MESSAGES: ${AI_TEACHER_RATE_LIMIT_MESSAGES:-30}
@@ -225,7 +234,7 @@ services:
     <<: *backend-image
     build:
       context: ./backend
-    # On Linux this lets the AI client reach Ollama on the Docker host.
+    # On Linux this lets the AI client reach a proxy/Ollama on the Docker host.
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:

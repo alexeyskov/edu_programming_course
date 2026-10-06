@@ -5,6 +5,7 @@ import {
 import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { Badge, Button, Card, Field, InlineError, Modal, PageLoader, Toggle, useToast } from '../components/ui';
 import { LmsSyncErrorDialog } from '../components/LmsSyncErrorDialog';
+import { AiChatCleanupSettings } from '../components/AiChatCleanupSettings';
 import { useAuth } from '../context/AuthContext';
 import { api, ApiError } from '../lib/api';
 import { loadRememberedTokens } from '../lib/rememberedTokens';
@@ -259,6 +260,11 @@ export function SettingsPage() {
     setTeacherTokenEditError(null);
     return true;
   }, [invalidateElevation]);
+
+  const handleChatCleanupAccessError = useCallback(
+    (caught: unknown) => requireElevation(caught, accessGeneration),
+    [requireElevation, accessGeneration],
+  );
 
   const load = useCallback(async (requestEpoch = accessEpochRef.current) => {
     if (requestEpoch === accessEpochRef.current) setLoading(true);
@@ -927,6 +933,7 @@ export function SettingsPage() {
           <Field label="Срок хранения учебных записей"><div className="unit-input"><input type="number" value={settings.retentionDays} onChange={(event) => patch({ retentionDays: Number(event.target.value) })} /><span>дней</span></div></Field>
           <Field className="settings-card__spaced-field" label="Системное объявление"><textarea rows={3} value={settings.incidentBanner} onChange={(event) => patch({ incidentBanner: event.target.value })} placeholder="Пусто — объявление не показывается" /></Field>
         </Card>
+        <AiChatCleanupSettings key={accessGeneration} onAccessError={handleChatCleanupAccessError} />
       </section>
 
       <aside>

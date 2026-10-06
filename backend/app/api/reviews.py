@@ -34,6 +34,8 @@ from app.models.attempts import (
     RunRequest,
     Snapshot,
     Submission,
+    Workspace,
+    WorkspaceFile,
 )
 from app.models.courses import (
     Course,
@@ -44,6 +46,7 @@ from app.models.courses import (
 from app.models.enums import AttemptState, CourseRole, ReviewClaimState, RunOrigin, RunStatus
 from app.models.evidence import EvidenceReport
 from app.models.identity import ExternalPrincipal
+from app.models.integration import LMSSubmissionFingerprint
 from app.models.review import (
     ReviewClaim,
     ReviewDecision,
@@ -83,6 +86,7 @@ from app.schemas.runs import (
 from app.services.build_profile import effective_attempt_build_profile
 from app.services.client_context import normalize_client_context
 from app.services.common import DomainError, language_for_path
+from app.services.edit_history import edit_details
 from app.services.moodle_attempt_selection import (
     is_completed_moodle_submission,
     latest_reviewable_moodle_submission_ids,
@@ -106,7 +110,7 @@ from app.services.review import (
     save_review_draft,
     update_experiment_file,
 )
-from app.services.submission_origin import submission_origin_verification
+from app.services.submission_origin import resolve_submission_origin
 
 router = APIRouter()
 DB = Annotated[AsyncSession, Depends(get_db)]
@@ -895,7 +899,69 @@ async def _submission_history(
     submission: Submission,
     attempt: Attempt,
     snapshot: Snapshot,
+    verified_delivery: LMSSubmissionFingerprint | None = None,
 ) -> list[AttemptHistoryEventRead]:
+    # A Moodle read-back has its own empty workspace. Reuse only the exact
+    # locally delivered snapshot verified by the origin check, never the latest
+    # attempt of a student or a workspace with merely similar source code.
+    if submission.source == "MOODLE_IMPORT" and verified_delivery is not None:
+        source = (
+            await db.execute(
+                select(Attempt, Snapshot)
+                .join(Workspace, Workspace.attempt_id == Attempt.id)
+                .join(Snapshot, Snapshot.workspace_id == Workspace.id)
+                .join(Assessment, Assessment.id == Attempt.assessment_id)
+                .where(
+                    Attempt.id == verified_delivery.attempt_id,
+                    Attempt.principal_id == attempt.principal_id,
+                    Attempt.principal_id == verified_delivery.principal_id,
+                    Attempt.submission_source != "MOODLE_IMPORT",
+                    Assessment.course_id == verified_delivery.course_id,
+                    Snapshot.id == verified_delivery.snapshot_id,
+                )
+            )
+        ).one_or_none()
+        if source is not None:
+            source_attempt, source_snapshot = source
+            # A periodic delivery can predate creation of the final Submission.
+            # Its fingerprint still pins an immutable snapshot and edit history.
+            source_submission = await db.scalar(
+                select(Submission)
+                .where(
+                    Submission.attempt_id == source_attempt.id,
+                    Submission.snapshot_id == source_snapshot.id,
+                    Submission.source != "MOODLE_IMPORT",
+                )
+                .order_by(Submission.revision)
+                .limit(1)
+            )
+            history = await _snapshot_history(
+                db, submission=source_submission, attempt=source_attempt, snapshot=source_snapshot,
+                delivered_at=verified_delivery.delivered_at,
+            )
+            history.append(AttemptHistoryEventRead(
+                id=snapshot.id,
+                type="snapshot",
+                label="Синхронизировано с Moodle",
+                detail="Ответ совпадает с отправленным из Практикума; история написания сохранена",
+                at=snapshot.created_at,
+                revision=source_snapshot.revision,
+            ))
+            return history
+    return await _snapshot_history(db, submission=submission, attempt=attempt, snapshot=snapshot)
+
+
+async def _snapshot_history(
+    db: AsyncSession,
+    *,
+    submission: Submission | None,
+    attempt: Attempt,
+    snapshot: Snapshot,
+    delivered_at: datetime | None = None,
+) -> list[AttemptHistoryEventRead]:
+    cutoff = _aware(submission.submitted_at if submission is not None else snapshot.created_at)
+    if delivered_at is not None:
+        cutoff = min(cutoff, _aware(delivered_at))
     edit_events = list(
         (
             await db.scalars(
@@ -903,6 +969,7 @@ async def _submission_history(
                 .where(
                     EditEvent.workspace_id == snapshot.workspace_id,
                     EditEvent.sequence <= snapshot.revision,
+                    EditEvent.received_at <= cutoff,
                 )
                 .order_by(EditEvent.sequence)
             )
@@ -929,23 +996,42 @@ async def _submission_history(
                     RunRequest.requested_by_id == attempt.principal_id,
                     RunRequest.origin == RunOrigin.STUDENT_ATTEMPT.value,
                     RunRequest.revision <= snapshot.revision,
+                    RunRequest.created_at <= cutoff,
                 )
                 .order_by(RunRequest.created_at)
             )
         ).all()
     )
+    paths = {str(file_id): path for file_id, path in (await db.execute(
+        select(WorkspaceFile.id, WorkspaceFile.path)
+        .where(WorkspaceFile.workspace_id == snapshot.workspace_id)
+    )).all()} if edit_events else {}
+    # Prefer names in the frozen snapshot; deleted files remain in WorkspaceFile.
+    paths.update({
+        str(item["id"]): item["path"]
+        for item in snapshot.files if item.get("id") and item.get("path")
+    })
     history: list[AttemptHistoryEventRead] = []
+    details = edit_details(edit_events, snapshots)
     for event in edit_events:
         is_paste = event.source == "INTERNAL_PASTE"
         history.append(
             AttemptHistoryEventRead(
                 id=event.id,
                 type="internal_paste" if is_paste else "edit",
-                label="Внутренняя вставка" if is_paste else "Изменение файла",
+                label=("Внутренняя вставка" if is_paste else {
+                    "FILE_CREATE": "Создание файла",
+                    "FILE_DELETE": "Удаление файла",
+                }.get(event.event_type, "Изменение файла")),
                 detail=event.event_type,
+                file_path=next(
+                    (change["path"] for change in event.changes if change.get("path")),
+                    paths.get(str(event.file_id)),
+                ),
                 at=event.received_at,
                 revision=event.sequence,
                 event=_edit_event_payload(event),
+                edit_details=details.get(event.id, []),
                 client=normalize_client_context(event.client_context) or None,
             )
         )
@@ -975,7 +1061,7 @@ async def _submission_history(
                 revision=item.revision,
                 client=(
                     normalize_client_context(submission.client_context) or None
-                    if is_submit and item.id == submission.snapshot_id
+                    if is_submit and submission is not None and item.id == submission.snapshot_id
                     else normalize_client_context(attempt.client_context) or None
                     if is_attempt_start
                     else None
@@ -1203,11 +1289,17 @@ async def get_submission(
         await db.get(TaskVersion, attempt.assigned_task_version_id)
         if attempt.assigned_task_version_id else None
     )
+    origin_verification, verified_delivery = await resolve_submission_origin(
+        db, submission=submission, attempt=attempt, assessment=assessment,
+    )
     return SubmissionTeacherRead(
         **base.model_dump(exclude={"review_group"}),
         attempt_id=attempt.id,
         assigned_task_version_id=attempt.assigned_task_version_id,
         task_statement=version.statement if version else assessment.instructions,
+        moodle_feedback_comment=str(
+            ((submission.external_receipt or {}).get("moodle_review") or {}).get("comment") or ""
+        ),
         source_warnings=await submission_source_warnings(
             db, submission=submission, attempt=attempt, assessment=assessment,
         ),
@@ -1222,18 +1314,14 @@ async def get_submission(
             submission=submission,
             attempt=attempt,
             snapshot=snapshot,
+            verified_delivery=verified_delivery,
         ),
         latest_decision=next(
             (decision for decision in decision_history if decision.status == "APPLIED"),
             None,
         ),
         decision_history=decision_history,
-        origin_verification=await submission_origin_verification(
-            db,
-            submission=submission,
-            attempt=attempt,
-            assessment=assessment,
-        ),
+        origin_verification=origin_verification,
         review_group=await _submission_review_group(
             db,
             submission=submission,
@@ -1329,6 +1417,17 @@ async def get_review_draft(
     draft = await db.scalar(select(ReviewDraft).where(ReviewDraft.submission_id == submission_id))
     if draft is None or draft.owner_id != auth.principal_id:
         return None
+    if draft.ai_review_id is not None:
+        from app.models.analysis import AICodeReview
+        from app.services.ai_review import recommendation_status
+
+        report = await db.get(AICodeReview, draft.ai_review_id)
+        submission = await db.get(Submission, submission_id)
+        if (
+            report is None or report.snapshot_id != submission.snapshot_id
+            or recommendation_status(report) != "PENDING"
+        ):
+            return None
     return ReviewDraftRead.model_validate(draft)
 
 
@@ -1350,6 +1449,7 @@ async def put_review_draft(
         grade=payload.grade,
         comment=payload.comment,
         criterion_scores=payload.criterion_scores,
+        ai_review_id=payload.ai_review_id,
         allow_system_settings_read=auth.has_capability("SYSTEM_SETTINGS"),
     )
     await db.commit()
@@ -1377,6 +1477,7 @@ async def create_review_decision(
         comment=payload.comment,
         criterion_scores=payload.criterion_scores,
         evidence_ids=payload.evidence_ids,
+        ai_review_id=payload.ai_review_id,
         idempotency_key=idempotency_key,
         allow_system_settings_read=auth.has_capability("SYSTEM_SETTINGS"),
     )

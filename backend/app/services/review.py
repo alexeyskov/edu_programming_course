@@ -36,6 +36,7 @@ from app.models.review import (
     TeacherExperimentFile,
 )
 from app.models.tasks import Assessment, TaskVersion
+from app.services.ai_review import require_pending_ai_recommendation
 from app.services.common import DomainError, sha256_text
 from app.services.moodle_attempt_selection import is_latest_completed_moodle_attempt
 from app.services.moodle_quiz_session import quiz_question_for_attempt
@@ -296,6 +297,7 @@ async def save_review_draft(
     grade: Decimal | None,
     comment: str,
     criterion_scores: dict | None = None,
+    ai_review_id: uuid.UUID | None = None,
     allow_system_settings_read: bool = False,
 ) -> ReviewDraft:
     _submission, _attempt, assessment = await _locked_submission_context(
@@ -315,6 +317,8 @@ async def save_review_draft(
         grade < 0 or grade > await response_max_score(db, _attempt, assessment)
     ):
         raise DomainError(422, "GRADE_OUT_OF_RANGE", "Grade is outside the assessment range")
+    if ai_review_id is not None:
+        await require_pending_ai_recommendation(db, _submission, ai_review_id)
     draft = await db.scalar(
         select(ReviewDraft).where(ReviewDraft.submission_id == submission_id).with_for_update()
     )
@@ -325,6 +329,7 @@ async def save_review_draft(
             grade=grade,
             comment=comment,
             criterion_scores=criterion_scores or {},
+            ai_review_id=ai_review_id,
         )
         db.add(draft)
     else:
@@ -335,6 +340,7 @@ async def save_review_draft(
         draft.grade = grade
         draft.comment = comment
         draft.criterion_scores = criterion_scores or {}
+        draft.ai_review_id = ai_review_id
     await db.flush()
     return draft
 
@@ -550,6 +556,7 @@ async def finalize_review(
     comment: str,
     criterion_scores: dict | None = None,
     evidence_ids: list[uuid.UUID] | None = None,
+    ai_review_id: uuid.UUID | None = None,
     idempotency_key: str | None = None,
     allow_system_settings_read: bool = False,
 ) -> ReviewDecision:
@@ -622,6 +629,11 @@ async def finalize_review(
     )
     if grade < 0 or grade > await response_max_score(db, attempt, assessment):
         raise DomainError(422, "GRADE_OUT_OF_RANGE", "Grade is outside the assessment range")
+    ai_report = None
+    if ai_review_id is not None:
+        # The report records provenance; the teacher can edit the suggested
+        # values in the draft. Only this explicit approval exports those fields.
+        ai_report = await require_pending_ai_recommendation(db, submission, ai_review_id)
     validated_evidence = await _validate_evidence_ids(
         db,
         evidence_ids=evidence_ids or [],
@@ -666,6 +678,8 @@ async def finalize_review(
     )
     db.add(decision)
     await db.flush()
+    if ai_report is not None:
+        ai_report.approved_decision_id = decision.id
     course = await db.get(Course, assessment.course_id)
     if course is None:
         raise DomainError(500, "COURSE_MISSING", "Submission course is missing")

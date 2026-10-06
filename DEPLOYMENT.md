@@ -875,6 +875,8 @@ LLM_API_KEY=""
 LLM_MODEL=Maternion/minicpm5:2b-q4_K_M
 LLM_THINKING=
 AI_API_STYLE=chat_completions
+AI_TIMEOUT_SECONDS=180
+AI_STREAM_IDLE_TIMEOUT_SECONDS=60
 ```
 
 Замените `llm.example.org` адресом своего сервера/туннеля, а `LLM_MODEL` —
@@ -882,6 +884,14 @@ AI_API_STYLE=chat_completions
 `GET /v1/models`). Ключ задайте, если сервер или reverse proxy требует
 авторизацию; при пустом ключе заголовок Authorization не отправляется.
 Ключ OpenRouter для Ollama не нужен.
+
+`AI_TIMEOUT_SECONDS` ограничивает весь запрос, включая ожидание, рассуждение
+и ответ. Для чата с рассуждающей моделью default — 180 секунд, а
+`AI_STREAM_IDLE_TIMEOUT_SECONDS=60` отдельно ограничивает отсутствие новых
+данных от провайдера. Backend отправляет браузеру SSE keep-alive каждые
+15 секунд. После изменения `~/cpp_markup.env` контейнер backend нужно
+пересоздать, чтобы он получил новые переменные (обычный restart контейнера
+не перечитывает environment).
 
 Запрос одинаков для всех этих серверов: `POST /v1/chat/completions`, JSON с
 `model`, `messages` (system/user/assistant) и `stream: false`; ответ читается из
@@ -972,7 +982,7 @@ curl --fail --silent --show-error http://127.0.0.1:11434/v1/models
 AI_ENABLED=true
 LLM_API_ADDRESS=https://openrouter.ai/api/v1
 LLM_API_KEY=your-openrouter-key
-LLM_MODEL=provider/model-id
+LLM_MODEL=deepseek/deepseek-v4.1-flash
 LLM_THINKING=0
 AI_API_STYLE=auto
 ```
@@ -980,6 +990,42 @@ AI_API_STYLE=auto
 Перед подключением внешнего провайдера согласуйте передачу учебных данных.
 Ключ передаётся только backend; frontend, runner и Moodle workers его не получают.
 Публичные адреса требуют HTTPS; локальные HTTP endpoints работают без `APP_DEBUG=true`.
+
+Если OpenRouter доступен через HTTP-прокси на Docker-хосте, добавьте в
+`~/cpp_markup.env` отдельные адреса для хоста и контейнера:
+
+```dotenv
+HTTP_PROXY=http://127.0.0.1:10809
+HTTPS_PROXY=http://127.0.0.1:10809
+CONTAINER_HTTP_PROXY=http://host.docker.internal:10809
+CONTAINER_HTTPS_PROXY=http://host.docker.internal:10809
+NO_PROXY=edu.mmcs.sfedu.ru
+```
+
+Замените домен Moodle на свой. В backend передаются контейнерные адреса;
+без `CONTAINER_*` используются обычные `HTTP_PROXY`/`HTTPS_PROXY`.
+HTTPX использует эти переменные как для чата, так и для автоматического анализа.
+В Compose уже есть `host.docker.internal:host-gateway`; прокси должен принимать
+соединения с Docker bridge, а не только с loopback. Ограничьте доступ к порту
+прокси доверенными сетями. В `NO_PROXY` всегда добавляются loopback и внутренние
+сервисы приложения, поэтому runner, browser connector и health checks не
+направляются через внешний прокси. Ключ и прокси не передаются runner и workers.
+
+Эти переменные **не настраивают загрузку образов Docker Engine**. Для неё нужен
+отдельный прокси демона, например systemd drop-in `docker.service.d/proxy.conf`:
+
+```ini
+[Service]
+Environment="HTTP_PROXY=http://127.0.0.1:10809"
+Environment="HTTPS_PROXY=http://127.0.0.1:10809"
+Environment="NO_PROXY=localhost,127.0.0.1,::1"
+```
+
+После изменения drop-in нужны `systemctl daemon-reload` и перезапуск Docker.
+Он затрагивает **все** контейнеры хоста; выполняйте его в согласованное окно.
+Не перезаписывайте существующий `daemon.json` или другие настройки демона.
+См. [настройку прокси Docker Engine](https://docs.docker.com/engine/daemon/proxy/)
+и [модель OpenRouter](https://openrouter.ai/deepseek/deepseek-v4.1-flash).
 
 `LLM_THINKING=0` запрашивает отключение thinking, `1` — включение. Если переменная
 не задана/пустая, параметр не отправляется и остаётся настройка провайдера.
@@ -1250,6 +1296,26 @@ mirror при course copy нельзя предполагать. Privacy provide
 5. выполните `docker compose up -d`;
 6. проверьте `alembic current`, health, вход через Moodle, `moodle-browser`,
    runner и оба фоновых worker.
+
+Рекомендации балла/комментария ИИ требуют миграции `20261005_0023` (после
+`20261004_0022`), а отмена при выходе и связь с утверждением — `20261005_0024`.
+Подстановка ответа ИИ в редактируемый черновик требует `20261005_0025`:
+миграция добавляет необязательную привязку черновика к ИИ-отчёту, сохраняя
+существующие ручные черновики. Отправка по-прежнему выполняется только через
+основное утверждение решения; подстановка и сохранение черновика Moodle не меняют.
+Ограниченные повторы ИИ-проверки требуют `20261005_0026`: она добавляет счётчик
+попыток и время следующего запроса, не меняя существующие оценки и отчёты.
+Один запуск выполняет до трёх запросов (с паузами 2/4 секунды между неудачами);
+старые ошибки сами не перезапускаются, явный повтор запускает новый цикл.
+Примените миграции до запуска обновлённого backend; старые отчёты и
+официальные решения сохраняются. UI читает новые поля из обновлённого API,
+поэтому пересоберите и frontend. Стрелка выхода из проверки отменяет
+неутверждённую ИИ-рекомендацию и ставит однократное чтение точной Moodle-попытки;
+суточного ожидания, отправки оценок и повторных запросов ИИ после выхода нет.
+При ошибках `MOODLE_AUTHENTICATION_FAILED` или
+`LMS_REAUTH_REQUIRED` перезапуск контейнеров не восстанавливает сессию Moodle:
+преподавателю нужно выйти и заново войти в Практикум через Moodle, затем повторить
+синхронизацию нужной работы. Пароль SSH на NUC к этой сессии отношения не имеет.
 
 После обновления уже добавленный Moodle-курс удалять и добавлять заново не
 нужно. Войдите как преподаватель и нажмите «Синхронизировать LMS». Подходящие

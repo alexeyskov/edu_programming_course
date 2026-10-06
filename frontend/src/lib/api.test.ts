@@ -2,6 +2,33 @@ import { describe, expect, it } from 'vitest';
 import { ApiError, apiNormalizers } from './api';
 
 describe('backend DTO normalization', () => {
+  it('distinguishes cached automatic reports from one-off manual checks', () => {
+    expect(apiNormalizers.mapAiCodeReview({ enabled: true, automatic: true, state: 'COMPLETED' })).toMatchObject({ automatic: true });
+    expect(apiNormalizers.mapAiCodeReview({ enabled: true, automatic: false, state: 'COMPLETED' })).toMatchObject({ automatic: false });
+    expect(apiNormalizers.mapAiCodeReview({ enabled: true, state: 'COMPLETED' })).toMatchObject({ automatic: false });
+  });
+  it('maps zero AI recommendations and independent Moodle feedback without losing them', () => {
+    expect(apiNormalizers.mapAiCodeReview({ enabled: true, state: 'COMPLETED', recommended_grade: '0.00', recommended_comment: 'Не решено' })).toMatchObject({ recommendedGrade: 0, recommendedComment: 'Не решено' });
+    expect(apiNormalizers.mapSubmission({ id: 's', moodle_feedback_comment: 'Комментарий без балла' })).toMatchObject({ moodleFeedbackComment: 'Комментарий без балла', score: undefined });
+  });
+  it('keeps automatic review separate from student AI and defaults to off', () => {
+    expect(apiNormalizers.mapAssessment({ id: 'assessment', student_ai_enabled: true }, '')).toMatchObject({ aiEnabled: true, aiReviewEnabled: false });
+    expect(apiNormalizers.mapAssessment({ id: 'assessment', ai_review_enabled: true, student_ai_enabled: false }, '')).toMatchObject({ aiEnabled: false, aiReviewEnabled: true });
+  });
+
+  it('maps persisted AI findings and their line ranges', () => {
+    expect(apiNormalizers.mapAiCodeReview({
+      enabled: true, state: 'COMPLETED', summary: 'Проверьте границы.', model: 'configured-model',
+      findings: [{ path: 'src/main.cpp', line: 4, end_line: 6, severity: 'warning', message: 'Выход за границы массива.' }],
+    })).toEqual({
+      enabled: true, automatic: false, state: 'COMPLETED', summary: 'Проверьте границы.', model: 'configured-model', error: undefined,
+      attemptCount: 0, maxAttempts: 3,
+      recommendedGrade: null, recommendedComment: '',
+      recommendationStatus: 'NONE',
+      findings: [{ path: 'src/main.cpp', line: 4, endLine: 6, severity: 'warning', message: 'Выход за границы массива.' }],
+    });
+  });
+
   it('localizes the terminal Moodle-attempt contract shown in the IDE', () => {
     const error = new ApiError(
       409,
@@ -172,6 +199,31 @@ describe('backend DTO normalization', () => {
     expect(event.client).toEqual({
       ipAddress: '203.0.113.42', browser: 'Firefox', browserVersion: '142.0', operatingSystem: 'Linux', deviceType: 'DESKTOP',
     });
+  });
+
+  it('retains file identities and paths from nested writing history events', () => {
+    const [edit, deleted] = apiNormalizers.mapHistory([
+      { id: 'edit', type: 'edit', file_path: 'src/main.cpp', event: { event_type: 'REPLACE_CONTENT', file_id: 'main' } },
+      { id: 'deleted', type: 'edit', event: { event_type: 'FILE_DELETE', file_id: 'old', changes: [{ type: 'file_delete', path: 'include/old.h' }] } },
+    ]);
+    expect(edit).toMatchObject({ fileId: 'main', filePath: 'src/main.cpp' });
+    expect(deleted).toMatchObject({ fileId: 'old', filePath: 'include/old.h' });
+  });
+
+  it('maps exact edit details and preserves unknown legacy fields as unknown', () => {
+    const [current, legacy] = apiNormalizers.mapHistory([
+      { id: 'new', edit_details: [{ operation: 'replace', offset: 8, delete_count: 2,
+        start_line: 2, start_column: 4, end_line: 2, end_column: 6,
+        deleted_text: 'ab', insert_text: '😀\n' }] },
+      { id: 'old', event: { changes: [{ type: 'contiguous_delta', offset: 7,
+        delete_count: 4, insert_text: '' }] } },
+    ]);
+    expect(current.editDetails?.[0]).toMatchObject({ operation: 'replace', offset: 8,
+      deleteCount: 2, startLine: 2, startColumn: 4, endLine: 2, endColumn: 6,
+      deletedText: 'ab', insertText: '😀\n' });
+    expect(legacy.editDetails?.[0]).toMatchObject({ operation: 'delete', offset: 7, deleteCount: 4,
+      deletedText: null, insertText: '' });
+    expect(legacy.editDetails?.[0].startLine).toBeUndefined();
   });
 
   it('maps the latest review decision and its immutable history from snake_case', () => {

@@ -116,10 +116,14 @@ class Settings(BaseSettings):
     llm_model: str | None = Field(default=None, validation_alias="LLM_MODEL")
     ai_api_style: Literal["auto", "responses", "chat_completions", "ollama"] = "responses"
     llm_thinking: bool | None = None
-    ai_timeout_seconds: float = Field(default=45, gt=0, le=600)
+    ai_timeout_seconds: float = Field(default=180, gt=0, le=600)
+    ai_stream_idle_timeout_seconds: float = Field(default=60, gt=0, le=600)
     ai_max_context_bytes: int = Field(default=256 * 1024, ge=1024)
     ai_max_response_bytes: int = Field(default=1024 * 1024, ge=1024)
+    # SSE repeats JSON metadata per token and carries reasoning that is not answer text.
+    ai_max_stream_bytes: int = Field(default=64 * 1024 * 1024, ge=1024)
     ai_max_output_chars: int = Field(default=12_000, ge=256)
+    ai_teacher_max_output_chars: int = Field(default=128 * 1024, ge=256)
     ai_history_messages: int = Field(default=20, ge=0, le=100)
     ai_max_history_chars: int = Field(default=128 * 1024, ge=1024)
     ai_student_rate_limit_messages: int = Field(default=10, ge=1, le=1_000)

@@ -194,7 +194,26 @@ async def submission_origin_verification(
     attempt: Attempt,
     assessment: Assessment,
 ) -> dict[str, Any]:
-    """Compare an imported Moodle response with the last successful local delivery."""
+    verification, _delivery = await resolve_submission_origin(
+        db, submission=submission, attempt=attempt, assessment=assessment,
+    )
+    return verification
+
+
+async def resolve_submission_origin(
+    db: AsyncSession,
+    *,
+    submission: Submission,
+    attempt: Attempt,
+    assessment: Assessment,
+) -> tuple[dict[str, Any], LMSSubmissionFingerprint | None]:
+    """Return the origin verdict and, on an exact match, its local delivery.
+
+    The delivery is internal evidence for recovering a frozen writing history;
+    callers must not replace it with the student's latest attempt or snapshot.
+    Legacy receipts without activity identity can retain their old verdict,
+    but cannot expose a linked history until their identity is synchronized.
+    """
 
     parent_assessment_id = _parent_assessment_id(assessment)
     if submission.source != "MOODLE_IMPORT":
@@ -209,7 +228,7 @@ async def submission_origin_verification(
                 "transport": None,
                 "checked_at": None,
                 "message": "Ответ создан в Мехмат.Практикуме, но LMS ещё не подтвердила доставку.",
-            }
+            }, None
         return {
             "state": "PENDING",
             "transport": expected.answer_transport,
@@ -218,7 +237,7 @@ async def submission_origin_verification(
                 "LMS подтвердила доставку ответа из Мехмат.Практикума; "
                 "совпадение содержимого будет проверено при обратной синхронизации."
             ),
-        }
+        }, None
 
     receipt = dict(submission.external_receipt or {})
     module, external_activity_id = _activity_identity(assessment, receipt)
@@ -261,7 +280,7 @@ async def submission_origin_verification(
                     "message": (
                         "Работа сдана напрямую через LMS; контрольной суммы Мехмат.Практикума нет."
                     ),
-                }
+                }, None
             return {
                 "state": "UNAVAILABLE",
                 "transport": activity_candidates[0].answer_transport,
@@ -269,7 +288,7 @@ async def submission_origin_verification(
                 "message": (
                     "LMS не передала номер попытки или задания; безопасное сравнение невозможно."
                 ),
-            }
+            }, None
         candidates = [
             row
             for row in activity_candidates
@@ -287,7 +306,7 @@ async def submission_origin_verification(
             "transport": None,
             "checked_at": submission.updated_at,
             "message": "Работа сдана напрямую через LMS; контрольной суммы Мехмат.Практикума нет.",
-        }
+        }, None
 
     expected = candidates[0]
     if receipt.get("lms_response_observations_complete") is not True:
@@ -298,7 +317,7 @@ async def submission_origin_verification(
             "message": (
                 "LMS передала ответ не полностью; сравнение будет повторено после синхронизации."
             ),
-        }
+        }, None
     raw_observations = receipt.get("lms_response_observations")
     observations = (
         [row for row in raw_observations if isinstance(row, dict)]
@@ -317,7 +336,12 @@ async def submission_origin_verification(
             "message": (
                 "Ответ написан и отправлен через Мехмат.Практикум; содержимое в LMS совпадает."
             ),
-        }
+        }, (
+            matched_candidate
+            if module == matched_candidate.module
+            and external_activity_id == matched_candidate.external_activity_id
+            else None
+        )
 
     if module not in {"quiz", "assign"}:
         return {
@@ -328,11 +352,11 @@ async def submission_origin_verification(
                 "LMS не передала идентификатор типа задания; "
                 "расхождение нельзя подтвердить однозначно."
             ),
-        }
+        }, None
 
     return {
         "state": "MISMATCH",
         "transport": expected.answer_transport,
         "checked_at": submission.updated_at,
         "message": "Ответ в LMS отличается от ответа, отправленного через Мехмат.Практикум.",
-    }
+    }, None

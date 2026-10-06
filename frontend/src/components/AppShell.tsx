@@ -113,7 +113,7 @@ export function AppShell({ children, fullBleed = false }: { children: ReactNode;
       </header>
       <main className={cn('page', fullBleed && 'page--full')}>{children}</main>
     </div>
-    <Modal open={elevationOpen} title="Открыть настройки системы" onClose={() => setElevationOpen(false)} footer={<><Button variant="ghost" onClick={() => setElevationOpen(false)}>Отмена</Button><Button loading={elevating} disabled={!adminToken.trim()} onClick={() => void handleElevation()}>Проверить токен</Button></>}>
+    <Modal open={elevationOpen} title="Открыть настройки системы" onClose={() => setElevationOpen(false)} footer={<><Button variant="ghost" onClick={() => setElevationOpen(false)}>Отмена</Button><Button loading={elevating} disabled={!adminToken.trim()} onClick={() => void handleElevation()}>Ввести токен</Button></>}>
       <p className="modal-copy">Повышение не изменит вашу роль. Оно откроет системные настройки, все сданные работы добавленных курсов, повторную проверку, песочницу и изменение оценок. После успешной проверки токен останется скрытым в localStorage этого браузера.</p>
       <Field label="Токен администратора"><input type="password" autoComplete="off" data-1p-ignore maxLength={1024} spellCheck={false} value={adminToken} onChange={(event) => setAdminToken(event.target.value)} placeholder="Введите токен" /></Field>
     </Modal>

@@ -51,7 +51,7 @@ describe('AppShell administrator elevation', () => {
     expect(tokenInput).toHaveAttribute('type', 'password');
     expect(tokenInput).toHaveValue('remembered-admin-secret');
 
-    fireEvent.click(screen.getByRole('button', { name: 'Проверить токен' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Ввести токен' }));
 
     await waitFor(() => expect(mocks.elevate).toHaveBeenCalledWith('remembered-admin-secret'));
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());

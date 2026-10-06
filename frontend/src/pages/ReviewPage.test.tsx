@@ -4,7 +4,8 @@ import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ToastProvider } from '../components/ui';
 import { ThemeProvider } from '../context/ThemeContext';
-import type { Submission, WorkspaceFile } from '../types';
+import type { AiCodeFinding, Submission, WorkspaceFile } from '../types';
+import type { AiCodeSelection } from '../lib/editorAiSelection';
 import { ReviewPage } from './ReviewPage';
 
 const mocks = vi.hoisted(() => ({
@@ -14,7 +15,9 @@ const mocks = vi.hoisted(() => ({
   createExperiment: vi.fn(), runExperiment: vi.fn(), getRun: vi.fn(), saveExperimentFile: vi.fn(),
   startInteractiveExperiment: vi.fn(), getInteractiveExperiment: vi.fn(), sendInteractiveInput: vi.fn(), eofInteractiveExperiment: vi.fn(), stopInteractiveExperiment: vi.fn(),
   resetExperiment: vi.fn(), deleteExperiment: vi.fn(),
-  getTeacherAiThreads: vi.fn(), getAiMessages: vi.fn(), createTeacherAiThread: vi.fn(), sendAiMessage: vi.fn(),
+  getTeacherAiThreads: vi.fn(), getAiMessages: vi.fn(), createTeacherAiThread: vi.fn(), sendAiMessageStream: vi.fn(),
+  getAiCodeReview: vi.fn(), startAiCodeReview: vi.fn(), discardAiCodeReview: vi.fn(),
+  getAuthorshipAnalyses: vi.fn(), getSimilarityAnalyses: vi.fn(),
 }));
 
 vi.mock('../lib/api', () => ({ api: mocks }));
@@ -24,7 +27,7 @@ vi.mock('@monaco-editor/react', () => ({
   ),
 }));
 vi.mock('../components/CodeWorkspace', () => ({
-  CodeWorkspace: forwardRef(({ files, activeFileId, onActiveFile, onChange, readOnly, explorerVisible = true, explorerId, onExplorerCollapse }: {
+  CodeWorkspace: forwardRef(({ files, activeFileId, onActiveFile, onChange, readOnly, explorerVisible = true, explorerId, onExplorerCollapse, aiFindings = [], onAskAi, onAskAiSelection }: {
     files: WorkspaceFile[];
     activeFileId: string;
     onActiveFile(id: string): void;
@@ -33,11 +36,16 @@ vi.mock('../components/CodeWorkspace', () => ({
     explorerVisible?: boolean;
     explorerId?: string;
     onExplorerCollapse?(): void;
+    aiFindings?: unknown[];
+    onAskAi?(finding: AiCodeFinding): void;
+    onAskAiSelection?(selection: AiCodeSelection): void;
   }, ref) => {
     useImperativeHandle(ref, () => ({ openDiagnostic: vi.fn(), focus: vi.fn() }));
     const activeFile = files.find((file) => file.id === activeFileId) ?? files[0];
-    return <div data-testid="code-workspace">
+    return <div data-testid="code-workspace" data-ai-findings={aiFindings.length}>
       Код работы
+      {onAskAi && aiFindings.length > 0 && <button onClick={() => onAskAi(aiFindings[0] as AiCodeFinding)}>Спросить о замечании</button>}
+      {onAskAiSelection && activeFile && <button onClick={() => onAskAiSelection({ path: activeFile.path, startLine: 1, endLine: 1, text: activeFile.content })}>Спросить о выделении</button>}
       <aside id={explorerId} className="file-explorer" hidden={!explorerVisible}>
         {onExplorerCollapse && <button type="button" aria-label="Скрыть файлы" onClick={onExplorerCollapse}>Скрыть</button>}
         {files.map((file) => <button key={file.id} type="button" onClick={() => onActiveFile(file.id)}>{file.path}</button>)}
@@ -106,15 +114,21 @@ function mockUngradedQuestionGroup() {
 
 beforeEach(() => {
   window.sessionStorage.clear();
+  window.localStorage.removeItem('eduprog:ai-highlights');
   Object.values(mocks).forEach((mock) => mock.mockReset());
   mocks.getSubmission.mockResolvedValue(submission);
   mocks.getAssessment.mockResolvedValue({ id: 'assessment-1', courseId: 'course-1', reviewRequired: true, decisionSupportEnabled: true });
   mocks.getReviewDraft.mockResolvedValue(null);
   mocks.getEvidenceRuns.mockResolvedValue([]);
+  mocks.getAuthorshipAnalyses.mockResolvedValue([]);
+  mocks.getSimilarityAnalyses.mockResolvedValue([]);
   mocks.getTeacherAiThreads.mockResolvedValue([]);
   mocks.getAiMessages.mockResolvedValue([]);
+  mocks.getAiCodeReview.mockResolvedValue({ enabled: true, state: 'NOT_STARTED', summary: '', findings: [] });
+  mocks.startAiCodeReview.mockResolvedValue({ enabled: true, state: 'QUEUED', summary: '', findings: [] });
+  mocks.discardAiCodeReview.mockResolvedValue({ enabled: true, state: 'NOT_STARTED', recommendationStatus: 'DISCARDED', summary: '', findings: [] });
   mocks.createTeacherAiThread.mockResolvedValue({ id: 'teacher-thread-1' });
-  mocks.sendAiMessage.mockResolvedValue({ content: 'Проверьте граничные значения.', citations: [] });
+  mocks.sendAiMessageStream.mockResolvedValue({ content: 'Проверьте граничные значения.', citations: [] });
   mocks.releaseClaim.mockResolvedValue(undefined);
   mocks.saveReview.mockResolvedValue({ grade: 8, comment: '', revision: 1 });
   mocks.createExperiment.mockResolvedValue({
@@ -157,6 +171,366 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.useRealTimers(); window.sessionStorage.clear(); });
 
 describe('reviewed submission', () => {
+  it('shows the exhausted AI error on the task tab without changing Moodle fields', async () => {
+    mocks.getAiCodeReview.mockResolvedValue({ id: 'ai-failed', enabled: true, state: 'FAILED', attemptCount: 3, maxAttempts: 3, error: 'ИИ вернул некорректный формат отчёта.', summary: '', findings: [] });
+    renderPage();
+    await screen.findByText('ИИ-проверка не выполнена');
+    expect(screen.getByRole('tab', { name: 'Задание' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByText('Все попытки исчерпаны. Выполнено: 3 из 3.')).toBeVisible();
+    expect(screen.getByText('ИИ вернул некорректный формат отчёта.')).toBeVisible();
+    expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(9);
+    expect(screen.getByLabelText('Финальный комментарий студенту')).toHaveValue('Хорошая работа');
+    expect(mocks.startAiCodeReview).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Повторить ИИ-проверку' }));
+    await screen.findByText('Работа в очереди на проверку.');
+    expect(screen.queryByText('ИИ-проверка не выполнена')).not.toBeInTheDocument();
+    expect(mocks.startAiCodeReview).toHaveBeenCalledExactlyOnceWith('graded', true);
+    expect(mocks.saveReview).not.toHaveBeenCalled();
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+  });
+
+  it('discards the unapproved AI result on explicit exit without changing the Moodle decision', async () => {
+    mocks.getAiCodeReview.mockResolvedValue({ id: 'ai-report', recommendationStatus: 'PENDING', enabled: true, state: 'COMPLETED', summary: 'Совет', findings: [], recommendedGrade: 4, recommendedComment: 'Новый совет' });
+    renderPage();
+    await screen.findByRole('region', { name: 'Ответ ИИ' });
+    expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(9);
+    expect(screen.getByLabelText('Финальный комментарий студенту')).toHaveValue('Хорошая работа');
+    fireEvent.click(screen.getByRole('button', { name: 'Вернуться к работам' }));
+    await screen.findByText('Список работ');
+    expect(mocks.discardAiCodeReview).toHaveBeenCalledExactlyOnceWith('graded', 'ai-report');
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+    expect(mocks.startAiCodeReview).not.toHaveBeenCalled();
+    expect(mocks.saveReview).not.toHaveBeenCalled();
+  });
+
+  it.each(['viewed', 'copied', 'saved'] as const)('keeps an automatic report after exit and reopening when it was %s', async (action) => {
+    const report = {
+      id: 'automatic-report', automatic: true, enabled: true, recommendationStatus: 'PENDING',
+      state: 'COMPLETED', summary: 'Обзор', recommendedGrade: 4, recommendedComment: 'Совет ИИ',
+      findings: [{ path: 'main.cpp', line: 1, severity: 'warning', message: 'Проверьте границы' }],
+    };
+    let savedDraft: { grade: number; comment: string; aiReviewId: string } | null = null;
+    mocks.getAiCodeReview.mockResolvedValue(report);
+    mocks.getReviewDraft.mockImplementation(async () => savedDraft);
+    mocks.claimSubmission.mockResolvedValue({ id: 'claim-1', mine: true, ownerName: 'Teacher' });
+    mocks.heartbeatClaim.mockResolvedValue({ id: 'claim-1', mine: true, ownerName: 'Teacher' });
+    mocks.saveReview.mockImplementation(async (_id, grade, comment, aiReviewId) => {
+      savedDraft = { grade, comment, aiReviewId };
+      return { ...savedDraft, revision: 1 };
+    });
+    // Exit clears the teacher's draft, not the server's cached automatic report.
+    mocks.discardAiCodeReview.mockImplementation(async () => { savedDraft = null; return report; });
+    const firstVisit = renderPage();
+    await screen.findByRole('region', { name: 'Ответ ИИ' });
+    expect(screen.getByText(/Ответ автоматической проверки и подсветка замечаний сохраняются/)).toBeVisible();
+    if (action !== 'viewed') {
+      fireEvent.click(screen.getByRole('button', { name: 'Утвердить рекомендацию ИИ' }));
+      await waitFor(() => expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(4));
+      expect(screen.getByLabelText('Комментарий студенту')).toHaveValue('Совет ИИ');
+      if (action === 'saved') {
+        fireEvent.click(screen.getByRole('button', { name: 'Сохранить' }));
+        await waitFor(() => expect(mocks.saveReview).toHaveBeenCalledWith('graded', 4, 'Совет ИИ', 'automatic-report'));
+      }
+    }
+    fireEvent.click(screen.getByRole('button', { name: 'Вернуться к работам' }));
+    await screen.findByText('Список работ');
+    expect(mocks.discardAiCodeReview).toHaveBeenCalledExactlyOnceWith('graded', 'automatic-report');
+    expect(savedDraft).toBeNull();
+    firstVisit.unmount();
+
+    renderPage();
+    const recommendation = await screen.findByRole('region', { name: 'Ответ ИИ' });
+    expect(within(recommendation).getByText('Совет ИИ')).toBeVisible();
+    expect(within(recommendation).getByText('4/10')).toBeVisible();
+    expect(screen.getByTestId('code-workspace')).toHaveAttribute('data-ai-findings', '1');
+    expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(9);
+    expect(screen.getByLabelText('Финальный комментарий студенту')).toHaveValue('Хорошая работа');
+    expect(mocks.startAiCodeReview).not.toHaveBeenCalled();
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+  });
+
+  it('keeps the page, claim and draft if discarding fails, and permits retry', async () => {
+    mocks.getSubmission.mockResolvedValue({ ...submission, status: 'CLAIMED', claim: { id: 'claim-1', mine: true, ownerName: 'Teacher' } });
+    mocks.heartbeatClaim.mockResolvedValue({ id: 'claim-1', mine: true, ownerName: 'Teacher' });
+    mocks.getAiCodeReview.mockResolvedValue({ id: 'ai-report', recommendationStatus: 'PENDING', enabled: true, state: 'COMPLETED', summary: '', findings: [], recommendedGrade: 4, recommendedComment: 'Совет' });
+    mocks.discardAiCodeReview.mockRejectedValueOnce(new Error('Сеть недоступна'));
+    renderPage();
+    await screen.findByRole('region', { name: 'Ответ ИИ' });
+    fireEvent.change(screen.getByLabelText(/Итоговый балл/), { target: { value: '6' } });
+    fireEvent.change(screen.getByLabelText('Комментарий студенту'), { target: { value: 'Мой черновик' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Вернуться к работам' }));
+    await screen.findByText('Не удалось завершить просмотр');
+    expect(screen.getByTestId('location')).toHaveTextContent('/review/graded');
+    expect(mocks.releaseClaim).not.toHaveBeenCalled();
+    expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(6);
+    expect(screen.getByLabelText('Комментарий студенту')).toHaveValue('Мой черновик');
+    fireEvent.click(screen.getByRole('button', { name: 'Вернуться к работам' }));
+    await screen.findByText('Список работ');
+    expect(mocks.releaseClaim).toHaveBeenCalledWith('claim-1');
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+  });
+
+  it.each(['APPROVED', 'DISCARDED'] as const)('does not discard an already %s report on exit', async (recommendationStatus) => {
+    mocks.getAiCodeReview.mockResolvedValue({ id: 'ai-report', recommendationStatus, enabled: true, state: 'COMPLETED', summary: 'Отчёт', findings: [] });
+    renderPage();
+    await screen.findByRole('switch', { name: 'Подсветка замечаний ИИ' });
+    fireEvent.click(screen.getByRole('button', { name: 'Вернуться к работам' }));
+    await screen.findByText('Список работ');
+    expect(mocks.discardAiCodeReview).not.toHaveBeenCalled();
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+  });
+
+  it('does not cancel AI when switching questions but discards both viewed reports on exit', async () => {
+    mockUngradedQuestionGroup();
+    mocks.getAiCodeReview.mockImplementation(async (id: string) => ({ id: `ai-${id}`, recommendationStatus: 'PENDING', enabled: true, state: 'COMPLETED', summary: 'Отчёт', findings: [], recommendedGrade: 4, recommendedComment: 'Совет' }));
+    renderPage('/review/question-1');
+    await screen.findByRole('region', { name: 'Ответ ИИ' });
+    fireEvent.click(screen.getByRole('button', { name: 'Следующее задание' }));
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/review/question-2'));
+    await screen.findByRole('region', { name: 'Ответ ИИ' });
+    expect(mocks.discardAiCodeReview).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Вернуться к работам' }));
+    await screen.findByText('Список работ');
+    expect(mocks.discardAiCodeReview.mock.calls).toEqual([
+      ['question-1', 'ai-question-1'], ['question-2', 'ai-question-2'],
+    ]);
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+  });
+
+  it('waits for cancellation before releasing the claim and prevents double exit while AI runs', async () => {
+    mocks.getSubmission.mockResolvedValue({ ...submission, claim: { id: 'claim-1', mine: true, ownerName: 'Teacher' } });
+    mocks.heartbeatClaim.mockResolvedValue({ id: 'claim-1', mine: true, ownerName: 'Teacher' });
+    mocks.getAiCodeReview.mockResolvedValue({ id: 'ai-running', recommendationStatus: 'NONE', enabled: true, state: 'RUNNING', summary: '', findings: [] });
+    let finish!: (value: object) => void;
+    mocks.discardAiCodeReview.mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+    renderPage();
+    await screen.findByText('Проверка ИИ 1/3…');
+    const exit = screen.getByRole('button', { name: 'Вернуться к работам' });
+    fireEvent.click(exit);
+    fireEvent.click(exit);
+    expect(exit).toBeDisabled();
+    expect(mocks.releaseClaim).not.toHaveBeenCalled();
+    expect(mocks.discardAiCodeReview).toHaveBeenCalledTimes(1);
+    await act(async () => { finish({ recommendationStatus: 'DISCARDED' }); });
+    await screen.findByText('Список работ');
+    expect(mocks.releaseClaim).toHaveBeenCalledWith('claim-1');
+  });
+
+  it.each([false, true])('copies AI values into editable fields and exports only through the main approval button (automatic=%s)', async (automatic) => {
+    mocks.getAiCodeReview.mockResolvedValue({ id: 'ai-report', automatic, recommendationStatus: 'PENDING', enabled: true, state: 'COMPLETED', summary: 'Обзор', findings: [], recommendedGrade: 7.5, recommendedComment: 'Исправьте граничный случай.' });
+    mocks.claimSubmission.mockResolvedValue({ id: 'ai-claim', mine: true, ownerName: 'Teacher' });
+    mocks.finalizeReview.mockResolvedValue({ id: 'new-decision', grade: 7.5, comment: 'Исправьте граничный случай.', lmsExportState: 'PENDING' });
+    renderPage();
+    const recommendation = await screen.findByRole('region', { name: 'Ответ ИИ' });
+    expect(within(recommendation).getByText('7.5/10')).toBeVisible();
+    expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(9);
+    expect(screen.getByLabelText('Финальный комментарий студенту')).toHaveValue('Хорошая работа');
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+    expect(mocks.claimSubmission).not.toHaveBeenCalled();
+    fireEvent.click(within(recommendation).getByRole('button', { name: 'Утвердить рекомендацию ИИ' }));
+    await waitFor(() => expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(7.5));
+    expect(screen.getByLabelText('Комментарий студенту')).toHaveValue('Исправьте граничный случай.');
+    expect(screen.getByLabelText('Комментарий студенту')).toBeEnabled();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(mocks.saveReview).not.toHaveBeenCalled();
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+    fireEvent.click(screen.getAllByRole('button', { name: 'Утвердить' })[0]);
+    expect(screen.getByRole('dialog')).toHaveTextContent('7.5/10');
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Утвердить и отправить' }));
+    await waitFor(() => expect(mocks.claimSubmission).toHaveBeenCalledWith('graded'));
+    await waitFor(() => expect(mocks.finalizeReview).toHaveBeenCalledWith('graded', 7.5, 'Исправьте граничный случай.', 'ai-report'));
+    expect(mocks.discardAiCodeReview).not.toHaveBeenCalled();
+  });
+
+  it('replaces existing fields with a zero AI grade and keeps subsequent teacher edits after cancelling approval', async () => {
+    mocks.getSubmission.mockResolvedValue({ ...submission, status: 'CLAIMED', claim: { id: 'claim-1', mine: true, ownerName: 'Teacher' } });
+    mocks.getAiCodeReview.mockResolvedValue({ id: 'ai-zero', recommendationStatus: 'PENDING', enabled: true, state: 'COMPLETED', summary: 'Обзор', findings: [], recommendedGrade: 0, recommendedComment: 'Не соответствует условию.' });
+    renderPage();
+    await screen.findByRole('region', { name: 'Ответ ИИ' });
+    fireEvent.change(screen.getByLabelText(/Итоговый балл/), { target: { value: '6' } });
+    fireEvent.change(screen.getByLabelText('Комментарий студенту'), { target: { value: 'Мой черновик' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Утвердить рекомендацию ИИ' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(0);
+    expect(screen.getByLabelText('Комментарий студенту')).toHaveValue('Не соответствует условию.');
+    fireEvent.change(screen.getByLabelText(/Итоговый балл/), { target: { value: '3' } });
+    fireEvent.change(screen.getByLabelText('Комментарий студенту'), { target: { value: 'Уточнение преподавателя' } });
+    fireEvent.click(screen.getAllByRole('button', { name: 'Утвердить' })[0]);
+    expect(screen.getByRole('dialog')).toHaveTextContent('3/10');
+    expect(screen.getByRole('dialog')).toHaveTextContent('Уточнение преподавателя');
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Отмена' }));
+    expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(3);
+    expect(screen.getByLabelText('Комментарий студенту')).toHaveValue('Уточнение преподавателя');
+    expect(mocks.saveReview).not.toHaveBeenCalled();
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+    mocks.finalizeReview.mockResolvedValue({ id: 'edited-decision', lmsExportState: 'PENDING' });
+    fireEvent.click(screen.getAllByRole('button', { name: 'Утвердить' })[0]);
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Утвердить и отправить' }));
+    await waitFor(() => expect(mocks.finalizeReview).toHaveBeenCalledWith('graded', 3, 'Уточнение преподавателя', 'ai-zero'));
+  });
+
+  it('leaves existing fields intact if an AI draft cannot acquire the claim', async () => {
+    mocks.getAiCodeReview.mockResolvedValue({ id: 'ai-report', recommendationStatus: 'PENDING', enabled: true, state: 'COMPLETED', summary: '', findings: [], recommendedGrade: 4, recommendedComment: 'Совет' });
+    mocks.claimSubmission.mockRejectedValue(new Error('Работа закреплена за другим преподавателем'));
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Утвердить рекомендацию ИИ' }));
+    await screen.findByText('Не удалось подставить рекомендацию');
+    expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(9);
+    expect(screen.getByLabelText('Финальный комментарий студенту')).toHaveValue('Хорошая работа');
+    expect(mocks.saveReview).not.toHaveBeenCalled();
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+  });
+
+  it('tags a saved AI draft for discard on exit without approving or exporting it', async () => {
+    mocks.getAiCodeReview.mockResolvedValue({ id: 'ai-report', recommendationStatus: 'PENDING', enabled: true, state: 'COMPLETED', summary: '', findings: [], recommendedGrade: 4, recommendedComment: 'Совет' });
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Утвердить рекомендацию ИИ' }));
+    await waitFor(() => expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(4));
+    fireEvent.click(screen.getByRole('button', { name: 'Сохранить' }));
+    await waitFor(() => expect(mocks.saveReview).toHaveBeenCalledWith('graded', 4, 'Совет', 'ai-report'));
+    fireEvent.click(screen.getByRole('button', { name: 'Вернуться к работам' }));
+    await screen.findByText('Список работ');
+    expect(mocks.discardAiCodeReview).toHaveBeenCalledWith('graded', 'ai-report');
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+  });
+
+  it('restores a saved AI draft as editable when switching back to an already graded question', async () => {
+    mocks.getReviewDraft.mockResolvedValue({ grade: 4, comment: 'Сохранённый ИИ-черновик', aiReviewId: 'ai-report' });
+    renderPage();
+    await waitFor(() => expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(4));
+    expect(screen.getByLabelText('Комментарий студенту')).toHaveValue('Сохранённый ИИ-черновик');
+    expect(screen.getByLabelText('Комментарий студенту')).toBeEnabled();
+    expect(mocks.claimSubmission).toHaveBeenCalledWith('graded');
+    fireEvent.click(screen.getByRole('button', { name: 'Вернуться к работам' }));
+    await screen.findByText('Список работ');
+    expect(mocks.discardAiCodeReview).toHaveBeenCalledWith('graded', 'ai-report');
+  });
+
+  it('shows comment-only Moodle feedback without manufacturing a grade', async () => {
+    mocks.getSubmission.mockResolvedValue({ ...submission, status: 'UNGRADED', score: undefined, latestDecision: undefined, decisionHistory: [], moodleFeedbackComment: 'Алгоритм неверный' });
+    mocks.claimSubmission.mockResolvedValue({ id: 'claim-1', mine: true, ownerName: 'Teacher' });
+    renderPage();
+    const feedback = await screen.findByRole('region', { name: 'Комментарий из Moodle' });
+    expect(feedback).toHaveTextContent('Алгоритм неверный');
+    expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(null);
+    expect(mocks.startAiCodeReview).not.toHaveBeenCalled();
+  });
+
+  it('attaches a finding and its code without inventing a question, calling the model or changing the grade', async () => {
+    mocks.getAiCodeReview.mockResolvedValue({ enabled: true, state: 'COMPLETED', summary: '', findings: [{ path: 'main.cpp', line: 1, severity: 'warning', message: 'Проверьте пустой массив.' }] });
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Спросить о замечании' }));
+    expect(screen.getByRole('tab', { name: 'ИИ' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('textbox', { name: 'Вопрос ИИ' })).toHaveValue('');
+    expect(screen.getByRole('complementary', { name: 'Прикреплённый код' })).toHaveTextContent('Проверьте пустой массив.');
+    expect(screen.getByRole('complementary', { name: 'Прикреплённый код' })).toHaveTextContent('int main() {}');
+    expect(mocks.createTeacherAiThread).not.toHaveBeenCalled();
+    expect(mocks.sendAiMessageStream).not.toHaveBeenCalled();
+    expect(mocks.saveReview).not.toHaveBeenCalled();
+  });
+
+  it('opens selection drafts only for the original and preserves drafts when expanding or switching tabs', async () => {
+    const { container } = renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Спросить о выделении' }));
+    const input = screen.getByRole('textbox', { name: 'Вопрос ИИ' });
+    expect(input).toHaveValue('');
+    expect(screen.getByRole('complementary', { name: 'Прикреплённый код' })).toHaveTextContent('main.cpp');
+    fireEvent.change(input, { target: { value: 'Мой уточнённый вопрос' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Развернуть чат' }));
+    expect(container.querySelector('.review-layout')).toHaveClass('review-layout--ai-expanded');
+    fireEvent.click(screen.getByRole('button', { name: 'Свернуть чат' }));
+    expect(container.querySelector('.review-layout')).not.toHaveClass('review-layout--ai-expanded');
+    fireEvent.click(screen.getByRole('tab', { name: 'Задание' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'ИИ' }));
+    expect(screen.getByRole('textbox', { name: 'Вопрос ИИ' })).toHaveValue('Мой уточнённый вопрос');
+    expect(screen.getByRole('complementary', { name: 'Прикреплённый код' })).toHaveTextContent('int main() {}');
+    fireEvent.click(screen.getByRole('button', { name: 'Открыть преподавательскую песочницу' }));
+    await screen.findByRole('button', { name: 'Закрыть преподавательскую песочницу' });
+    expect(screen.queryByRole('button', { name: 'Спросить о выделении' })).not.toBeInTheDocument();
+    expect(mocks.sendAiMessageStream).not.toHaveBeenCalled();
+  });
+
+  it('offers manual analysis without the old automatic review panel', async () => {
+    renderPage();
+    const start = await screen.findByRole('button', { name: 'Проверить работу через ИИ' });
+    await waitFor(() => expect(start).toBeEnabled());
+    expect(mocks.startAiCodeReview).not.toHaveBeenCalled();
+    fireEvent.click(start);
+    await waitFor(() => expect(mocks.startAiCodeReview).toHaveBeenCalledExactlyOnceWith('graded', false));
+    expect(screen.getByRole('button', { name: 'ИИ-проверка выполняется' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('tab', { name: 'ИИ' }));
+    expect(screen.getByRole('region', { name: 'Помощник проверки' })).toBeInTheDocument();
+    expect(screen.queryByText('Автоматическая ИИ-проверка')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Администратор может включить/)).not.toBeInTheDocument();
+  });
+
+  it('shows an error for a failed manual request without changing a grade', async () => {
+    mocks.startAiCodeReview.mockRejectedValue(new Error('ИИ временно недоступен'));
+    renderPage();
+    const start = await screen.findByRole('button', { name: 'Проверить работу через ИИ' });
+    await waitFor(() => expect(start).toBeEnabled());
+    fireEvent.click(start);
+    expect(await screen.findByText('ИИ-проверка не запущена')).toBeInTheDocument();
+    expect(mocks.saveReview).not.toHaveBeenCalled();
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+  });
+
+  it('shows cached AI recommendations and lets the teacher turn code highlights off', async () => {
+    mocks.getAiCodeReview.mockResolvedValue({
+      enabled: true, state: 'COMPLETED', summary: 'Проверьте граничные случаи.', model: 'test-model',
+      findings: [{ path: 'main.cpp', line: 1, severity: 'warning', message: 'Нет обработки пустого массива.' }],
+    });
+    renderPage();
+    const indicator = await screen.findByRole('switch', { name: 'Подсветка замечаний ИИ' });
+    await waitFor(() => expect(indicator).toBeEnabled());
+    expect(screen.getByRole('tab', { name: 'Задание' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByTestId('code-workspace')).toHaveAttribute('data-ai-findings', '1');
+    fireEvent.click(indicator);
+    expect(screen.getByRole('tab', { name: 'Задание' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByTestId('code-workspace')).toHaveAttribute('data-ai-findings', '0');
+    expect(mocks.startAiCodeReview).not.toHaveBeenCalled();
+    expect(mocks.saveReview).not.toHaveBeenCalled();
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+  });
+
+  it('keeps code and grading usable while the background AI report is loading', async () => {
+    mocks.getAiCodeReview.mockReturnValue(new Promise(() => undefined));
+    renderPage();
+    expect(await screen.findByLabelText('Код main.cpp')).toBeInTheDocument();
+    expect(screen.getByText('Оценка и комментарий')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Компилировать и запустить код' })).toBeEnabled();
+    expect(mocks.startAiCodeReview).not.toHaveBeenCalled();
+  });
+
+  it('does not transfer delayed AI findings to another question', async () => {
+    mockUngradedQuestionGroup();
+    let resolveFirst!: (value: unknown) => void;
+    mocks.getAiCodeReview.mockImplementation((id: string) => id === 'question-1'
+      ? new Promise((resolve) => { resolveFirst = resolve; })
+      : Promise.resolve({ enabled: false, state: 'DISABLED', summary: '', findings: [] }));
+    renderPage('/review/question-1');
+    await screen.findByText('Задание 1 из 2');
+    fireEvent.click(screen.getByRole('button', { name: 'Следующее задание' }));
+    await screen.findByText('Задание 2 из 2');
+    await act(async () => { resolveFirst({ enabled: true, state: 'COMPLETED', summary: 'Старый отчёт', findings: [{ path: 'main.cpp', line: 1, severity: 'warning', message: 'Старая ошибка' }] }); });
+    expect(screen.getByTestId('code-workspace')).toHaveAttribute('data-ai-findings', '0');
+    expect(screen.queryByRole('button', { name: 'ИИ: замечаний 1' })).not.toBeInTheDocument();
+  });
+
+  it('does not attach code or a question from the previous submission after switching tasks', async () => {
+    mockUngradedQuestionGroup();
+    renderPage('/review/question-1');
+    fireEvent.click(await screen.findByRole('button', { name: 'Спросить о выделении' }));
+    expect(screen.getByRole('complementary', { name: 'Прикреплённый код' })).toHaveTextContent('return 1;');
+    fireEvent.change(screen.getByRole('textbox', { name: 'Вопрос ИИ' }), { target: { value: 'Вопрос о первом задании' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Следующее задание' }));
+    await screen.findByText('Задание 2 из 2');
+    fireEvent.click(screen.getByRole('tab', { name: 'ИИ' }));
+    expect(screen.getByRole('textbox', { name: 'Вопрос ИИ' })).toHaveValue('');
+    expect(screen.queryByRole('complementary', { name: 'Прикреплённый код' })).not.toBeInTheDocument();
+    expect(mocks.sendAiMessageStream).not.toHaveBeenCalled();
+  });
+
   it('opens the exact task by default without requesting or generating hidden tests', async () => {
     renderPage();
     expect(await screen.findByRole('region', { name: 'Задание студента' })).toHaveTextContent(submission.taskStatement!);
@@ -248,6 +622,22 @@ describe('reviewed submission', () => {
 
     expect(screen.getByText(/IP: 203\.0\.113\.42 · Google Chrome 140\.0/)).toBeInTheDocument();
     expect(screen.getByText(/Windows 10\/11 · компьютер/)).toBeInTheDocument();
+  });
+
+  it('opens the writing history in the right panel from the integrity card', async () => {
+    mocks.getSubmission.mockResolvedValue({ ...submission, history: [{
+      id: 'edit-1', type: 'edit', label: 'Изменение файла', filePath: 'src/main.cpp',
+      at: '2026-08-25T09:45:12Z', revision: 1,
+    }] });
+    mocks.getAuthorshipAnalyses.mockResolvedValue([]);
+    mocks.getSimilarityAnalyses.mockResolvedValue([]);
+    renderPage();
+    await screen.findByText('Работа проверена');
+    fireEvent.click(screen.getByRole('tab', { name: 'Плагиат' }));
+    fireEvent.click(await screen.findByRole('button', { name: /История написания/ }));
+    expect(screen.getByRole('tab', { name: 'История' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByText('src/main.cpp')).toBeVisible();
+    expect(screen.getByRole('button', { name: /История написания/ })).toHaveAttribute('aria-expanded', 'true');
   });
 
   it('switches between Moodle Quiz questions without returning to the review queue', async () => {
@@ -969,12 +1359,11 @@ describe('reviewed submission', () => {
     await screen.findByText('Работа проверена');
 
     fireEvent.click(screen.getByRole('tab', { name: 'ИИ' }));
-    expect(screen.getByText('Спросить о работе')).toBeInTheDocument();
-    expect(screen.getByText(/Для вопросов закреплять работу за собой не нужно/)).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'Помощник проверки' })).toBeInTheDocument();
+    expect(screen.queryByText(/Для вопросов закреплять работу за собой не нужно/)).not.toBeInTheDocument();
     expect(screen.getByLabelText(/Итоговый балл/)).toBeDisabled();
     expect(mocks.claimSubmission).not.toHaveBeenCalled();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Открыть чат' }));
     const input = await screen.findByPlaceholderText('Вопрос о текущем коде…');
     expect(screen.queryByRole('button', { name: 'Почему не проходит тест?' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Что проверить вручную?' })).not.toBeInTheDocument();
@@ -983,7 +1372,7 @@ describe('reviewed submission', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Отправить' }));
 
     await waitFor(() => expect(mocks.createTeacherAiThread).toHaveBeenCalledWith('graded', 'course-1'));
-    await waitFor(() => expect(mocks.sendAiMessage).toHaveBeenCalledWith('teacher-thread-1', 'Что проверить вручную?', { teacherComment: 'Хорошая работа' }));
+    await waitFor(() => expect(mocks.sendAiMessageStream).toHaveBeenCalledWith('teacher-thread-1', 'Что проверить вручную?', { teacherComment: 'Хорошая работа' }, expect.objectContaining({ onEvent: expect.any(Function), signal: expect.any(AbortSignal) })));
     expect(await screen.findByText('Проверьте граничные значения.')).toBeInTheDocument();
     expect(mocks.claimSubmission).not.toHaveBeenCalled();
     expect(screen.getByLabelText(/Итоговый балл/)).toBeDisabled();
@@ -1003,27 +1392,25 @@ describe('reviewed submission', () => {
     }));
     mocks.createTeacherAiThread.mockImplementation(async (id: string) => ({ id: `thread-${id}` }));
     let finishFirst!: (value: { content: string; citations: [] }) => void;
-    mocks.sendAiMessage.mockImplementationOnce(() => new Promise((resolve) => { finishFirst = resolve; }));
+    mocks.sendAiMessageStream.mockImplementationOnce(() => new Promise((resolve) => { finishFirst = resolve; }));
     renderPage('/review/question-1');
     await screen.findByRole('navigation', { name: 'Задания в ответе студента' });
     fireEvent.click(screen.getByRole('tab', { name: 'ИИ' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Открыть чат' }));
     await waitFor(() => expect(screen.getByPlaceholderText('Вопрос о текущем коде…')).not.toBeDisabled());
     fireEvent.change(screen.getByPlaceholderText('Вопрос о текущем коде…'), { target: { value: 'Первый вопрос' } });
     fireEvent.click(screen.getByRole('button', { name: 'Отправить' }));
-    await waitFor(() => expect(mocks.sendAiMessage).toHaveBeenCalledWith('thread-question-1', 'Первый вопрос', { teacherComment: 'Комментарий question-1' }));
+    await waitFor(() => expect(mocks.sendAiMessageStream).toHaveBeenCalledWith('thread-question-1', 'Первый вопрос', { teacherComment: 'Комментарий question-1' }, expect.objectContaining({ onEvent: expect.any(Function), signal: expect.any(AbortSignal) })));
 
     fireEvent.click(screen.getByRole('tab', { name: /№2 Массивы/ }));
     await screen.findByText('Задание 2 из 2');
     fireEvent.click(screen.getByRole('tab', { name: 'ИИ' }));
-    fireEvent.click(await screen.findByRole('button', { name: 'Открыть чат' }));
     await waitFor(() => expect(screen.getByPlaceholderText('Вопрос о текущем коде…')).not.toBeDisabled());
     await act(async () => { finishFirst({ content: 'Ответ для первой задачи', citations: [] }); });
     expect(screen.queryByText('Первый вопрос')).not.toBeInTheDocument();
     expect(screen.queryByText('Ответ для первой задачи')).not.toBeInTheDocument();
     fireEvent.change(screen.getByPlaceholderText('Вопрос о текущем коде…'), { target: { value: 'Второй вопрос' } });
     fireEvent.click(screen.getByRole('button', { name: 'Отправить' }));
-    await waitFor(() => expect(mocks.sendAiMessage).toHaveBeenLastCalledWith('thread-question-2', 'Второй вопрос', { teacherComment: 'Комментарий question-2' }));
+    await waitFor(() => expect(mocks.sendAiMessageStream).toHaveBeenLastCalledWith('thread-question-2', 'Второй вопрос', { teacherComment: 'Комментарий question-2' }, expect.objectContaining({ onEvent: expect.any(Function), signal: expect.any(AbortSignal) })));
     expect(mocks.saveReview).not.toHaveBeenCalled();
   });
 
@@ -1036,11 +1423,10 @@ describe('reviewed submission', () => {
     const comment = await screen.findByLabelText('Комментарий студенту');
     fireEvent.change(comment, { target: { value: 'Проверить пустой ввод' } });
     fireEvent.click(screen.getByRole('tab', { name: 'ИИ' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Открыть чат' }));
     await waitFor(() => expect(screen.getByPlaceholderText('Вопрос о текущем коде…')).not.toBeDisabled());
     fireEvent.change(screen.getByPlaceholderText('Вопрос о текущем коде…'), { target: { value: 'Верно ли замечание?' } });
     fireEvent.click(screen.getByRole('button', { name: 'Отправить' }));
-    await waitFor(() => expect(mocks.sendAiMessage).toHaveBeenCalledWith('teacher-thread-1', 'Верно ли замечание?', { teacherComment: 'Проверить пустой ввод' }));
+    await waitFor(() => expect(mocks.sendAiMessageStream).toHaveBeenCalledWith('teacher-thread-1', 'Верно ли замечание?', { teacherComment: 'Проверить пустой ввод' }, expect.objectContaining({ onEvent: expect.any(Function), signal: expect.any(AbortSignal) })));
     expect(mocks.saveReview).not.toHaveBeenCalled();
   });
 });

@@ -54,15 +54,33 @@ def create_app(
                 name="embedded-terminal-checkpoint-worker",
             )
         application.state.terminal_checkpoint_worker_task = terminal_worker_task
+        # Advisory analysis must never occupy the student submission/checkpoint
+        # lane. It has its own durable queue and a single bounded consumer.
+        from app.workers.ai_review import run_ai_review_worker
+
+        ai_review_worker_stop = asyncio.Event()
+        ai_review_worker_task = asyncio.create_task(
+            run_ai_review_worker(
+                session_factory,
+                settings,
+                stop_event=ai_review_worker_stop,
+            ),
+            name="embedded-ai-review-worker",
+        )
+        application.state.ai_review_worker_task = ai_review_worker_task
         try:
             yield
         finally:
+            ai_review_worker_stop.set()
+            ai_review_worker_task.cancel()
             if terminal_worker_stop is not None:
                 terminal_worker_stop.set()
             if terminal_worker_task is not None:
                 terminal_worker_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await terminal_worker_task
+            with suppress(asyncio.CancelledError):
+                await ai_review_worker_task
             if owned_engine:
                 await engine.dispose()
 

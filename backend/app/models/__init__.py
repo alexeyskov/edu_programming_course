@@ -4,6 +4,7 @@ Importing this module is intentionally sufficient for Alembic to discover every 
 """
 
 from app.models.analysis import (
+    AICodeReview,
     AuthorshipAnalysisJob,
     AuthorshipAnalysisResult,
     PlagiarismCase,
@@ -69,6 +70,7 @@ from app.models.tasks import (
 )
 
 __all__ = [
+    "AICodeReview",
     "AdminElevation",
     "Assessment",
     "AssessmentItem",

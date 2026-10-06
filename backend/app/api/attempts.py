@@ -1099,6 +1099,9 @@ async def get_attempt_history(
         (await db.scalars(run_statement.order_by(RunRequest.created_at.desc()).limit(limit))).all()
     )
     rows: list[AttemptHistoryEventRead] = []
+    from app.services.edit_history import edit_details
+
+    details = edit_details(edit_events, snapshots)
     for event in edit_events:
         internal_paste = event.source == "INTERNAL_PASTE"
         rows.append(
@@ -1110,6 +1113,7 @@ async def get_attempt_history(
                 at=event.received_at,
                 revision=event.sequence,
                 event=_edit_event_payload(event),
+                edit_details=details.get(event.id, []),
                 client=normalize_client_context(event.client_context) or None,
             )
         )
