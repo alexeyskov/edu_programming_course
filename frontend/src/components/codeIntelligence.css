@@ -1,0 +1,27 @@
+.code-intelligence-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-inline: 8px;
+  flex-shrink: 0;
+}
+.code-intelligence-status {
+  font-size: 11px;
+  color: var(--text-secondary, #737b86);
+  white-space: nowrap;
+}
+.code-intelligence-status--ready { color: var(--success, #3c8059); }
+.editor-tabs .code-intelligence-format {
+  min-width: 26px;
+  padding: 5px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+}
+.editor-tabs .code-intelligence-format:hover {
+  color: var(--primary, #0078d4);
+  background: var(--surface-hover, rgb(127 127 127 / 12%));
+}
+@media (max-width: 650px) {
+  .code-intelligence-status { max-width: 90px; overflow: hidden; text-overflow: ellipsis; }
+}

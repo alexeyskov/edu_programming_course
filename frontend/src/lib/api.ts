@@ -12,6 +12,7 @@ import type {
 
 import type { AiChatCleanupCounts, AiChatCleanupPreview } from '../types';
 import { readAiStream, type AiStreamEvent } from './aiStream';
+import type { CodeIntelligenceQuery, CodeIntelligenceResponse } from './codeIntelligence';
 
 type DemoMode = 'always' | 'auto' | 'never';
 const envMode = import.meta.env.VITE_DEMO_MODE;
@@ -892,6 +893,10 @@ function mapSimilarityComparison(raw: any): SimilarityComparison {
 }
 
 export const api = {
+  // Optional language intelligence must never fall back to unrelated demo data.
+  queryCodeIntelligence: (body: CodeIntelligenceQuery, signal: AbortSignal) => withRequestDeadline(signal, 12_000, (boundedSignal) => request<CodeIntelligenceResponse>('/code-intelligence/query', {
+    method: 'POST', body: JSON.stringify(body), signal: boundedSignal, timeoutMs: 12_000,
+  })),
   getConnections: () => withDemo(
     async () => unwrapList<any>(await request('/auth/connections')).map((item) => ({ id: String(item.id), name: String(item.name), kind: String(item.provider ?? item.kind ?? 'LMS'), enabled: item.enabled !== false, loginMode: String(item.login_mode ?? 'REDIRECT').toUpperCase() === 'CREDENTIALS' ? 'CREDENTIALS' as const : 'REDIRECT' as const })),
     () => cloneDemo(demoConnections),

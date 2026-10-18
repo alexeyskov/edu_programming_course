@@ -98,6 +98,17 @@ class Settings(BaseSettings):
     runner_rate_limit_runs: int = Field(default=30, ge=1, le=1_000)
     runner_rate_limit_window_seconds: int = Field(default=60, ge=1, le=3_600)
     runner_running_stale_seconds: int = Field(default=120, ge=30, le=3_600)
+    # Optional editor intelligence is independent of saving, running, and grading.
+    code_intelligence_enabled: bool = True
+    code_intelligence_url: str = ""
+    code_intelligence_shared_secret: SecretStr = SecretStr("")
+    code_intelligence_request_timeout_seconds: float = Field(default=10, gt=0, le=30)
+    code_intelligence_request_body_max_bytes: int = Field(
+        default=3 * 1024 * 1024, ge=1024, le=16 * 1024 * 1024,
+    )
+    code_intelligence_response_body_max_bytes: int = Field(
+        default=2 * 1024 * 1024, ge=1024, le=8 * 1024 * 1024,
+    )
     # Evidence runs remain synchronous for the initial baseline, so their own wall
     # clock budget stays safely below the reverse-proxy request timeout.
     evidence_case_timeout_seconds: float = Field(default=8, gt=0, le=30)

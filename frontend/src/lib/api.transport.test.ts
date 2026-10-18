@@ -19,6 +19,48 @@ afterEach(() => {
 });
 
 describe('API transport security contract', () => {
+  it('queries language intelligence using credentials and CSRF without any demo substitution', async () => {
+    vi.stubEnv('VITE_DEMO_MODE', 'always');
+    try {
+      const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ csrf_token: 'clangd-csrf' }))
+        .mockResolvedValueOnce(jsonResponse({ result: { items: [] }, diagnostics: [] }));
+      vi.stubGlobal('fetch', fetchMock);
+      const { api } = await freshApi();
+      const query = { scope: { kind: 'attempt' as const, id: 'attempt-1' }, method: 'completion' as const, path: 'main.cpp', files: [{ path: 'main.cpp', content: 'int main() {}' }], position: { line: 0, character: 3 } };
+      await expect(api.queryCodeIntelligence(query, new AbortController().signal)).resolves.toEqual({ result: { items: [] }, diagnostics: [] });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock.mock.calls[1][0]).toBe('/api/v1/code-intelligence/query');
+      expect(fetchMock.mock.calls[1][1]).toMatchObject({ method: 'POST', credentials: 'include', body: JSON.stringify(query) });
+      expect(fetchMock.mock.calls[1][1].headers.get('X-CSRFToken')).toBe('clangd-csrf');
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('propagates optional language-service failure rather than substituting demo content', async () => {
+    vi.stubEnv('VITE_DEMO_MODE', 'auto');
+    try {
+      const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ csrf_token: 'clangd-csrf' }))
+        .mockResolvedValueOnce(jsonResponse({ detail: { code: 'CODE_INTELLIGENCE_UNAVAILABLE', message: 'Unavailable' } }, 503));
+      vi.stubGlobal('fetch', fetchMock);
+      const { api } = await freshApi();
+      await expect(api.queryCodeIntelligence({ scope: { kind: 'submission', id: 'submission-1' }, method: 'hover', path: 'main.cpp' }, new AbortController().signal)).rejects.toMatchObject({ status: 503 });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('bounds optional intelligence to 12 seconds including shared CSRF preparation', async () => {
+    vi.useFakeTimers();
+    let resolveCsrf!: (response: Response) => void;
+    const fetchMock = vi.fn().mockImplementation(() => new Promise<Response>((resolve) => { resolveCsrf = resolve; }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    const pending = api.queryCodeIntelligence({ scope: { kind: 'attempt', id: 'attempt-1' }, method: 'completion', path: 'main.cpp' }, new AbortController().signal);
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'REQUEST_TIMEOUT' });
+    await vi.advanceTimersByTimeAsync(12_000); await rejected;
+    resolveCsrf(jsonResponse({ csrf_token: 'late-csrf' }));
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it('defaults new demo assessments to automatic review without changing student help or saved opt-outs', async () => {
     vi.stubEnv('VITE_DEMO_MODE', 'always');
     try {

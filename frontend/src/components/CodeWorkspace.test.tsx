@@ -3,8 +3,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { THEME_STORAGE_KEY, ThemeProvider, useTheme } from '../context/ThemeContext';
 import { CodeWorkspace } from './CodeWorkspace';
 
-vi.mock('@monaco-editor/react', () => ({
-  default: ({ theme, options }: { theme: string; options?: { readOnlyMessage?: { value?: string } } }) => <div data-testid="monaco-theme" data-read-only-message={options?.readOnlyMessage?.value}>{theme}</div>,
+vi.mock('./MonacoEditors', () => ({
+  MonacoEditor: ({ theme, options }: { theme: string; options?: { readOnlyMessage?: { value?: string } } }) => <div data-testid="monaco-theme" data-read-only-message={options?.readOnlyMessage?.value}>{theme}</div>,
 }));
 
 beforeEach(() => localStorage.clear());

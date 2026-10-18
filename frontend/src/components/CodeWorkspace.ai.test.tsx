@@ -59,8 +59,8 @@ const mock = vi.hoisted(() => {
   return { models, collections, monaco, editor, switchModel, disposeListeners, modelListeners };
 });
 
-vi.mock('@monaco-editor/react', () => ({
-  default: ({ path, value, onMount }: { path: string; value: string; onMount: (editor: typeof mock.editor, monaco: typeof mock.monaco) => void }) => {
+vi.mock('./MonacoEditors', () => ({
+  MonacoEditor: ({ path, value, onMount }: { path: string; value: string; onMount: (editor: typeof mock.editor, monaco: typeof mock.monaco) => void }) => {
     useLayoutEffect(() => { mock.switchModel(path, value); }, [path, value]);
     useEffect(() => {
       onMount(mock.editor, mock.monaco);

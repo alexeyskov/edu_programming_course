@@ -31,6 +31,12 @@ x-backend-environment: &backend-environment
   RUNNER_RATE_LIMIT_WINDOW_SECONDS: ${RUNNER_RATE_LIMIT_WINDOW_SECONDS:-60}
   RUNNER_RUNNING_STALE_SECONDS: ${RUNNER_RUNNING_STALE_SECONDS:-120}
   RUNNER_MOCK_ENABLED: ${RUNNER_MOCK_ENABLED:-false}
+  CODE_INTELLIGENCE_ENABLED: ${CODE_INTELLIGENCE_ENABLED:-true}
+  CODE_INTELLIGENCE_URL: http://code-intelligence:8084
+  CODE_INTELLIGENCE_SHARED_SECRET: ${CODE_INTELLIGENCE_SHARED_SECRET:-}
+  CODE_INTELLIGENCE_REQUEST_TIMEOUT_SECONDS: ${CODE_INTELLIGENCE_REQUEST_TIMEOUT_SECONDS:-10}
+  CODE_INTELLIGENCE_REQUEST_BODY_MAX_BYTES: ${CODE_INTELLIGENCE_REQUEST_BODY_MAX_BYTES:-3145728}
+  CODE_INTELLIGENCE_RESPONSE_BODY_MAX_BYTES: ${CODE_INTELLIGENCE_RESPONSE_BODY_MAX_BYTES:-2097152}
   EVIDENCE_CASE_TIMEOUT_SECONDS: ${EVIDENCE_CASE_TIMEOUT_SECONDS:-8}
   EVIDENCE_TOTAL_TIMEOUT_SECONDS: ${EVIDENCE_TOTAL_TIMEOUT_SECONDS:-50}
   EVIDENCE_CPU_SECONDS_PER_CASE: ${EVIDENCE_CPU_SECONDS_PER_CASE:-2}
@@ -50,7 +56,7 @@ x-backend-environment: &backend-environment
   HTTP_PROXY: ${CONTAINER_HTTP_PROXY:-${HTTP_PROXY:-}}
   HTTPS_PROXY: ${CONTAINER_HTTPS_PROXY:-${HTTPS_PROXY:-}}
   # Internal RPC and health checks must never go through the external proxy.
-  NO_PROXY: localhost,127.0.0.1,::1,backend,postgres,runner,moodle-browser,sync-worker,deadline-worker,host.docker.internal${NO_PROXY:+,${NO_PROXY}}
+  NO_PROXY: localhost,127.0.0.1,::1,backend,postgres,runner,code-intelligence,moodle-browser,sync-worker,deadline-worker,host.docker.internal${NO_PROXY:+,${NO_PROXY}}
   AI_TIMEOUT_SECONDS: ${AI_TIMEOUT_SECONDS:-180}
   AI_STREAM_IDLE_TIMEOUT_SECONDS: ${AI_STREAM_IDLE_TIMEOUT_SECONDS:-60}
   AI_MAX_RESPONSE_BYTES: ${AI_MAX_RESPONSE_BYTES:-1048576}
@@ -176,6 +182,36 @@ services:
     networks:
       - execution
 
+  code-intelligence:
+    image: eduprog-code-intelligence:${APP_IMAGE_TAG:-local}
+    build:
+      context: ./language_service
+    init: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: ${CODE_INTELLIGENCE_CONTAINER_MEMORY:-2g}
+    cpus: ${CODE_INTELLIGENCE_CONTAINER_CPUS:-1.0}
+    environment:
+      CODE_INTELLIGENCE_SHARED_SECRET: ${CODE_INTELLIGENCE_SHARED_SECRET:-}
+      CODE_INTELLIGENCE_ISOLATION: ${CODE_INTELLIGENCE_ISOLATION:-container}
+      CODE_INTELLIGENCE_MAX_SESSIONS: ${CODE_INTELLIGENCE_MAX_SESSIONS:-4}
+      CODE_INTELLIGENCE_IDLE_SECONDS: ${CODE_INTELLIGENCE_IDLE_SECONDS:-180}
+      CODE_INTELLIGENCE_REQUEST_SECONDS: ${CODE_INTELLIGENCE_REQUEST_SECONDS:-8}
+      CODE_INTELLIGENCE_PROCESS_MEMORY_MB: ${CODE_INTELLIGENCE_PROCESS_MEMORY_MB:-1024}
+      CODE_INTELLIGENCE_WORK_ROOT: /var/lib/code-intelligence/workspaces
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=32m,mode=1777
+      - /var/lib/code-intelligence/workspaces:rw,nosuid,nodev,noexec,size=256m,uid=65532,gid=65532,mode=0700
+    networks:
+      - language-rpc
+    # Never a prerequisite for backend readiness: optional intelligence can fail
+    # without preventing student autosave/submission or teacher review.
+
   moodle-browser:
     image: eduprog-moodle-browser:${APP_IMAGE_TAG:-local}
     build:
@@ -247,6 +283,7 @@ services:
       - data
       - execution
       - browser-rpc
+      - language-rpc
     depends_on:
       postgres:
         condition: service_healthy
@@ -368,5 +405,7 @@ networks:
   execution:
     internal: true
   browser-rpc:
+    internal: true
+  language-rpc:
     internal: true
   integration:

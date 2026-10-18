@@ -232,6 +232,7 @@ Docker-сборки.
   импорта Quiz Essay/Assignment и записи преподавательских баллов/комментариев
   через штатные формы Moodle; один Chromium, наружу не публикуется;
 - `runner/` — отдельный сервис компиляции и запуска C/C++;
+- `language_service/` — изолированный `clangd` для семантических подсказок редактора;
 - `moodle/local/programming_bridge/` — опциональный Moodle local plugin 0.3 для
   расширенных checkpoint/task-mirror возможностей;
 - `docs/` — требования, фактический статус, архитектура и критерии приёмки;
@@ -292,6 +293,18 @@ Frontend собирается внутри Docker: `npm ci` использует
 Проверить, что OpenRouter-настройки дошли до launcher и уже запущенного backend,
 не раскрывая API key, можно командой `./run_eduprog.sh diagnose-ai`.
 
+Редактор студента, просмотр сдачи и преподавательская песочница используют
+настоящий `clangd`: дополнение методов и заголовков, параметры функций, типы,
+переходы к определениям и ссылкам, диагностические подчёркивания. Форматирование
+доступно только в редактируемых файлах. Это локальный анализ без ИИ-запросов;
+оценку и результат компиляции он не заменяет. По умолчанию используется обычная
+контейнерная изоляция (`CODE_INTELLIGENCE_ISOLATION=container`), без требования
+Landlock или Linux 6.2. Сохраняются ограничения ресурсов и seccomp. Дополнительная
+защита файлов между сессиями доступна явно через режим `landlock`; только он
+требует Landlock ABI 3+. Изоляция прежнего runner не менялась. При недоступности
+clangd сохраняются простые подсказки, сохранение, сдача и запуск.
+Проверка: `./run_eduprog.sh diagnose-code-intelligence`.
+
 Недоступный runner не должен уводить весь сайт в systemd restart loop: launcher
 оставляет frontend/backend доступными и пишет диагностическое предупреждение.
 
@@ -318,6 +331,10 @@ cd ../moodle_browser
 python -m pip install -e '.[test]' ruff
 pytest
 ruff check src tests
+
+cd ../language_service
+python -m pip install -e '.[test]'
+pytest
 
 cd ..
 docker compose --env-file .env.example -f compose.yml config --quiet

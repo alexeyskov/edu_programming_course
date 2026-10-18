@@ -1,14 +1,17 @@
-import Editor, { type BeforeMount, type OnMount } from '@monaco-editor/react';
+import type { BeforeMount, OnMount } from '@monaco-editor/react';
+import { MonacoEditor as Editor } from './MonacoEditors';
 import type * as Monaco from 'monaco-editor';
-import { ChevronRight, FileCode2, FilePlus2, Folder, LockKeyhole, PanelLeftClose, Trash2, X } from 'lucide-react';
+import { ChevronRight, FileCode2, FilePlus2, Folder, LockKeyhole, PanelLeftClose, Trash2, WrapText, X } from 'lucide-react';
 import { forwardRef, useEffect, useId, useImperativeHandle, useMemo, useRef, useState } from 'react';
 import { useTheme } from '../context/ThemeContext';
-import { cn, cppKeywords, languageForPath, workspaceIdentifiers } from '../lib/utils';
+import { cn, languageForPath } from '../lib/utils';
 import { installEditorClipboardGuard, type EditorClipboardSession } from '../lib/editorClipboard';
 import { installAiSelectionAction, type AiCodeSelection } from '../lib/editorAiSelection';
+import { installCodeIntelligence, type CodeIntelligenceScope, type CodeIntelligenceStatus } from '../lib/codeIntelligence';
 import type { AiCodeFinding, Diagnostic, InternalPasteRange, WorkspaceFile } from '../types';
 import { Badge, Button } from './ui';
 import './aiAnnotations.css';
+import './codeIntelligence.css';
 
 export interface CodeWorkspaceHandle {
   openDiagnostic(diagnostic: Diagnostic): void;
@@ -35,6 +38,7 @@ interface Props {
   readOnly?: boolean;
   strictPaste?: boolean;
   scopeId: string;
+  intelligenceScope?: CodeIntelligenceScope;
   clipboardScopeId?: string;
   clipboardSession?: EditorClipboardSession;
   diagnostics?: Diagnostic[];
@@ -59,7 +63,7 @@ export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function Cod
   files, activeFileId, onActiveFile, onChange, onCreateFile, onDeleteFile, canDeleteFile,
   readOnly = false, strictPaste = false,
   scopeId, diagnostics = [], aiFindings = [], onAskAi, onAskAiSelection, highlights = [], theme: requestedTheme, experiment = false, explorerVisible = true, explorerId,
-  onExplorerCollapse, onPasteBlocked, onInternalCopy, clipboardScopeId, clipboardSession,
+  onExplorerCollapse, onPasteBlocked, onInternalCopy, clipboardScopeId, clipboardSession, intelligenceScope,
 }, ref) {
   const { theme: applicationTheme } = useTheme();
   const theme = requestedTheme ?? applicationTheme;
@@ -84,10 +88,16 @@ export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function Cod
   const active = files.find((file) => file.id === activeFileId) ?? files[0];
   const activeRef = useRef(active);
   const filesRef = useRef(files);
+  const intelligenceRef = useRef<ReturnType<typeof installCodeIntelligence>>();
+  const [intelligenceStatus, setIntelligenceStatus] = useState<CodeIntelligenceStatus>('connecting');
+  const intelligenceConfigRef = useRef({ scopeId, scope: intelligenceScope, files, readOnly, onOpenFile: onActiveFile, onStatus: setIntelligenceStatus });
+  intelligenceConfigRef.current = { scopeId, scope: intelligenceScope, files, readOnly, onOpenFile: onActiveFile, onStatus: setIntelligenceStatus };
   const pasteConfigRef = useRef({ strictPaste, readOnly, scopeId, clipboardScopeId, onPasteBlocked, onInternalCopy });
   activeRef.current = active;
   filesRef.current = files;
   pasteConfigRef.current = { strictPaste, readOnly, scopeId, clipboardScopeId, onPasteBlocked, onInternalCopy };
+
+  useEffect(() => { intelligenceRef.current?.refresh(); }, [scopeId, intelligenceScope?.id, intelligenceScope?.kind, files, activeFileId, readOnly]);
 
   useEffect(() => {
     if (activeFileId && !openFiles.includes(activeFileId)) setOpenFiles((items) => [...items, activeFileId]);
@@ -270,26 +280,9 @@ export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function Cod
     aiSelectionRef.current = installAiSelectionAction(editor, monaco, () => ({ ...selectionConfigRef.current, path: activeRef.current?.path }));
     refreshAiAction(); setMarkers(); setHighlights(); setAiAnnotations();
     const aiModelListener = editor.onDidChangeModel(() => refreshAiAnnotationsRef.current());
-    const completionProvider = (language: 'c' | 'cpp') => monaco.languages.registerCompletionItemProvider(language, {
-      provideCompletionItems(model, position) {
-        const scopePrefix = `inmemory:///${pasteConfigRef.current.scopeId}/`;
-        if (!model.uri.toString().startsWith(scopePrefix)) return { suggestions: [] };
-        const word = model.getWordUntilPosition(position);
-        const range = { startLineNumber: position.lineNumber, endLineNumber: position.lineNumber, startColumn: word.startColumn, endColumn: word.endColumn };
-        const local = workspaceIdentifiers(filesRef.current).map((identifier) => ({
-          label: identifier, kind: monaco.languages.CompletionItemKind.Variable, insertText: identifier,
-          detail: 'Идентификатор из текущей рабочей области', range, sortText: `0-${identifier}`,
-        }));
-        const keywords = cppKeywords.map((keyword) => ({
-          label: keyword, kind: monaco.languages.CompletionItemKind.Keyword, insertText: keyword,
-          detail: 'Ключевое слово C/C++', range, sortText: `1-${keyword}`,
-        }));
-        return { suggestions: [...local, ...keywords] };
-      },
-    });
-    const completionProviders = [completionProvider('c'), completionProvider('cpp')];
+    intelligenceRef.current = installCodeIntelligence(editor, monaco, () => intelligenceConfigRef.current);
     const dom = clipboardRootRef.current;
-    if (!dom) { completionProviders.forEach((provider) => provider.dispose()); return; }
+    if (!dom) { intelligenceRef.current.dispose(); return; }
     const disposeClipboard = installEditorClipboardGuard(dom, editor, () => ({
       ...pasteConfigRef.current, active: activeRef.current, files: filesRef.current,
     }), (receiptId, range, apply) => {
@@ -312,7 +305,8 @@ export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function Cod
       aiModelListener.dispose();
       highlightDecorationsRef.current?.clear();
       highlightDecorationsRef.current = null;
-      completionProviders.forEach((provider) => provider.dispose());
+      intelligenceRef.current?.dispose();
+      intelligenceRef.current = undefined;
       disposeClipboard();
     });
   };
@@ -327,12 +321,17 @@ export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function Cod
 
   return <div ref={clipboardRootRef} className={cn('code-workspace', experiment && 'code-workspace--experiment', !explorerVisible && 'code-workspace--explorer-hidden')}>
     <aside id={explorerId} className="file-explorer" hidden={!explorerVisible}><header><span>Файлы</span><span className="file-explorer__actions">{onCreateFile && !readOnly && <button onClick={onCreateFile} title="Создать файл" aria-label="Создать файл"><FilePlus2 size={15} /></button>}{onExplorerCollapse && <button onClick={onExplorerCollapse} title="Скрыть панель файлов" aria-label="Скрыть файлы"><PanelLeftClose size={15} /></button>}</span></header><div className="folder-label"><ChevronRight size={14} /><Folder size={15} /><span>workspace</span></div><div className="file-list">{files.map((file) => <div key={file.id} className={cn('file-entry', file.id === activeFileId && 'is-active')}><button className="file-entry__open" onClick={() => onActiveFile(file.id)}><FileCode2 size={15} /><span>{file.path}</span>{file.readOnly && <LockKeyhole size={12} />}</button>{onDeleteFile && !readOnly && !file.readOnly && (canDeleteFile?.(file) ?? files.length > 1) && <button className="file-entry__delete" onClick={() => onDeleteFile(file)} title={`Удалить ${file.path}`} aria-label={`Удалить ${file.path}`}><Trash2 size={13} /></button>}</div>)}</div><footer><span>Файлов: {files.length}</span></footer></aside>
-    <section className="editor-stage"><div className="editor-tabs">{openFiles.map((id) => { const file = files.find((item) => item.id === id); return file ? <button key={id} className={cn(id === activeFileId && 'is-active')} onClick={() => onActiveFile(id)}><FileCode2 size={14} /><span>{file.path.split('/').at(-1)}</span>{openFiles.length > 1 && <X size={13} onClick={(event) => { event.stopPropagation(); closeTab(id); }} />}</button> : null; })}<span className="editor-tabs__fill" /></div>
+    <section className="editor-stage"><div className="editor-tabs">{openFiles.map((id) => { const file = files.find((item) => item.id === id); return file ? <button key={id} className={cn(id === activeFileId && 'is-active')} onClick={() => onActiveFile(id)}><FileCode2 size={14} /><span>{file.path.split('/').at(-1)}</span>{openFiles.length > 1 && <X size={13} onClick={(event) => { event.stopPropagation(); closeTab(id); }} />}</button> : null; })}<span className="editor-tabs__fill" />{intelligenceScope && <div className="code-intelligence-tools"><span className={`code-intelligence-status code-intelligence-status--${intelligenceStatus}`} title={intelligenceStatus === 'ready' ? 'Подсказки C/C++, параметры функций, переход к определению (F12), ссылки (Shift+F12), символы файла (Ctrl/Cmd+Shift+O). Диагностика редактора не заменяет запуск компилятора.' : intelligenceStatus === 'fallback' ? 'clangd временно недоступен. Работают локальные подсказки; сохранение, сдача и запуск кода доступны.' : 'Подключение подсказок C/C++. Сохранение и запуск кода доступны.'}>{intelligenceStatus === 'ready' ? 'C/C++' : intelligenceStatus === 'fallback' ? 'Базовые подсказки' : 'C/C++…'}</span>{!readOnly && !active.readOnly && <button type="button" className="code-intelligence-format" aria-label="Форматировать код" title="Форматировать код (Shift+Alt+F)" onClick={() => { void intelligenceRef.current?.format(); }}><WrapText size={15} /></button>}</div>}</div>
       <Editor path={`inmemory:///${scopeId}/${active.path}`} value={active.content} language={active.language ?? languageForPath(active.path)} beforeMount={beforeMount} onMount={handleMount}
         onChange={(value) => onChange(active.id, value ?? '', internalPasteRef.current ? 'internal_paste' : 'typing', internalPasteRef.current ? internalPasteReceiptRef.current : undefined, internalPasteRef.current ? internalPasteRangeRef.current : undefined)}
         theme={theme === 'dark' ? 'eduprog-dark' : 'eduprog-light'} options={{
           // Keep clickable teacher AI hovers outside the editor row's overflow clip.
           fixedOverflowWidgets: Boolean(onAskAi || onAskAiSelection),
+          // No documentHighlight provider is registered. Avoid Monaco 0.52's
+          // idle highlighter cancellation on file switches; selection/search
+          // highlighting and explicit reference navigation remain available.
+          occurrencesHighlight: 'off',
+          quickSuggestionsDelay: 200,
           readOnly: readOnly || active.readOnly, readOnlyMessage: { value: 'Редактирование недоступно в режиме чтения.' }, minimap: { enabled: true, maxColumn: 80 }, fontSize: 14, lineHeight: 23, fontFamily: "'JetBrains Mono', 'SFMono-Regular', Consolas, monospace", fontLigatures: true, padding: { top: 14, bottom: 18 }, smoothScrolling: true, cursorSmoothCaretAnimation: 'on', automaticLayout: true, scrollBeyondLastLine: false, bracketPairColorization: { enabled: true }, guides: { bracketPairs: true, indentation: true }, suggest: { showSnippets: false }, quickSuggestions: !readOnly, inlineSuggest: { enabled: false }, contextmenu: !strictPaste, pasteAs: { enabled: !strictPaste }, dropIntoEditor: { enabled: !strictPaste }, dragAndDrop: !strictPaste, wordWrap: 'off', renderValidationDecorations: 'on',
         }} />
     </section>

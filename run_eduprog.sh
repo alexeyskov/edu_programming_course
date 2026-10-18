@@ -175,6 +175,12 @@ load_host_environment() {
     AI_TIMEOUT_SECONDS AI_STREAM_IDLE_TIMEOUT_SECONDS
     AI_MAX_RESPONSE_BYTES AI_MAX_STREAM_BYTES AI_MAX_OUTPUT_CHARS AI_TEACHER_MAX_OUTPUT_CHARS
     HTTP_PROXY HTTPS_PROXY NO_PROXY CONTAINER_HTTP_PROXY CONTAINER_HTTPS_PROXY
+    CODE_INTELLIGENCE_ENABLED CODE_INTELLIGENCE_SHARED_SECRET CODE_INTELLIGENCE_ISOLATION
+    CODE_INTELLIGENCE_MAX_SESSIONS CODE_INTELLIGENCE_IDLE_SECONDS
+    CODE_INTELLIGENCE_REQUEST_SECONDS CODE_INTELLIGENCE_REQUEST_TIMEOUT_SECONDS
+    CODE_INTELLIGENCE_PROCESS_MEMORY_MB CODE_INTELLIGENCE_CONTAINER_MEMORY
+    CODE_INTELLIGENCE_CONTAINER_CPUS CODE_INTELLIGENCE_REQUEST_BODY_MAX_BYTES
+    CODE_INTELLIGENCE_RESPONSE_BODY_MAX_BYTES
   )
   for key in "${allowed_keys[@]}"; do
     if [[ -n "${!key+x}" ]]; then
@@ -230,6 +236,12 @@ ensure_runtime_env() {
       printf '\nMOODLE_BROWSER_SHARED_SECRET=%s\n' "$browser_secret" >>"$RUNTIME_ENV_FILE"
       log "added the internal Moodle browser HMAC key"
     fi
+    if ! grep -q '^CODE_INTELLIGENCE_SHARED_SECRET=' "$RUNTIME_ENV_FILE"; then
+      local language_secret
+      language_secret="$(random_hex 32)"
+      printf '\nCODE_INTELLIGENCE_SHARED_SECRET=%s\n' "$language_secret" >>"$RUNTIME_ENV_FILE"
+      log "added the internal code-intelligence HMAC key"
+    fi
     return
   fi
 
@@ -237,13 +249,14 @@ ensure_runtime_env() {
   chmod 700 "$env_dir"
 
   local app_secret runner_secret moodle_secret moodle_credential_secret
-  local moodle_browser_secret authorship_secret
+  local moodle_browser_secret authorship_secret language_secret
   app_secret="$(random_hex 48)"
   runner_secret="$(random_hex 32)"
   moodle_secret="$(random_hex 32)"
   moodle_credential_secret="$(random_hex 32)"
   moodle_browser_secret="$(random_hex 32)"
   authorship_secret="$(random_hex 32)"
+  language_secret="$(random_hex 32)"
 
   if ! (
     umask 077
@@ -255,6 +268,7 @@ ensure_runtime_env() {
       printf 'MOODLE_CREDENTIAL_ENCRYPTION_KEY=%s\n' "$moodle_credential_secret"
       printf 'MOODLE_BROWSER_SHARED_SECRET=%s\n' "$moodle_browser_secret"
       printf 'AUTHORSHIP_PSEUDONYM_SECRET=%s\n' "$authorship_secret"
+      printf 'CODE_INTELLIGENCE_SHARED_SECRET=%s\n' "$language_secret"
       printf 'APP_IMAGE_TAG=n150\n'
       printf 'WEB_CONCURRENCY=2\n'
       printf 'RUNNER_MAX_CONCURRENT_JOBS=2\n'
@@ -441,6 +455,15 @@ diagnose_runner() {
   compose logs --no-color --tail=80 runner || true
 }
 
+diagnose_code_intelligence() {
+  log "code-intelligence readiness (clangd and effective isolation mode)"
+  compose exec -T code-intelligence python -c \
+    "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8084/health/ready', timeout=5).read().decode())" || true
+  compose ps code-intelligence || true
+  log "recent code-intelligence service logs (source code and secrets are not logged)"
+  compose logs --no-color --tail=40 code-intelligence || true
+}
+
 diagnose_ai() {
   local launcher_key_status="not configured"
   if [[ -n "${LLM_API_KEY:-}" ]]; then
@@ -520,7 +543,7 @@ start_detached() {
   if ! compose up -d --remove-orphans; then
     log "one or more containers failed during startup"
     compose ps >&2 || true
-    compose logs --no-color --tail=120 moodle-browser backend runner deadline-worker sync-worker frontend >&2 || true
+    compose logs --no-color --tail=120 moodle-browser backend runner code-intelligence deadline-worker sync-worker frontend >&2 || true
     return 1
   fi
   wait_for_service moodle-browser 180 python -c \
@@ -533,6 +556,12 @@ start_detached() {
     "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health/ready', timeout=3).read()"; then
     log "warning: runner is unavailable; the site will start, but compile/run requests remain disabled"
     diagnose_runner
+  fi
+  if [[ "${CODE_INTELLIGENCE_ENABLED:-true}" != "false" && "${CODE_INTELLIGENCE_ENABLED:-true}" != "0" ]]; then
+    if ! wait_for_service code-intelligence 20 python -c \
+      "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8084/health/ready', timeout=3).read()"; then
+      log "warning: clangd is unavailable; the editor keeps basic completion, saving and execution remain available"
+    fi
   fi
   wait_for_service frontend 120 wget -q -O /dev/null http://127.0.0.1:8080/healthz
   compose ps
@@ -575,6 +604,8 @@ Commands:
              Print runner readiness and effective container limits
   diagnose-ai
              Print effective AI provider settings without revealing the API key
+  diagnose-code-intelligence
+             Print clangd/isolation readiness without exposing source code or keys
   bootstrap-moodle [base-url] [display-name]
              Create/update the Moodle login connection in the application DB
   bootstrap-moodle-bridge [base-url] [display-name]
@@ -672,6 +703,9 @@ case "$command_name" in
     ;;
   diagnose-runner)
     diagnose_runner
+    ;;
+  diagnose-code-intelligence)
+    diagnose_code_intelligence
     ;;
   diagnose-ai)
     diagnose_ai

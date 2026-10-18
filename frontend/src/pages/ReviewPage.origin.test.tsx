@@ -18,7 +18,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('../lib/api', () => ({ api: mocks }));
-vi.mock('@monaco-editor/react', () => ({ DiffEditor: () => <div>Diff editor</div> }));
+vi.mock('../components/MonacoEditors', () => ({ MonacoDiffEditor: () => <div>Diff editor</div> }));
 vi.mock('../components/CodeWorkspace', () => ({
   CodeWorkspace: forwardRef((_props, ref) => {
     useImperativeHandle(ref, () => ({ openDiagnostic: vi.fn(), focus: vi.fn() }));

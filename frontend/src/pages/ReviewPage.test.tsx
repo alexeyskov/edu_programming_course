@@ -21,8 +21,8 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('../lib/api', () => ({ api: mocks }));
-vi.mock('@monaco-editor/react', () => ({
-  DiffEditor: ({ original, modified }: { original: string; modified: string }) => (
+vi.mock('../components/MonacoEditors', () => ({
+  MonacoDiffEditor: ({ original, modified }: { original: string; modified: string }) => (
     <div data-testid="diff-editor" data-original={original} data-modified={modified}>Diff editor</div>
   ),
 }));
