@@ -309,7 +309,10 @@ export function installCodeIntelligence(
       async provideCompletionItems(model, position, context, token) {
         if (!fileFor(model) || !editable(model)) return { suggestions: [] };
         const version = model.getVersionId(); const scope = scopeKey();
-        const result = await ask('completion', model, token, position, { triggerKind: context.triggerKind, ...(context.triggerCharacter ? { triggerCharacter: context.triggerCharacter } : {}) });
+        // Monaco completion triggers are 0/1/2, while LSP uses 1/2/3.
+        // Sending Invoke=0 caused a 422 and a 30-second lexical fallback.
+        // SignatureHelpTriggerKind already matches LSP and needs no offset.
+        const result = await ask('completion', model, token, position, { triggerKind: context.triggerKind + 1, ...(context.triggerCharacter ? { triggerCharacter: context.triggerCharacter } : {}) });
         if (disposed || token.isCancellationRequested || model.isDisposed() || model.getVersionId() !== version || scope !== scopeKey() || !editable(model)) return { suggestions: [] };
         return completion(result, model, position) ?? { suggestions: localCompletions(model, position) };
       },

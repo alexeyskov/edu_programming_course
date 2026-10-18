@@ -9,7 +9,7 @@ const range = { start: { line: 0, character: 0 }, end: { line: 0, character: 3 }
 const response = (result: unknown, diagnostics: CodeIntelligenceResponse['diagnostics'] = []): CodeIntelligenceResponse => ({ result, diagnostics });
 const token = { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) } as Monaco.CancellationToken;
 const position = { lineNumber: 1, column: 4 };
-const context = { triggerKind: 1 } as Monaco.languages.CompletionContext;
+const context = { triggerKind: 0 } as Monaco.languages.CompletionContext;
 
 class Model {
   private version = 1;
@@ -87,6 +87,40 @@ beforeEach(() => { vi.useFakeTimers(); });
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
 
 describe('C/C++ intelligence bridge', () => {
+  it.each([
+    { triggerKind: 0, expected: { triggerKind: 1 } },
+    { triggerKind: 1, triggerCharacter: '.', expected: { triggerKind: 2, triggerCharacter: '.' } },
+    { triggerKind: 2, expected: { triggerKind: 3 } },
+  ])('translates Monaco completion trigger $triggerKind to LSP', async ({ triggerKind, triggerCharacter, expected }) => {
+    const h = harness(); h.query.mockResolvedValue(response({ items: [] }));
+    await h.providers.completion.cpp.provideCompletionItems(h.model, position, { triggerKind, triggerCharacter }, token);
+    expect(h.query.mock.calls[0][0].context).toEqual(expected);
+    h.bridge.dispose();
+  });
+
+  it('requests members immediately after accepting a variable completion, without entering fallback', async () => {
+    const h = harness();
+    const declaration = 'std::vector<std::string> words;\n';
+    h.change(`${declaration}word`);
+    h.query.mockImplementation(async (body) => {
+      // The HTTP schema accepts LSP kinds 1..3; a raw Monaco Invoke (0)
+      // used to fail here and suppress all semantic completions for 30 seconds.
+      if (!body.context?.triggerKind) throw new Error('422: invalid triggerKind');
+      return response({ items: body.context.triggerKind === 2
+        ? [{ label: 'size', kind: 2 }, { label: 'push_back', kind: 2 }]
+        : [{ label: 'words', kind: 6 }] });
+    });
+    const variable = await h.complete(h.model, { lineNumber: 2, column: 5 });
+    expect(variable.suggestions).toEqual([expect.objectContaining({ label: 'words', kind: h.monaco.languages.CompletionItemKind.Variable })]);
+    h.change(`${declaration}words.`);
+    const members = await h.providers.completion.cpp.provideCompletionItems(h.model, { lineNumber: 2, column: 7 }, { triggerKind: 1, triggerCharacter: '.' }, token);
+    expect(h.query).toHaveBeenCalledTimes(2);
+    expect(h.query.mock.calls[1][0]).toMatchObject({ files: [{ path: 'main.cpp', content: `${declaration}words.` }, { path: 'lib/thing.h', content: 'int helper();' }] });
+    expect(members.suggestions.map((item: { label: string }) => item.label)).toEqual(['size', 'push_back']);
+    expect(h.config.onStatus).not.toHaveBeenCalledWith('fallback');
+    h.bridge.dispose();
+  });
+
   it('uses canonical Monaco URIs and sends current unsaved source, not auxiliary data files', async () => {
     const h = harness(); h.model.setValue('std::vector<int> values; values.');
     h.query.mockResolvedValue(response({ items: [{ label: 'push_back', kind: 2, detail: 'void push_back(int)', textEdit: { range, newText: 'push_back' }, command: { command: 'evil' } }], isIncomplete: true }));

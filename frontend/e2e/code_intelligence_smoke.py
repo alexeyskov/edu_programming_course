@@ -29,6 +29,10 @@ async def main():
             method = body["method"]
             result = None
             if method == "completion":
+                # Match the gateway's LSP contract, not Monaco's zero-based enum.
+                assert body["context"]["triggerKind"] in (1, 2, 3)
+                if body["context"].get("triggerCharacter"):
+                    assert body["context"]["triggerKind"] == 2
                 result = {"items": [{"label": "push_back", "kind": 2, "insertTextFormat": 2, "detail": "void push_back(int value)", "textEdit": {
                     "range": {"start": {"line": 4, "character": 9}, "end": {"line": 4, "character": 9}}, "newText": "push_back(${1:1})$0"}}]}
             elif method == "definition":
