@@ -12,6 +12,121 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.fixture
+def bashrc_launcher(tmp_path):
+    runtime_env = tmp_path / "runtime.env"
+    runtime_env.write_text(
+        "APP_SECRET_KEY=test-secret\nRUNNER_SHARED_SECRET=test-secret\n"
+        "MOODLE_CREDENTIAL_ENCRYPTION_KEY=test-secret\nMOODLE_BROWSER_SHARED_SECRET=test-secret\n"
+    )
+    host_env = tmp_path / "cpp_markup.env"
+    bashrc = tmp_path / "profile.bashrc"
+    capture = tmp_path / "captured.env"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        '#!/bin/sh\n'
+        'if [ "$1" = "compose" ] && [ "$2" = "version" ]; then exit 0; fi\n'
+        'if [ "$1" = "volume" ]; then exit 1; fi\n'
+        'printf "%s\\n%s\\n" "$LLM_API_KEY" "$AI_API_KEY" > "$EDUPROG_CAPTURE_FILE"\n'
+    )
+    fake_docker.chmod(fake_docker.stat().st_mode | stat.S_IXUSR)
+
+    def run(profile, *, llm_key="", extra_env=None):
+        host_env.write_text(
+            'DBLOGIN="db-user"\nDBPASSWORD="db-pass"\n'
+            'LLM_API_ADDRESS="https://openrouter.ai/api/v1"\nLLM_MODEL="test/model"\n'
+            'AI_API_KEY="legacy-test-key"\n'
+            + (f'LLM_API_KEY="{llm_key}"\n' if llm_key is not None else "")
+        )
+        if profile is not None:
+            bashrc.write_text(profile)
+        environment = {
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "EDUPROG_ENV_FILE": str(runtime_env),
+            "EDUPROG_HOST_ENV_FILE": str(host_env),
+            "EDUPROG_BASHRC_FILE": str(bashrc),
+            "EDUPROG_CAPTURE_FILE": str(capture),
+            **(extra_env or {}),
+        }
+        result = subprocess.run(
+            ["bash", str(PROJECT_ROOT / "run_eduprog.sh"), "diagnose-ai"],
+            cwd=PROJECT_ROOT, env=environment, capture_output=True, text=True,
+        )
+        return result, capture, runtime_env, host_env
+
+    return run
+
+
+@pytest.mark.parametrize("llm_key", [None, ""])
+@pytest.mark.parametrize("quote", ["", "'", '"'])
+def test_empty_or_absent_llm_key_reads_literal_bashrc_without_executing_it(
+    bashrc_launcher, tmp_path, llm_key, quote,
+):
+    marker = tmp_path / "must-not-exist"
+    profile = (
+        f'touch "{marker}"\n'
+        'case $- in *i*) ;; *) return ;; esac\n'
+        f'export OPENROUTER_API_KEY={quote}router-profile-test-key{quote} # private\n'
+    )
+    result, capture, runtime, host = bashrc_launcher(profile, llm_key=llm_key)
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text().splitlines() == ["router-profile-test-key"] * 2
+    assert not marker.exists()
+    assert "LLM_API_KEY=configured" in result.stdout
+    for value in (result.stdout, result.stderr, runtime.read_text(), host.read_text()):
+        assert "router-profile-test-key" not in value
+
+
+@pytest.mark.parametrize(
+    "llm_key,extra_env,expected",
+    [
+        ("explicit-test-key", {}, "explicit-test-key"),
+        ("", {"OPENROUTER_API_KEY": "exported-test-key"}, "exported-test-key"),
+        ("", {"OPENROUTER_API_KEY": ""}, "legacy-test-key"),
+        ("", {"EDUPROG_BASHRC_FILE": ""}, "legacy-test-key"),
+    ],
+)
+def test_explicit_keys_and_disabled_profile_loading_do_not_evaluate_bashrc(
+    bashrc_launcher, llm_key, extra_env, expected,
+):
+    result, capture, _, _ = bashrc_launcher(
+        'export OPENROUTER_API_KEY="$(printf do-not-evaluate)"\n',
+        llm_key=llm_key, extra_env=extra_env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text().splitlines() == [expected] * 2
+    assert expected not in result.stdout and expected not in result.stderr
+
+
+@pytest.mark.parametrize("profile", [None, "# No OpenRouter key here\n"])
+def test_missing_profile_key_preserves_legacy_configuration(bashrc_launcher, profile):
+    result, capture, _, _ = bashrc_launcher(profile)
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text().splitlines() == ["legacy-test-key"] * 2
+
+
+def test_dynamic_bashrc_key_fails_without_executing_or_exposing_it(bashrc_launcher, tmp_path):
+    marker = tmp_path / "must-not-exist"
+    result, _, _, _ = bashrc_launcher(
+        f'export OPENROUTER_API_KEY="$(touch {marker}; printf secret-expression)"\n'
+    )
+    assert result.returncode != 0
+    assert "literal single-line assignment" in result.stderr
+    assert "secret-expression" not in result.stderr and "secret-expression" not in result.stdout
+    assert not marker.exists()
+
+
+def test_profile_key_is_reread_on_next_launcher_invocation(bashrc_launcher):
+    for key in ("first-test-key", "rotated-test-key"):
+        result, capture, runtime, host = bashrc_launcher(f"export OPENROUTER_API_KEY='{key}'\n")
+        assert result.returncode == 0, result.stderr
+        assert capture.read_text().splitlines() == [key] * 2
+        for text in (result.stdout, result.stderr, runtime.read_text(), host.read_text()):
+            assert key not in text
+
+
 def test_launcher_maps_openrouter_aliases_and_compose_forwards_ai_environment(
     tmp_path: Path,
 ) -> None:
@@ -54,6 +169,7 @@ exit 0
             "PATH": f"{fake_bin}:{environment['PATH']}",
             "EDUPROG_ENV_FILE": str(runtime_env),
             "EDUPROG_HOST_ENV_FILE": str(tmp_path / "absent-host.env"),
+            "EDUPROG_BASHRC_FILE": str(tmp_path / "absent-bashrc"),
             "EDUPROG_CAPTURE_FILE": str(capture),
             "DBLOGIN": "test-db-user",
             "DBPASSWORD": "test-db-password",
@@ -80,7 +196,7 @@ exit 0
     ]
 
     compose = (PROJECT_ROOT / "compose.yml").read_text(encoding="utf-8")
-    assert "LLM_API_KEY: ${LLM_API_KEY-${AI_API_KEY:-${OPENROUTER_API_KEY:-}}}" in compose
+    assert "LLM_API_KEY: ${LLM_API_KEY:-${OPENROUTER_API_KEY:-${AI_API_KEY:-}}}" in compose
     assert "LLM_MODEL: ${LLM_MODEL:-${AI_MODEL:-${OPENROUTER_MODEL:-gpt-5-mini}}}" in compose
     assert (
         "LLM_API_ADDRESS: ${LLM_API_ADDRESS:-${AI_BASE_URL:-https://api.openai.com/v1}}" in compose
@@ -174,6 +290,7 @@ printf '%s\\n%s\\n%s\\n%s\\n%s\\n' \\
             "PATH": f"{fake_bin}:{environment['PATH']}",
             "EDUPROG_ENV_FILE": str(runtime_env),
             "EDUPROG_HOST_ENV_FILE": str(host_env),
+            "EDUPROG_BASHRC_FILE": str(tmp_path / "absent-bashrc"),
             "EDUPROG_CAPTURE_FILE": str(capture),
         }
     )
@@ -187,7 +304,7 @@ printf '%s\\n%s\\n%s\\n%s\\n%s\\n' \\
     assert result.returncode == 0, result.stderr
     assert capture.read_text().splitlines() == [
         "http://host.docker.internal:11434/api",
-        api_key,
+        api_key or "stale-router-secret",
         "Maternion/minicpm5:2b-q4_K_M",
         thinking,
         "true",
@@ -202,7 +319,7 @@ printf '%s\\n%s\\n%s\\n%s\\n%s\\n' \\
     assert f"LLM_THINKING={thinking}" in result.stdout
     assert "AI_TIMEOUT_SECONDS=180" in result.stdout
     assert "AI_STREAM_IDLE_TIMEOUT_SECONDS=60" in result.stdout
-    assert "LLM_API_KEY=" + ("configured" if api_key else "not configured") in result.stdout
+    assert "LLM_API_KEY=configured" in result.stdout
     for secret in (api_key, "stale-ai-secret", "stale-router-secret"):
         if secret:
             assert secret not in result.stdout and secret not in result.stderr
@@ -210,8 +327,9 @@ printf '%s\\n%s\\n%s\\n%s\\n%s\\n' \\
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="Docker Compose is optional locally")
 @pytest.mark.parametrize("new_names", [False, True])
+@pytest.mark.parametrize("router_key", ["", "router-test-key"])
 @pytest.mark.parametrize("proxy_mode", ["none", "generic", "container"])
-def test_real_compose_interpolation_of_provider_settings(new_names, proxy_mode):
+def test_real_compose_interpolation_of_provider_settings(new_names, proxy_mode, router_key):
     environment = {
         "PATH": os.environ["PATH"],
         "APP_SECRET_KEY": "test-only-secret",
@@ -224,6 +342,7 @@ def test_real_compose_interpolation_of_provider_settings(new_names, proxy_mode):
         "AI_ENABLED": "true",
         "AI_BASE_URL": "https://old.example/v1",
         "AI_API_KEY": "old-test-key",
+        "OPENROUTER_API_KEY": router_key,
         "AI_MODEL": "old-test-model",
         "AI_API_STYLE": "responses",
         "MOODLE_SYNC_TIMEOUT": "600",
@@ -279,7 +398,7 @@ def test_real_compose_interpolation_of_provider_settings(new_names, proxy_mode):
         assert config["LLM_API_ADDRESS"] == environment.get(
             "LLM_API_ADDRESS", environment["AI_BASE_URL"]
         )
-        assert config["LLM_API_KEY"] == ("" if new_names else "old-test-key")
+        assert config["LLM_API_KEY"] == (router_key or "old-test-key")
         assert config["LLM_MODEL"] == ("local/model" if new_names else "old-test-model")
         assert config["LLM_THINKING"] == ("0" if new_names else "")
         assert config["AI_API_STYLE"] == ("auto" if new_names else "responses")

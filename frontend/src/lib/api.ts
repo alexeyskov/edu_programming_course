@@ -1017,7 +1017,7 @@ export const api = {
   }) => withDemo(
     async () => mapAssessment(await request(`/courses/${courseId}/assessments`, { method: 'POST', body: JSON.stringify(payload) }), courseId),
     () => {
-      const item = mapAssessment({ id: createUuid(), course: courseId, ...payload, status: 'DRAFT' }, courseId);
+      const item = mapAssessment({ id: createUuid(), course: courseId, ...payload, ai_review_enabled: true, status: 'DRAFT' }, courseId);
       assessmentState.push(item); return cloneDemo(item);
     },
   ),

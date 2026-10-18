@@ -19,6 +19,26 @@ afterEach(() => {
 });
 
 describe('API transport security contract', () => {
+  it('defaults new demo assessments to automatic review without changing student help or saved opt-outs', async () => {
+    vi.stubEnv('VITE_DEMO_MODE', 'always');
+    try {
+      const fetchMock = vi.fn();
+      vi.stubGlobal('fetch', fetchMock);
+      const { api } = await freshApi();
+      const assessment = await api.createAssessment('course-1', {
+        type: 'EXAM', title: 'Новая работа', instructions: '', max_score: 10,
+        paste_policy: 'INTERNAL_ONLY', student_ai_enabled: false, multi_file: false,
+        review_required: true, decision_support_enabled: true,
+      });
+      expect(assessment).toMatchObject({ aiReviewEnabled: true, aiEnabled: false });
+      await api.setAssessmentAiReviewPolicy(assessment.id, false);
+      await expect(api.getAssessment(assessment.id)).resolves.toMatchObject({ aiReviewEnabled: false, aiEnabled: false });
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('previews closed AI chats read-only and purges only the explicitly confirmed cutoff with CSRF', async () => {
     const cutoff = '2026-10-05T09:55:00Z';
     const fetchMock = vi.fn()

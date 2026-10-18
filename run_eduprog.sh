@@ -111,6 +111,55 @@ sys.stdout.write(value)
 PY
 }
 
+read_openrouter_bashrc_key() {
+  python3 - "$1" <<'PY'
+import re
+import sys
+
+value = None
+try:
+    with open(sys.argv[1], encoding="utf-8") as source:
+        for line in source:
+            assignment = re.fullmatch(
+                r"[ \t]*(?:export[ \t]+)?OPENROUTER_API_KEY[ \t]*=(.*)",
+                line.rstrip("\r\n"),
+            )
+            if assignment is None:
+                continue
+            literal = re.fullmatch(
+                r'''[ \t]*(?:'([^']*)'|"([^"$`\\]*)"|([A-Za-z0-9_./+=:-]*))[ \t]*;?[ \t]*(?:\#.*)?''',
+                assignment.group(1),
+            )
+            if literal is None:
+                raise SystemExit(2)
+            value = next(item for item in literal.groups() if item is not None)
+except (OSError, UnicodeError):
+    raise SystemExit(2)
+if value is None:
+    raise SystemExit(3)
+sys.stdout.write(value)
+PY
+}
+
+load_openrouter_bashrc_key() {
+  # systemd does not source interactive shell profiles. Read only a literal key
+  # assignment, including one after Bash's usual non-interactive early return.
+  [[ -z "${LLM_API_KEY:-}" ]] || return 0
+  [[ -z "${OPENROUTER_API_KEY+x}" ]] || return 0
+  local bashrc_file="${EDUPROG_BASHRC_FILE-${HOME:+$HOME/.bashrc}}"
+  [[ -n "$bashrc_file" && -e "$bashrc_file" ]] || return 0
+  [[ -f "$bashrc_file" && -r "$bashrc_file" ]] || die "cannot read OpenRouter key file"
+  local value
+  if value="$(read_openrouter_bashrc_key "$bashrc_file")"; then
+    export OPENROUTER_API_KEY="$value"
+  else
+    case "$?" in
+      3) ;;
+      *) die "OPENROUTER_API_KEY in .bashrc must be a literal single-line assignment; shell expressions are not executed" ;;
+    esac
+  fi
+}
+
 load_host_environment() {
   [[ -n "$HOST_ENV_FILE" && -e "$HOST_ENV_FILE" ]] || return 0
   [[ -f "$HOST_ENV_FILE" ]] || die "host env is not a regular file: $HOST_ENV_FILE"
@@ -249,14 +298,14 @@ map_legacy_environment() {
   if [[ -n "${LLM_API_ADDRESS:-}" || -n "${LLM_MODEL:-}" || -n "${LLM_API_KEY:-}" ]]; then
     export AI_ENABLED="${AI_ENABLED:-true}"
     export AI_BASE_URL="${LLM_API_ADDRESS:-${AI_BASE_URL:-${OPENROUTER_API_BASE:-https://openrouter.ai/api/v1}}}"
-    # An explicitly empty new key means no authentication (local Ollama).
-    export AI_API_KEY="${LLM_API_KEY-${AI_API_KEY:-${OPENROUTER_API_KEY:-}}}"
+    # Empty and absent keys both inherit OpenRouter, then the legacy AI key.
+    export AI_API_KEY="${LLM_API_KEY:-${OPENROUTER_API_KEY:-${AI_API_KEY:-}}}"
     export AI_MODEL="${LLM_MODEL:-${AI_MODEL:-${OPENROUTER_MODEL:-gpt-5-mini}}}"
     export AI_API_STYLE="${AI_API_STYLE:-auto}"
   elif [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
     export AI_ENABLED="${AI_ENABLED:-true}"
     export AI_BASE_URL="${AI_BASE_URL:-${OPENROUTER_API_BASE:-https://openrouter.ai/api/v1}}"
-    export AI_API_KEY="${AI_API_KEY:-$OPENROUTER_API_KEY}"
+    export AI_API_KEY="$OPENROUTER_API_KEY"
     export AI_MODEL="${AI_MODEL:-${OPENROUTER_MODEL:-deepseek/deepseek-v4-pro}}"
     export AI_API_STYLE="${AI_API_STYLE:-chat_completions}"
   fi
@@ -537,6 +586,9 @@ Environment:
   LLM_API_ADDRESS / LLM_API_KEY / LLM_MODEL configure the AI provider.
   LLM_THINKING=0/1 controls model thinking where supported by the provider/model.
   OPENROUTER_* and AI_* remain supported as legacy provider settings.
+  Empty LLM_API_KEY inherits OPENROUTER_API_KEY, then AI_API_KEY.
+  OPENROUTER_API_KEY is also read as a literal assignment from ~/.bashrc.
+  EDUPROG_BASHRC_FILE selects that file (empty disables profile key loading).
   EDUPROG_ENV_FILE selects the persistent runtime configuration file.
   EDUPROG_HOST_ENV_FILE selects the host deployment env (default: ~/cpp_markup.env).
   EDUPROG_LEGACY_ENV_FILE selects an existing runtime file to copy once.
@@ -574,6 +626,7 @@ if [[ "$command_name" != "config" ]]; then
   docker info >/dev/null 2>&1 || die "Docker daemon is unavailable to the current user"
 fi
 load_host_environment
+load_openrouter_bashrc_key
 ensure_runtime_env
 map_legacy_environment
 

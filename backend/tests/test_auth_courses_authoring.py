@@ -490,6 +490,8 @@ async def test_task_and_assessment_state_machine_and_course_immutability(app_bun
             json={"type": "LAB", "title": "Lab", "max_score": "10.00"},
         )
         assert assessment.status_code == 201
+        assert assessment.json()["ai_review_enabled"] is True
+        assert assessment.json()["student_ai_enabled"] is False
         assessment_id = assessment.json()["id"]
         attached = await client.post(
             f"/api/v1/assessments/{assessment_id}/items",

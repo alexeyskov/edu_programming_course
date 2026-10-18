@@ -41,7 +41,7 @@ x-backend-environment: &backend-environment
   AI_ENABLED: ${AI_ENABLED:-false}
   AI_MOCK_ENABLED: ${AI_MOCK_ENABLED:-false}
   LLM_API_ADDRESS: ${LLM_API_ADDRESS:-${AI_BASE_URL:-https://api.openai.com/v1}}
-  LLM_API_KEY: ${LLM_API_KEY-${AI_API_KEY:-${OPENROUTER_API_KEY:-}}}
+  LLM_API_KEY: ${LLM_API_KEY:-${OPENROUTER_API_KEY:-${AI_API_KEY:-}}}
   LLM_MODEL: ${LLM_MODEL:-${AI_MODEL:-${OPENROUTER_MODEL:-gpt-5-mini}}}
   LLM_THINKING: ${LLM_THINKING:-}
   AI_API_STYLE: ${AI_API_STYLE:-auto}

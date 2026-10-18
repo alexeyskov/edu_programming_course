@@ -24,7 +24,8 @@ def settings(**values) -> Settings:
     )
 
 
-def test_new_environment_overrides_legacy_including_empty_key(monkeypatch):
+def test_new_environment_overrides_legacy_except_empty_key(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     for name, value in {
         "LLM_API_ADDRESS": "http://host.docker.internal:11434/api",
         "LLM_API_KEY": "",
@@ -37,11 +38,26 @@ def test_new_environment_overrides_legacy_including_empty_key(monkeypatch):
         monkeypatch.setenv(name, value)
     config = settings()
     assert config.ai_base_url == "http://host.docker.internal:11434/api"
-    assert config.ai_api_key.get_secret_value() == ""
+    assert config.ai_api_key.get_secret_value() == "old-secret"
     assert config.ai_model == "local/model"
     assert config.llm_thinking is False
     assert config.ai_api_style == "auto"
     assert config.ai_provider_configured
+
+
+@pytest.mark.parametrize("llm_key", [None, "", "explicit-test-key"])
+def test_openrouter_key_fallback_is_used_internally_and_remains_redacted(monkeypatch, llm_key):
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    if llm_key is not None:
+        monkeypatch.setenv("LLM_API_KEY", llm_key)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "router-fallback-test-key")
+    monkeypatch.setenv("AI_API_KEY", "old-test-key")
+    config = settings()
+    expected = llm_key or "router-fallback-test-key"
+    assert config.ai_api_key.get_secret_value() == expected
+    assert config.llm_api_key.get_secret_value() == expected
+    assert expected not in repr(config)
+    assert expected not in config.model_dump_json()
 
 
 def test_old_ai_environment_remains_compatible(monkeypatch):

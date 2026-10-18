@@ -16,7 +16,6 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
-    false,
     true,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -107,7 +106,7 @@ class Assessment(UUIDTimestampModel):
     paste_policy: Mapped[str] = mapped_column(String(32), default="INTERNAL_ONLY")
     student_ai_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     teacher_ai_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    ai_review_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    ai_review_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
     review_required: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
     decision_support_enabled: Mapped[bool] = mapped_column(
         Boolean,

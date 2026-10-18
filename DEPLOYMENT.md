@@ -242,8 +242,8 @@ sandbox; предупреждение в readiness является ожидае
 разделители.
 
 Новые настройки провайдера — `LLM_API_ADDRESS`, `LLM_API_KEY`, `LLM_MODEL`,
-`LLM_THINKING`. Они имеют приоритет над прежними `AI_*`/`OPENROUTER_*` именами.
-Пустой `LLM_API_KEY` явно отключает наследование старого ключа. Launcher
+`LLM_THINKING`. Непустой `LLM_API_KEY` имеет приоритет; при пустом или отсутствующем
+значении используется `OPENROUTER_API_KEY`, затем старый `AI_API_KEY`. Launcher
 автоматически включает AI при новых настройках адреса/модели, если
 `AI_ENABLED=false` не задан явно. Это позволяет подключать локальный сервер без ключа.
 
@@ -257,6 +257,30 @@ Docker Compose как дополнительный `--env-file` с приори�
 ```bash
 EDUPROG_HOST_ENV_FILE=/home/alexey/cpp_markup.env ./run_eduprog.sh diagnose-ai
 ```
+
+Для хранения ключа OpenRouter в `/home/alexey/.bashrc` используйте обычную
+однострочную запись (вместо примера укажите свой ключ):
+
+```bash
+export OPENROUTER_API_KEY='your-openrouter-key'
+```
+
+В `cpp_markup.env` можно оставить `LLM_API_KEY=""` или удалить эту строку.
+Удалите оттуда старую запись `OPENROUTER_API_KEY`, если она есть: уже заданная
+переменная окружения/host ENV имеет приоритет над `.bashrc`. Скрипт запуска
+сам читает только буквальное присваивание ключа из `.bashrc` пользователя сервиса,
+в том числе после стандартного `return` для неинтерактивной оболочки. Он не
+исполняет профиль, `source`, подстановки команд или ссылки на другие переменные.
+При повторном запуске ключ перечитывается, без сохранения в runtime/host ENV-файлы;
+в окружение backend он попадает как `LLM_API_KEY`.
+
+Другой путь к профилю задаётся через `EDUPROG_BASHRC_FILE`; пустое значение отключает
+чтение профиля. Для локального провайдера без авторизации оставьте пустыми
+`LLM_API_KEY`, `OPENROUTER_API_KEY` и `AI_API_KEY`: явно заданный пустой
+`OPENROUTER_API_KEY` также запрещает его чтение из `.bashrc`.
+После синхронизации кода и изменения ключа достаточно штатного перезапуска
+`sudo systemctl restart eduprog.service`. Значение ключа в диагностике не печатается:
+`bash ./run_eduprog.sh diagnose-ai` показывает только `configured`/`not configured`.
 
 На целевом NUC в `/home/alexey/cpp_markup.env` должны быть заданы именно эти
 host-level параметры (systemd unit читает их из `EnvironmentFile=`):
@@ -981,11 +1005,15 @@ curl --fail --silent --show-error http://127.0.0.1:11434/v1/models
 ```dotenv
 AI_ENABLED=true
 LLM_API_ADDRESS=https://openrouter.ai/api/v1
-LLM_API_KEY=your-openrouter-key
+LLM_API_KEY=""
 LLM_MODEL=deepseek/deepseek-v4.1-flash
 LLM_THINKING=0
 AI_API_STYLE=auto
 ```
+
+Ключ в этом примере берётся из `OPENROUTER_API_KEY` окружения или `.bashrc`
+через launcher. Прямой `docker compose` не читает `.bashrc`: ему переменная
+должна быть уже экспортирована в окружение.
 
 Перед подключением внешнего провайдера согласуйте передачу учебных данных.
 Ключ передаётся только backend; frontend, runner и Moodle workers его не получают.

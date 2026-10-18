@@ -270,6 +270,11 @@ Ollama и других ИИ-провайдеров ([примеры подклю
 `OPENROUTER_MODEL` из прежнего `cpp_markup.env`. При ручном запуске launcher сам
 читает разрешённые deployment-переменные из `~/cpp_markup.env` без `source` или
 `eval`; другой путь задаётся через `EDUPROG_HOST_ENV_FILE`.
+Если `LLM_API_KEY` пуст или отсутствует, используется `OPENROUTER_API_KEY`
+(затем legacy `AI_API_KEY`). Для запуска через systemd launcher умеет безопасно
+прочитать буквальную запись `export OPENROUTER_API_KEY='…'` из `~/.bashrc`
+пользователя сервиса, не исполняя сам профиль и не записывая ключ в ENV-файлы.
+Уже заданный `OPENROUTER_API_KEY` имеет приоритет над профилем.
 
 На целевом NUC файл `/home/alexey/cpp_markup.env` должен задавать
 `PUBLIC_BIND_ADDRESS=127.0.0.1` и `PUBLIC_PORT=5173`. Это локальный endpoint NUC;

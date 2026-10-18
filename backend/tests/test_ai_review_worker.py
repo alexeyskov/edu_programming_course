@@ -145,11 +145,14 @@ async def test_lifespan_runs_independent_ai_and_terminal_workers(app_bundle, mon
     assert app.state.terminal_checkpoint_worker_task.done()
 
 
-@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("enabled", [None, True, False])
 @pytest.mark.parametrize("source", ["MANUAL", "DEADLINE"])
-async def test_new_submission_enqueues_only_opted_in_advisory_job(db, enabled, source):
+async def test_new_submission_defaults_to_advisory_review_and_respects_opt_out(db, enabled, source):
     student, _, _, assessment = await _seed_course(db)
-    assessment.ai_review_enabled = enabled
+    assert assessment.ai_review_enabled is True
+    assert assessment.student_ai_enabled is False
+    if enabled is not None:
+        assessment.ai_review_enabled = enabled
     attempt = await start_attempt(
         db, assessment_id=assessment.id, principal_id=student.id,
     )
@@ -162,7 +165,7 @@ async def test_new_submission_enqueues_only_opted_in_advisory_job(db, enabled, s
     reports = list((await db.scalars(select(AICodeReview))).all())
 
     assert repeated.id == submission.id
-    assert len(reports) == int(enabled)
+    assert len(reports) == int(enabled is not False)
     if reports:
         assert reports[0].submission_id == submission.id
         assert reports[0].snapshot_id == submission.snapshot_id

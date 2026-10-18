@@ -33,6 +33,9 @@ from tests.test_api_integrity_ai_system import _context, _csrf, _seed
 async def review_bundle(app_bundle):
     app, sessions, settings = app_bundle
     seed = await _seed(sessions)
+    # Exercise a saved administrative opt-out, independent of the new-work default.
+    async with sessions() as db, db.begin():
+        (await db.get(Assessment, seed.assessment_id)).ai_review_enabled = False
     settings.ai_mock_enabled = True
     holder = {"auth": _context(seed.teacher_id, roles=("TEACHER",))}
 
@@ -396,7 +399,7 @@ async def test_moodle_feedback_arriving_during_ai_analysis_remains_authoritative
 
 
 @pytest.mark.asyncio
-async def test_automatic_ai_review_is_opt_in_and_administrator_only(review_bundle):
+async def test_automatic_ai_review_policy_is_administrator_only(review_bundle):
     app, sessions, settings, seed, holder = review_bundle
     provider = ReviewProvider()
     url = f"/api/v1/ai/submissions/{seed.submission_id}/code-review"

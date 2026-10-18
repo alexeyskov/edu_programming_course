@@ -16,6 +16,8 @@ WorkingDirectory=/home/alexey/programming/edu_programming_course
 EnvironmentFile=/home/alexey/cpp_markup.env
 Environment=EDUPROG_ENV_FILE=/home/alexey/.config/eduprog/runtime.env
 Environment=EDUPROG_LEGACY_ENV_FILE=/home/alexey/.config/contour/runtime.env
+# run_eduprog.sh reads only the literal OPENROUTER_API_KEY assignment from
+# the service user's ~/.bashrc; it does not source or execute that profile.
 # Invoke Bash explicitly so deployments copied without the executable file bit
 # do not fail at systemd's EXEC stage (status=203/EXEC).
 ExecStart=/bin/bash /home/alexey/programming/edu_programming_course/run_eduprog.sh serve

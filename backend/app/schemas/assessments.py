@@ -172,7 +172,7 @@ class AssessmentStudentRead(ReadModel):
 class AssessmentTeacherRead(AssessmentStudentRead):
     section_id: UUID | None = None
     teacher_ai_enabled: bool
-    ai_review_enabled: bool = False
+    ai_review_enabled: bool = True
     decision_support_enabled: bool
     policy: JsonObject = Field(default_factory=dict)
     items: list[AssessmentItemTeacherRead] = Field(default_factory=list)

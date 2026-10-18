@@ -113,6 +113,9 @@ class Settings(BaseSettings):
     ai_model: str = "gpt-5-mini"
     llm_api_address: str | None = Field(default=None, validation_alias="LLM_API_ADDRESS")
     llm_api_key: SecretStr | None = Field(default=None, validation_alias="LLM_API_KEY")
+    openrouter_api_key: SecretStr = Field(
+        default=SecretStr(""), validation_alias="OPENROUTER_API_KEY",
+    )
     llm_model: str | None = Field(default=None, validation_alias="LLM_MODEL")
     ai_api_style: Literal["auto", "responses", "chat_completions", "ollama"] = "responses"
     llm_thinking: bool | None = None
@@ -276,9 +279,11 @@ class Settings(BaseSettings):
             self.ai_base_url = self.llm_api_address.strip()
             if "ai_api_style" not in self.model_fields_set:
                 self.ai_api_style = "auto"
-        if self.llm_api_key is not None:
-            # Explicitly empty LLM_API_KEY disables legacy key inheritance.
+        if self.llm_api_key is not None and self.llm_api_key.get_secret_value():
             self.ai_api_key = self.llm_api_key
+        elif self.openrouter_api_key.get_secret_value():
+            self.ai_api_key = self.openrouter_api_key
+        self.llm_api_key = self.ai_api_key
         if self.llm_model is not None:
             self.ai_model = self.llm_model.strip()
         return self

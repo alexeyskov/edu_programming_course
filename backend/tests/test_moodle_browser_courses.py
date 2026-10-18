@@ -1361,6 +1361,7 @@ async def test_course_import_materializes_idempotent_moodle_managed_drafts(
                 for version in versions
             )
             assert all(assessment.status == "DRAFT" for assessment in assessments)
+            assert all(assessment.ai_review_enabled is True for assessment in assessments)
             assert {assessment.type for assessment in assessments} == {"LAB", "EXAM"}
             local_version = next(
                 version for version in versions if version.title.startswith("Лабораторная")
@@ -1375,6 +1376,7 @@ async def test_course_import_materializes_idempotent_moodle_managed_drafts(
                 if assessment.title.startswith("Лабораторная")
             )
             local_assessment.title = "Локально исправленная лабораторная"
+            local_assessment.ai_review_enabled = False
             local_assessment.closes_at = datetime.fromtimestamp(1_900_000_000, tz=UTC)
             assessment_id = local_assessment.id
             exam_assessment = next(
@@ -1606,6 +1608,10 @@ async def test_course_import_materializes_idempotent_moodle_managed_drafts(
     )
     assert local_assessment is not None
     assert local_assessment.title == "Лабораторная работа 1 changed upstream"
+    assert local_assessment.ai_review_enabled is False
+    assert (
+        next(row for row in assessments if row.id == exam_assessment_id).ai_review_enabled is True
+    )
     assert local_assessment.attempt_limit is None
     assert local_assessment.closes_at is not None
     assert local_assessment.closes_at.replace(tzinfo=UTC) == datetime.fromtimestamp(

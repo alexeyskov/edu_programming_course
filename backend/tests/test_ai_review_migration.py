@@ -9,6 +9,46 @@ from alembic.operations import Operations
 from app.models.analysis import AICodeReview
 
 
+def test_ai_review_default_on_migration_preserves_saved_policy_in_both_directions():
+    migration = importlib.import_module(
+        "app.db.migrations.versions.20261019_0027_ai_review_default_on"
+    )
+    engine = sa.create_engine("sqlite://")
+    metadata = sa.MetaData()
+    assessment = sa.Table(
+        "core_assessment",
+        metadata,
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("ai_review_enabled", sa.Boolean(), nullable=False, server_default=sa.false()),
+    )
+    try:
+        with engine.begin() as connection:
+            metadata.create_all(connection)
+            connection.execute(assessment.insert(), {"id": 1})
+            connection.execute(assessment.insert(), {"id": 2, "ai_review_enabled": True})
+            with Operations.context(MigrationContext.configure(connection)):
+                migration.upgrade()
+            upgraded = sa.Table(assessment.name, sa.MetaData(), autoload_with=connection)
+            assert connection.execute(sa.select(upgraded).order_by(upgraded.c.id)).all() == [
+                (1, False), (2, True),
+            ]
+            # Exercise the database default, not SQLAlchemy's Python-side default.
+            connection.execute(upgraded.insert(), {"id": 3})
+            connection.execute(upgraded.insert(), {"id": 4, "ai_review_enabled": False})
+            assert connection.execute(sa.select(upgraded).order_by(upgraded.c.id)).all() == [
+                (1, False), (2, True), (3, True), (4, False),
+            ]
+            with Operations.context(MigrationContext.configure(connection)):
+                migration.downgrade()
+            downgraded = sa.Table(assessment.name, sa.MetaData(), autoload_with=connection)
+            connection.execute(downgraded.insert(), {"id": 5})
+            assert connection.execute(sa.select(downgraded).order_by(downgraded.c.id)).all() == [
+                (1, False), (2, True), (3, True), (4, False), (5, False),
+            ]
+    finally:
+        engine.dispose()
+
+
 def test_ai_review_migration_defaults_off_and_preserves_existing_assessments():
     migration = importlib.import_module("app.db.migrations.versions.20261004_0021_ai_code_review")
     manual_migration = importlib.import_module(
