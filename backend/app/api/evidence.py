@@ -40,6 +40,7 @@ from app.services.policy import (
     require_submission_review_access,
 )
 from app.services.review import require_owned_active_claim
+from app.services.storage_state import require_submission_payload
 
 router = APIRouter(tags=["decision-support", "evidence"])
 DB = Annotated[AsyncSession, Depends(get_db)]
@@ -63,6 +64,7 @@ async def _submission_context(
         allow_system_settings_read=allow_system_settings_read,
     )
     submission = access.submission
+    require_submission_payload(submission)
     attempt = access.attempt
     assessment = access.assessment
     snapshot = await db.get(Snapshot, submission.snapshot_id)

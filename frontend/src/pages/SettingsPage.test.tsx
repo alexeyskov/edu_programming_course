@@ -11,6 +11,8 @@ const mocks = vi.hoisted(() => ({
   getSettings: vi.fn(),
   getAiChatCleanup: vi.fn(),
   cleanUpAiChats: vi.fn(),
+  getStorageUsage: vi.fn(),
+  cleanUpStorage: vi.fn(),
   updateSettings: vi.fn(),
   getHealth: vi.fn(),
   getCourseCatalog: vi.fn(),
@@ -39,6 +41,8 @@ vi.mock('../lib/api', async (importOriginal) => {
     getSettings: mocks.getSettings,
     getAiChatCleanup: mocks.getAiChatCleanup,
     cleanUpAiChats: mocks.cleanUpAiChats,
+    getStorageUsage: mocks.getStorageUsage,
+    cleanUpStorage: mocks.cleanUpStorage,
     updateSettings: mocks.updateSettings,
     getHealth: mocks.getHealth,
     getCourseCatalog: mocks.getCourseCatalog,
@@ -149,6 +153,10 @@ beforeEach(() => {
     closedBefore: '2026-10-05T09:55:00Z', graceSeconds: 300, protectedThreads: 0,
   });
   mocks.updateSettings.mockResolvedValue(settings);
+  mocks.getStorageUsage.mockResolvedValue({
+    storageLimitGb: 128, usedBytes: 0, databaseBytes: null, eligibleBefore: '2026-10-19T09:00:00Z',
+    categories: [], warnings: [], lastCleanupAt: null,
+  });
   mocks.getHealth.mockResolvedValue({ status: 'ok', database: 'ok', build: 'test' });
   mocks.getCourseCatalog.mockResolvedValue([course]);
   mocks.deleteCourseCatalogEntry.mockResolvedValue(undefined);
@@ -165,6 +173,39 @@ beforeEach(() => {
 });
 
 describe('administrator elevation renewal', () => {
+  it('defaults the stored-data budget to 128 GiB and persists an edited value only after saving', async () => {
+    renderSettings();
+    const budget = await screen.findByRole('spinbutton', { name: 'Лимит хранимых данных' });
+    expect(budget).toHaveValue(128);
+    fireEvent.change(budget, { target: { value: '256' } });
+    expect(mocks.updateSettings).not.toHaveBeenCalled();
+    expect(mocks.cleanUpStorage).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Сохранить настройки' }));
+    await waitFor(() => expect(mocks.updateSettings).toHaveBeenCalledWith({ ...settings, storageLimitGb: 256 }));
+    expect(mocks.cleanUpStorage).not.toHaveBeenCalled();
+  });
+
+  it('rejects a fractional or out-of-bounds storage budget without sending settings or cleanup requests', async () => {
+    renderSettings();
+    const budget = await screen.findByRole('spinbutton', { name: 'Лимит хранимых данных' });
+    for (const invalid of ['0', '-1', '1.5', '65537']) {
+      fireEvent.change(budget, { target: { value: invalid } });
+      expect(budget).toHaveAttribute('aria-invalid', 'true');
+      expect(screen.getByRole('button', { name: 'Сохранить настройки' })).toBeDisabled();
+    }
+    expect(mocks.updateSettings).not.toHaveBeenCalled();
+    expect(mocks.cleanUpStorage).not.toHaveBeenCalled();
+  });
+
+  it('returns to administrator token entry if storage access expires', async () => {
+    mocks.getStorageUsage.mockRejectedValue(new ApiError(403, 'CAPABILITY_REQUIRED', 'Missing SYSTEM_SETTINGS'));
+    renderSettings();
+    expect(await screen.findByRole('heading', { name: 'Возобновление доступа' })).toBeInTheDocument();
+    expect(mocks.invalidateElevation).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('heading', { name: 'Управление хранилищем' })).not.toBeInTheDocument();
+    expect(mocks.cleanUpStorage).not.toHaveBeenCalled();
+  });
+
   it('returns to administrator token entry if chat cleanup access expires', async () => {
     mocks.getAiChatCleanup.mockRejectedValue(new ApiError(403, 'CAPABILITY_REQUIRED', 'Missing SYSTEM_SETTINGS'));
     renderSettings();

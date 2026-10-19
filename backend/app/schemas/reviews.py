@@ -110,6 +110,7 @@ class SubmissionSourceWarningRead(ReadModel):
 
 class SubmissionTeacherRead(SubmissionListItemRead):
     attempt_id: UUID
+    payload_evicted_at: datetime | None = None
     assigned_task_version_id: UUID | None
     task_statement: str = ""
     source_warnings: list[SubmissionSourceWarningRead] = Field(default_factory=list)

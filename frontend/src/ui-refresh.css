@@ -509,6 +509,16 @@ select:focus-visible, summary:focus-visible, [role='separator']:focus-visible {
   .review-page[data-mobile-panel='task'] .evidence-body { flex: 0 0 auto; overflow: visible; }
   .review-page[data-mobile-panel='task'] .grading-panel { display: block; flex: 0 0 auto; overflow: visible; padding: 18px; }
   .review-side > .grading-panel .grading-panel__heading { min-height: 44px; }
+  .review-mobile-actions { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 8px; min-height: 48px; padding: 6px 12px; border-bottom: 1px solid var(--line); background: var(--surface); }
+  .review-mobile-actions > span { max-width: 150px; color: var(--muted); font-size: 11px; line-height: 1.4; text-align: right; }
+  .review-mobile-actions .ai-review-launch, .review-mobile-actions .ai-highlights-toggle { min-height: 36px; }
+  .review-mobile-claim { margin-bottom: 14px; }
+  .review-mobile-claim p { font-size: 12px; line-height: 1.6; color: var(--muted); }
+  .review-mobile-claim .button { min-height: 44px; }
+  .review-side .grading-panel input, .review-side .grading-panel textarea { font-size: 16px; }
+  .review-side .grading-panel__body > footer { position: static; flex-wrap: wrap; padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+  .review-side .grading-panel__body > footer .button { flex: 1; min-height: 44px; white-space: normal; }
+  .review-side .ai-review-recommendation > button { align-self: stretch; min-height: 44px; white-space: normal; text-align: left; }
   .review-side .teacher-chat-expand { display: none; }
   .review-layout--ai-expanded .teacher-chat { max-width: none; }
   .teacher-chat > .teacher-chat-transcript { padding-right: 0; }

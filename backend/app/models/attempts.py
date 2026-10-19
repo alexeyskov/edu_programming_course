@@ -193,6 +193,11 @@ class Submission(UUIDTimestampModel):
     lms_export_state: Mapped[str] = mapped_column(String(32), default="PENDING")
     external_receipt: Mapped[dict[str, Any]] = mapped_column(JSONValue, default=dict)
     client_context: Mapped[dict[str, Any]] = mapped_column(JSONValue, default=dict)
+    # IDs, hashes and grading metadata survive local cache eviction. Source and
+    # confirmed Moodle comments can be restored by an explicit history sync.
+    payload_evicted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
 
 
 class RunRequest(UUIDTimestampModel):

@@ -36,6 +36,7 @@ from app.models.identity import ExternalPrincipal
 from app.models.tasks import Assessment, TaskVersion
 from app.services.common import DomainError, audit_row, canonical_hash
 from app.services.policy import require_decision_support, require_membership
+from app.services.storage_state import require_submission_payload
 
 _KEYWORDS = {
     "alignas",
@@ -215,7 +216,7 @@ async def _prepare_submission(
     window_size: int,
     max_bytes: int,
 ) -> PreparedSubmission:
-    snapshot = await db.get(Snapshot, submission.snapshot_id)
+    snapshot = await db.get(Snapshot, submission.snapshot_id, populate_existing=True)
     if snapshot is None:
         raise DomainError(500, "SNAPSHOT_MISSING", "Submission snapshot is missing")
     total = sum(len(str(file.get("content", "")).encode()) for file in snapshot.files)
@@ -379,9 +380,30 @@ async def run_similarity_analysis(
         analysis.state = AnalysisState.FAILED.value
         analysis.error = "Submission count exceeds configured scan limit"
         raise DomainError(413, "SIMILARITY_SCAN_TOO_LARGE", analysis.error)
+    # Retention uses the same attempt fence. Acquire it in stable order before
+    # reading source payloads, then refresh identities that may have been loaded
+    # before a concurrent cleanup committed.
+    if submissions:
+        await db.scalars(
+            select(Attempt)
+            .where(Attempt.id.in_([item.attempt_id for item in submissions]))
+            .order_by(Attempt.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        refreshed = {
+            item.id: item
+            for item in await db.scalars(
+                select(Submission)
+                .where(Submission.id.in_([item.id for item in submissions]))
+                .execution_options(populate_existing=True)
+            )
+        }
+        submissions = [refreshed[item.id] for item in submissions]
     prepared: list[PreparedSubmission] = []
     total_bytes = 0
     for submission in submissions:
+        require_submission_payload(submission)
         item = await _prepare_submission(
             db,
             submission,
@@ -482,7 +504,21 @@ async def create_authorship_job(
             role=CourseRole.TEACHER,
         )
     require_decision_support(assessment)
+    attempt = await db.scalar(
+        select(Attempt)
+        .where(Attempt.id == attempt.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    await db.refresh(submission)
+    snapshot = await db.get(Snapshot, submission.snapshot_id, populate_existing=True)
     workspace = await db.scalar(select(Workspace).where(Workspace.attempt_id == attempt.id))
+    require_submission_payload(submission)
+    if (attempt.integrity_policy or {}).get("history_available") is False:
+        raise DomainError(
+            410, "EDIT_HISTORY_PRUNED",
+            "История написания очищена администратором. Повторный анализ авторства недоступен.",
+        )
     if workspace is None:
         raise DomainError(500, "WORKSPACE_MISSING", "Submission workspace is missing")
     events = list(

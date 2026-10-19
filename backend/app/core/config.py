@@ -195,6 +195,14 @@ class Settings(BaseSettings):
         gt=0,
         validation_alias="DEADLINE_POLL_SECONDS",
     )
+    # Storage accounting is deliberately independent of the deadline polling
+    # cadence: a full data scan must never run every five seconds.
+    storage_cleanup_interval_seconds: int = Field(
+        default=900,
+        ge=60,
+        le=86_400,
+        validation_alias="STORAGE_CLEANUP_INTERVAL_SECONDS",
+    )
     sync_poll_seconds: float = Field(
         default=2,
         gt=0,

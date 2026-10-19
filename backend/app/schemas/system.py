@@ -42,6 +42,7 @@ class SystemSettingsRead(ReadModel):
     runner_cpu_seconds: int = Field(ge=1, le=300)
     runner_memory_mb: int = Field(ge=64, le=65_536)
     retention_days: int = Field(ge=1, le=3_650)
+    storage_limit_gb: int = Field(default=128, ge=1, le=65_536)
     allowed_lms_origins: list[AnyHttpUrl] = Field(default_factory=list, max_length=100)
     incident_banner: Annotated[str, StringConstraints(max_length=10_000)] = ""
     services: list[ServiceHealthRead] = Field(default_factory=list, max_length=100)
@@ -55,6 +56,7 @@ class SystemSettingsUpdateRequest(MutationModel):
     runner_cpu_seconds: int | None = Field(default=None, ge=1, le=300)
     runner_memory_mb: int | None = Field(default=None, ge=64, le=65_536)
     retention_days: int | None = Field(default=None, ge=1, le=3_650)
+    storage_limit_gb: int | None = Field(default=None, ge=1, le=65_536, strict=True)
     allowed_lms_origins: list[AnyHttpUrl] | None = Field(default=None, max_length=100)
     incident_banner: Annotated[str, StringConstraints(max_length=10_000)] | None = None
 
@@ -88,6 +90,56 @@ class AIChatCleanupRequest(MutationModel):
         if not value:
             raise ValueError("explicit confirmation is required")
         return value
+
+
+StorageCategory = Literal["edit_history", "teacher_ai_chats", "synced_submissions"]
+
+
+class StorageCategoryRead(ReadModel):
+    category: StorageCategory
+    records: int = Field(ge=0)
+    used_bytes: int = Field(ge=0)
+    eligible_records: int = Field(ge=0)
+    eligible_bytes: int = Field(ge=0)
+
+
+class StorageStatusRead(ReadModel):
+    storage_limit_gb: int = Field(default=128, ge=1, le=65_536)
+    used_bytes: int = Field(ge=0)
+    database_bytes: int | None = Field(default=None, ge=0)
+    eligible_before: AwareDatetime
+    categories: list[StorageCategoryRead] = Field(max_length=3)
+    warnings: list[str] = Field(default_factory=list, max_length=20)
+    last_cleanup_at: AwareDatetime | None = None
+
+
+class StorageCleanupRequest(MutationModel):
+    category: Literal["edit_history", "teacher_ai_chats", "synced_submissions", "quota"]
+    eligible_before: AwareDatetime
+    confirm: bool = Field(strict=True)
+
+    @field_validator("confirm")
+    @classmethod
+    def require_confirmation(cls, value: bool) -> bool:
+        if not value:
+            raise ValueError("explicit confirmation is required")
+        return value
+
+
+class StorageCleanupCategoryRead(ReadModel):
+    category: StorageCategory
+    removed_records: int = Field(ge=0)
+    reclaimed_bytes: int = Field(ge=0)
+
+
+class StorageCleanupRead(ReadModel):
+    used_bytes_before: int = Field(ge=0)
+    used_bytes_after: int = Field(ge=0)
+    reclaimed_bytes: int = Field(ge=0)
+    over_limit: bool
+    removed_records: int = Field(ge=0)
+    categories: list[StorageCleanupCategoryRead] = Field(max_length=3)
+    warnings: list[str] = Field(default_factory=list, max_length=20)
 
 
 class SystemSettingRead(ReadModel):
@@ -194,6 +246,12 @@ __all__ = [
     "AuditEntryRead",
     "ServiceHealthRead",
     "ServiceStatus",
+    "StorageCategory",
+    "StorageCategoryRead",
+    "StorageCleanupCategoryRead",
+    "StorageCleanupRead",
+    "StorageCleanupRequest",
+    "StorageStatusRead",
     "SyncOutboxListItemRead",
     "SyncOutboxRead",
     "SyncOutboxRetryRequest",

@@ -149,7 +149,7 @@ describe('course and work filters', () => {
     renderPage('/submissions?course=course-b&q=Никита');
     fireEvent.click(await screen.findByRole('button', { name: 'Открыть следующую' }));
     await waitFor(() => expect(mocks.claimSubmission).toHaveBeenCalledWith('other'));
-    expect(screen.getByTestId('location').textContent).toBe('/review/other?course=course-b&q=Никита');
+    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('/review/other?course=course-b&q=Никита'));
   });
 
   it('keeps a filter with no remaining submissions instead of silently showing other work', async () => {

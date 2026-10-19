@@ -19,6 +19,48 @@ afterEach(() => {
 });
 
 describe('API transport security contract', () => {
+  it('previews stored data read-only and sends a category and refreshed cutoff only with confirmed cleanup', async () => {
+    const cutoff = '2026-10-19T09:00:00Z';
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({
+      storage_limit_gb: 128, used_bytes: 200, database_bytes: null, eligible_before: cutoff,
+      categories: [{ category: 'edit_history', records: 4, used_bytes: 100, eligible_records: 2, eligible_bytes: 50 }],
+      warnings: [], last_cleanup_at: null,
+    })).mockResolvedValueOnce(jsonResponse({ csrf_token: 'storage-csrf' })).mockResolvedValueOnce(jsonResponse({
+      used_bytes_before: 200, used_bytes_after: 150, reclaimed_bytes: 50, over_limit: false, removed_records: 2,
+      categories: [{ category: 'edit_history', removed_records: 2, reclaimed_bytes: 50 }], warnings: [],
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    await expect(api.getStorageUsage()).resolves.toEqual({
+      storageLimitGb: 128, usedBytes: 200, databaseBytes: null, eligibleBefore: cutoff,
+      categories: [{ category: 'edit_history', records: 4, usedBytes: 100, eligibleRecords: 2, eligibleBytes: 50 }],
+      warnings: [], lastCleanupAt: null,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await expect(api.cleanUpStorage('edit_history', cutoff)).resolves.toEqual({
+      usedBytesBefore: 200, usedBytesAfter: 150, reclaimedBytes: 50, overLimit: false, removedRecords: 2,
+      categories: [{ category: 'edit_history', removedRecords: 2, reclaimedBytes: 50 }], warnings: [],
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const [url, init] = fetchMock.mock.calls[2];
+    expect(url).toBe('/api/v1/system/storage/cleanup');
+    expect(init.method).toBe('POST'); expect(init.credentials).toBe('include');
+    expect(init.headers.get('X-CSRFToken')).toBe('storage-csrf');
+    expect(JSON.parse(init.body)).toEqual({ category: 'edit_history', eligible_before: cutoff, confirm: true });
+  });
+
+  it('never retries storage deletion or substitutes demo success on provider failure', async () => {
+    vi.stubEnv('VITE_DEMO_MODE', 'auto');
+    try {
+      const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ csrf_token: 'storage-csrf' }))
+        .mockResolvedValueOnce(jsonResponse({ detail: { code: 'UNAVAILABLE', message: 'Unavailable' } }, 503));
+      vi.stubGlobal('fetch', fetchMock);
+      const { api } = await freshApi();
+      await expect(api.cleanUpStorage('quota', '2026-10-19T09:00:00Z')).rejects.toMatchObject({ status: 503 });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it('queries language intelligence using credentials and CSRF without any demo substitution', async () => {
     vi.stubEnv('VITE_DEMO_MODE', 'always');
     try {

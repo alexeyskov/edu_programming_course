@@ -2,6 +2,12 @@ import { describe, expect, it } from 'vitest';
 import { ApiError, apiNormalizers } from './api';
 
 describe('backend DTO normalization', () => {
+  it('preserves the archive marker without treating a missing local payload as a new answer', () => {
+    expect(apiNormalizers.mapSubmission({ id: 'archived', payload_evicted_at: '2026-10-19T09:00:00Z', status: 'GRADED', score: '9', files: [] }))
+      .toMatchObject({ payloadEvictedAt: '2026-10-19T09:00:00Z', files: [], score: 9, status: 'GRADED' });
+    expect(apiNormalizers.mapSubmission({ id: 'normal' }).payloadEvictedAt).toBeUndefined();
+  });
+
   it('distinguishes cached automatic reports from one-off manual checks', () => {
     expect(apiNormalizers.mapAiCodeReview({ enabled: true, automatic: true, state: 'COMPLETED' })).toMatchObject({ automatic: true });
     expect(apiNormalizers.mapAiCodeReview({ enabled: true, automatic: false, state: 'COMPLETED' })).toMatchObject({ automatic: false });
@@ -367,6 +373,8 @@ describe('backend DTO normalization', () => {
     expect(settings.studentAiEnabled).toBe(false);
     expect(settings.runnerEnabled).toBe(false);
     expect(settings.services).toEqual([]);
+    expect(settings.storageLimitGb).toBe(128);
+    expect(apiNormalizers.mapSettings({ storage_limit_gb: 256 }).storageLimitGb).toBe(256);
   });
 
   it('normalizes uppercase diagnostic severity', () => {

@@ -1740,6 +1740,7 @@ async def _materialize_flat_historical_submissions(
     items: list[dict[str, Any]],
     attached_version: TaskVersion | None = None,
     prepared_sources: dict[str, _HistoricalSourceMaterialization] | None = None,
+    restore_evicted: bool = False,
 ) -> MoodleHistoryImportStats:
     """Idempotently project read-only Moodle attempts into the review domain."""
 
@@ -1781,10 +1782,20 @@ async def _materialize_flat_historical_submissions(
                 ExternalMapping.external_id == external_id,
             )
         )
+        mapped_submission = await db.get(Submission, mapping.local_id) if mapping else None
+        evicted = mapped_submission is not None and mapped_submission.payload_evicted_at is not None
+        if (
+            evicted and not restore_evicted and mapping.external_revision == external_revision
+        ):
+            # Do not refill a deliberately evicted cache at every background
+            # scan. An explicit teacher sync (or changed remote revision) restores it.
+            stats = stats.add("unchanged")
+            continue
         if (
             mapping is not None
             and mapping.external_revision == external_revision
             and _historical_source_materialization_is_current(mapping)
+            and not evicted
         ):
             # Re-evaluate the imported decision even for an unchanged Moodle
             # revision.  This repairs attempts that an older importer left
@@ -2103,6 +2114,7 @@ async def _materialize_flat_historical_submissions(
             db.add(snapshot)
             await db.flush()
             submission.snapshot_id = snapshot.id
+            submission.payload_evicted_at = None
             submission.submitted_at = submitted_at
             submission.external_receipt = {
                 **dict(submission.external_receipt or {}),
@@ -2166,6 +2178,7 @@ async def materialize_historical_submissions(
     assessment: Assessment,
     actor_external_subject: str,
     items: list[dict[str, Any]],
+    restore_evicted: bool = False,
 ) -> MoodleHistoryImportStats:
     """Idempotently import Moodle history, splitting multi-Essay quizzes.
 
@@ -2265,6 +2278,7 @@ async def materialize_historical_submissions(
             assessment=assessment,
             actor_external_subject=actor_external_subject,
             items=items,
+            restore_evicted=restore_evicted,
         )
 
     await _mark_managed_quiz_as_split_container(db, course=course, parent=assessment)
@@ -2284,6 +2298,7 @@ async def materialize_historical_submissions(
                     assessment=assessment,
                     actor_external_subject=actor_external_subject,
                     items=[item],
+                    restore_evicted=restore_evicted,
                 )
             )
             continue
@@ -2351,6 +2366,7 @@ async def materialize_historical_submissions(
                     items=[split_item],
                     attached_version=version,
                     prepared_sources={str(split_item["external_id"]): converted},
+                    restore_evicted=restore_evicted,
                 )
             )
         if not legacy_adopted:

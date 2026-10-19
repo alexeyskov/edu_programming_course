@@ -128,7 +128,7 @@ export function AiReviewRecommendation({ report, maxScore, canApprove, onApprove
       : `Кнопка подставит балл и комментарий в поля формы. Отправка в Moodle — только через «Утвердить». ${report.automatic
         ? 'При выходе отменяется только неутверждённый ИИ-черновик в форме. Ответ автоматической проверки и подсветка замечаний сохраняются.'
         : 'При выходе без утверждения ИИ-черновик и рекомендация ручной проверки отменяются.'}`}</small>
-    {report.id && report.recommendationStatus === 'PENDING' && validGrade && report.recommendedComment?.trim() && <Button size="sm" variant="secondary" disabled={!canApprove} loading={applying} onClick={onApprove}>Подставить оценку и комментарий</Button>}
+    {report.id && report.recommendationStatus === 'PENDING' && validGrade && report.recommendedComment?.trim() && <Button size="sm" variant="secondary" disabled={!canApprove} loading={applying} onClick={onApprove}>Поставить оценку и комментарий от ИИ</Button>}
   </section>;
 }
 

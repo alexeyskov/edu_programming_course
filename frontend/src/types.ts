@@ -392,6 +392,7 @@ export interface Submission {
   taskVersionId?: string;
   taskStatement?: string;
   sourceWarnings?: Array<{ code: string; message: string; moodleUrl?: string }>;
+  payloadEvictedAt?: string;
   courseId?: string;
   courseTitle?: string;
   assessmentTitle: string;
@@ -536,6 +537,37 @@ export interface AiChatCleanupPreview extends AiChatCleanupCounts {
   protectedThreads: number;
 }
 
+export type StorageCategory = 'edit_history' | 'teacher_ai_chats' | 'synced_submissions';
+export type StorageCleanupTarget = StorageCategory | 'quota';
+
+export interface StorageUsageCategory {
+  category: StorageCategory;
+  records: number;
+  usedBytes: number;
+  eligibleRecords: number;
+  eligibleBytes: number;
+}
+
+export interface StorageUsage {
+  storageLimitGb: number;
+  usedBytes: number;
+  databaseBytes: number | null;
+  eligibleBefore: string;
+  categories: StorageUsageCategory[];
+  warnings: string[];
+  lastCleanupAt: string | null;
+}
+
+export interface StorageCleanupResult {
+  usedBytesBefore: number;
+  usedBytesAfter: number;
+  reclaimedBytes: number;
+  overLimit: boolean;
+  removedRecords: number;
+  categories: Array<{ category: StorageCategory; removedRecords: number; reclaimedBytes: number }>;
+  warnings: string[];
+}
+
 export interface SystemSettings {
   revision?: number;
   aiEnabled: boolean;
@@ -544,6 +576,7 @@ export interface SystemSettings {
   runnerCpuSeconds: number;
   runnerMemoryMb: number;
   retentionDays: number;
+  storageLimitGb?: number;
   allowedLmsOrigins: string[];
   incidentBanner: string;
   services: Array<{ name: string; status: 'ok' | 'degraded' | 'down'; detail: string }>;

@@ -198,9 +198,8 @@ async def main(output):
             original,
         )
         await student.set_viewport_size({"width": 390, "height": 844})
-        await student.wait_for_function(
-            "window.testMonaco.editor.getEditors()[0].getOption(window.testMonaco.editor.EditorOption.readOnly)"
-        )
+        await student.locator(".mobile-code-preview").wait_for()
+        assert await student.locator(".ide-editor textarea, .ide-editor [contenteditable]").count() == 0
         await capture(student, "student-mobile-code")
         await student.get_by_role("button", name="Условие", exact=True).click()
         await student.locator(".condition-statement").wait_for(state="visible")
@@ -220,7 +219,7 @@ async def main(output):
         )
         await student.set_viewport_size({"width": 1366, "height": 768})
         await student.wait_for_function(
-            "!window.testMonaco.editor.getEditors()[0].getOption(window.testMonaco.editor.EditorOption.readOnly)"
+            "window.testMonaco.editor.getEditors()[0] && !window.testMonaco.editor.getEditors()[0].getOption(window.testMonaco.editor.EditorOption.readOnly)"
         )
         assert (
             await student.evaluate(

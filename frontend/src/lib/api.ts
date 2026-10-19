@@ -10,7 +10,7 @@ import type {
   CourseImportJob, InternalPasteRange, MoodleHistoryImportEvent, Session, SimilarityAnalysis, SimilarityComparison, SimilarityMatch, Submission, SystemHealth, SystemSettings, TaskBankItem, TaskVersion, TeacherAccessToken, TeacherAccessTokenIssued, TeacherExperiment, WorkspaceFile,
 } from '../types';
 
-import type { AiChatCleanupCounts, AiChatCleanupPreview } from '../types';
+import type { AiChatCleanupCounts, AiChatCleanupPreview, StorageCategory, StorageCleanupResult, StorageCleanupTarget, StorageUsage } from '../types';
 import { readAiStream, type AiStreamEvent } from './aiStream';
 import type { CodeIntelligenceQuery, CodeIntelligenceResponse } from './codeIntelligence';
 
@@ -724,6 +724,7 @@ function mapSubmission(raw: any): Submission {
     parentAssessmentId: raw.parent_assessment_id ? String(raw.parent_assessment_id) : undefined,
     parentAssessmentTitle: raw.parent_assessment_title ? String(raw.parent_assessment_title) : undefined,
     taskStatement: typeof raw.task_statement === 'string' ? raw.task_statement : undefined,
+    payloadEvictedAt: raw.payload_evicted_at || undefined,
     sourceWarnings: unwrapList<any>(raw.source_warnings ?? []).map((warning) => ({
       code: String(warning.code), message: String(warning.message), moodleUrl: safeExternalUrl(warning.moodle_url),
     })),
@@ -819,6 +820,7 @@ function mapSettings(raw: any): SystemSettings {
     runnerCpuSeconds: Number(raw.runner_cpu_seconds ?? 4),
     runnerMemoryMb: Number(raw.runner_memory_mb ?? 256),
     retentionDays: Number(raw.retention_days ?? 365),
+    storageLimitGb: Number(raw.storage_limit_gb ?? 128),
     allowedLmsOrigins: raw.allowed_lms_origins ?? [],
     incidentBanner: String(raw.incident_banner ?? ''),
     services: raw.services ?? [],
@@ -1552,6 +1554,45 @@ export const api = {
       method: 'POST', body: JSON.stringify({ closed_before: closedBefore, confirm: true }),
     }));
   },
+  getStorageUsage: async (): Promise<StorageUsage> => {
+    if (demoMode === 'always') return {
+      storageLimitGb: settingsState.storageLimitGb ?? 128,
+      usedBytes: 0, databaseBytes: null, eligibleBefore: new Date().toISOString(),
+      categories: ['edit_history', 'teacher_ai_chats', 'synced_submissions'].map((category) => ({
+        category: category as StorageCategory, records: 0, usedBytes: 0, eligibleRecords: 0, eligibleBytes: 0,
+      })),
+      warnings: [], lastCleanupAt: null,
+    };
+    const raw = await request<any>('/system/storage');
+    return {
+      storageLimitGb: Number(raw.storage_limit_gb), usedBytes: Number(raw.used_bytes),
+      databaseBytes: raw.database_bytes == null ? null : Number(raw.database_bytes),
+      eligibleBefore: raw.eligible_before,
+      categories: (raw.categories ?? []).map((item: any) => ({
+        category: item.category, records: Number(item.records), usedBytes: Number(item.used_bytes),
+        eligibleRecords: Number(item.eligible_records), eligibleBytes: Number(item.eligible_bytes),
+      })),
+      warnings: raw.warnings ?? [], lastCleanupAt: raw.last_cleanup_at ?? null,
+    };
+  },
+  cleanUpStorage: async (category: StorageCleanupTarget, eligibleBefore: string): Promise<StorageCleanupResult> => {
+    if (demoMode === 'always') return {
+      usedBytesBefore: 0, usedBytesAfter: 0, reclaimedBytes: 0, overLimit: false,
+      removedRecords: 0, categories: [], warnings: [],
+    };
+    const raw = await request<any>('/system/storage/cleanup', {
+      method: 'POST', body: JSON.stringify({ category, eligible_before: eligibleBefore, confirm: true }),
+    });
+    return {
+      usedBytesBefore: Number(raw.used_bytes_before), usedBytesAfter: Number(raw.used_bytes_after),
+      reclaimedBytes: Number(raw.reclaimed_bytes), overLimit: raw.over_limit === true,
+      removedRecords: Number(raw.removed_records),
+      categories: (raw.categories ?? []).map((item: any) => ({
+        category: item.category, removedRecords: Number(item.removed_records), reclaimedBytes: Number(item.reclaimed_bytes),
+      })),
+      warnings: raw.warnings ?? [],
+    };
+  },
   getHealth: (): Promise<SystemHealth> => withDemo(async () => {
     const raw = await request<any>('/system/health');
     return { status: raw.status === 'ok' ? 'ok' : raw.status === 'degraded' ? 'degraded' : 'down', database: String(raw.database ?? 'error'), build: String(raw.build ?? 'unknown') } as SystemHealth;
@@ -1570,6 +1611,7 @@ function toSnakeSettings(value: SystemSettings) {
     revision: value.revision,
     ai_enabled: value.aiEnabled, student_ai_enabled: value.studentAiEnabled, runner_enabled: value.runnerEnabled,
     runner_cpu_seconds: value.runnerCpuSeconds, runner_memory_mb: value.runnerMemoryMb,
-    retention_days: value.retentionDays, allowed_lms_origins: value.allowedLmsOrigins, incident_banner: value.incidentBanner,
+    retention_days: value.retentionDays, storage_limit_gb: value.storageLimitGb ?? 128,
+    allowed_lms_origins: value.allowedLmsOrigins, incident_banner: value.incidentBanner,
   };
 }

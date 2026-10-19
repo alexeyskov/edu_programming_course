@@ -68,6 +68,11 @@ from app.services.policy import (
     visible_submission_ids_for_review,
 )
 from app.services.review import response_max_score
+from app.services.storage_state import (
+    ARCHIVED_PAYLOAD_MESSAGE,
+    lock_submission_payload,
+    require_submission_payload,
+)
 from app.services.teacher_tokens import teacher_membership_is_authorized
 from app.services.workspace import ensure_attempt_not_finalized_in_moodle
 
@@ -407,6 +412,7 @@ async def _teacher_context(
     settings: Settings,
     allow_system_settings_read: bool = False,
     teacher_comment: str | None = None,
+    lock_payload: bool = True,
 ) -> dict[str, Any]:
     submission = await db.get(Submission, submission_id)
     attempt = await db.get(Attempt, submission.attempt_id) if submission is not None else None
@@ -421,11 +427,14 @@ async def _teacher_context(
         submission_id=submission.id,
         allow_system_settings_read=allow_system_settings_read,
     )
+    if lock_payload:
+        submission = await lock_submission_payload(db, submission)
     globally_enabled, _student_enabled = await _effective_ai_flags(db, settings)
+    require_submission_payload(submission)
     if not globally_enabled or not assessment.teacher_ai_enabled:
         raise DomainError(403, "TEACHER_AI_DISABLED", "Teacher AI help is disabled")
     require_decision_support(assessment)
-    snapshot = await db.get(Snapshot, submission.snapshot_id)
+    snapshot = await db.get(Snapshot, submission.snapshot_id, populate_existing=True)
     if snapshot is None:
         raise DomainError(500, "SNAPSHOT_MISSING", "Submission snapshot is missing")
     # A child question has its own statement, but shares the work's general
@@ -780,6 +789,7 @@ async def _code_review_context(
     settings: Settings,
     *,
     allow_manual: bool = False,
+    lock_payload: bool = True,
 ) -> tuple[Submission, Snapshot, AICodeReviewRead | None, dict[str, Any]]:
     access = await require_submission_review_access(
         db,
@@ -788,10 +798,16 @@ async def _code_review_context(
         allow_system_settings_read=auth.has_capability("SYSTEM_SETTINGS"),
     )
     submission, attempt, assessment = access.submission, access.attempt, access.assessment
+    if lock_payload:
+        submission = await lock_submission_payload(db, submission)
     policy = await ai_review_policy_assessment(db, assessment, attempt)
-    snapshot = await db.get(Snapshot, submission.snapshot_id)
+    snapshot = await db.get(Snapshot, submission.snapshot_id, populate_existing=True)
     if snapshot is None:
         raise DomainError(409, "SNAPSHOT_MISSING", "Submission snapshot is missing")
+    if submission.payload_evicted_at is not None:
+        return submission, snapshot, AICodeReviewRead(
+            enabled=False, state="UNAVAILABLE", error=ARCHIVED_PAYLOAD_MESSAGE,
+        ), {}
     if not policy.ai_review_enabled and not allow_manual:
         return submission, snapshot, AICodeReviewRead(enabled=False, state="DISABLED"), {}
     enabled, _ = await _effective_ai_flags(db, settings)
@@ -1159,6 +1175,10 @@ async def process_next_ai_code_review(
                 auth,
                 settings,
                 allow_manual=manual_requested,
+                # The worker already holds its report row. QUEUED/RUNNING
+                # reports protect retention; taking Attempt here would invert
+                # the API's Attempt -> Submission -> report lock order.
+                lock_payload=False,
             )
         except DomainError:
             report.state = "FAILED"
@@ -1226,6 +1246,7 @@ async def process_next_ai_code_review(
                 auth,
                 settings,
                 allow_manual=manual_requested,
+                lock_payload=False,
             )
         except DomainError:
             unavailable = AICodeReviewRead(enabled=False, state="DISABLED")
@@ -1316,6 +1337,10 @@ async def _create_teacher_thread(
                 expected_course_id=body.course,
                 settings=settings,
                 allow_system_settings_read=auth.has_capability("SYSTEM_SETTINGS"),
+                # Creation only validates availability; no model context is
+                # sent or persisted. Keep reset's ChatThread update out of the
+                # inverse Attempt -> ChatThread lock order used by sending.
+                lock_payload=False,
             )
             if reset_history:
                 # Keep the audit trail, but never include it in the new conversation.

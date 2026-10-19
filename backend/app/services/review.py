@@ -41,6 +41,7 @@ from app.services.common import DomainError, sha256_text
 from app.services.moodle_attempt_selection import is_latest_completed_moodle_attempt
 from app.services.moodle_quiz_session import quiz_question_for_attempt
 from app.services.policy import require_review_required, require_submission_review_access
+from app.services.storage_state import require_submission_payload
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -98,6 +99,7 @@ async def _submission_context(
         submission_id=submission_id,
         allow_system_settings_read=allow_system_settings_read,
     )
+    require_submission_payload(submission)
     return submission, access.attempt, access.assessment
 
 

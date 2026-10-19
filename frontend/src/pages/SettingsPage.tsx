@@ -6,6 +6,7 @@ import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react'
 import { Badge, Button, Card, Field, InlineError, Modal, PageLoader, Toggle, useToast } from '../components/ui';
 import { LmsSyncErrorDialog } from '../components/LmsSyncErrorDialog';
 import { AiChatCleanupSettings } from '../components/AiChatCleanupSettings';
+import { StorageCleanupSettings } from '../components/StorageCleanupSettings';
 import { useAuth } from '../context/AuthContext';
 import { api, ApiError } from '../lib/api';
 import { loadRememberedTokens } from '../lib/rememberedTokens';
@@ -202,6 +203,7 @@ export function SettingsPage() {
   const [health, setHealth] = useState<SystemHealth | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [storageRefreshKey, setStorageRefreshKey] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [catalog, setCatalog] = useState<CourseCatalogEntry[]>([]);
   const [catalogLoading, setCatalogLoading] = useState(true);
@@ -439,14 +441,18 @@ export function SettingsPage() {
   if (error || !settings) return <InlineError message={error ?? 'Настройки не найдены'} retry={() => void load()} />;
 
   const patch = (next: Partial<SystemSettings>) => setSettings({ ...settings, ...next });
+  const storageLimitGb = settings.storageLimitGb ?? 128;
+  const storageLimitError = Number.isInteger(storageLimitGb) && storageLimitGb >= 1 && storageLimitGb <= 65536
+    ? undefined : 'Введите целое число от 1 до 65 536 ГиБ.';
 
   async function save() {
-    if (!settings) return;
+    if (!settings || storageLimitError) return;
     const requestEpoch = accessEpochRef.current;
     setSaving(true);
     try {
       const updated = await api.updateSettings(settings);
       setSettings(updated);
+      setStorageRefreshKey((value) => value + 1);
       settingsLoadedRef.current = true;
       toast.push('success', 'Настройки сохранены', 'Изменение политик зафиксировано в аудите.');
     } catch (caught) {
@@ -932,9 +938,11 @@ export function SettingsPage() {
 
         <Card id="settings-storage" className="settings-card">
           <header><span><Database /></span><div><h2>Хранение</h2><p>История, снимки, эксперименты и аудит.</p></div></header>
+          <Field label="Лимит хранимых данных" error={storageLimitError} hint="После сохранения при превышении лимита фоновая очистка удаляет старые данные по очереди. Снижение лимита может привести к безвозвратному удалению истории и чатов."><div className="unit-input"><input type="number" min={1} max={65536} step={1} value={storageLimitGb} onChange={(event) => patch({ storageLimitGb: Number(event.target.value) })} /><span>ГиБ</span></div></Field>
           <Field label="Срок хранения учебных записей"><div className="unit-input"><input type="number" value={settings.retentionDays} onChange={(event) => patch({ retentionDays: Number(event.target.value) })} /><span>дней</span></div></Field>
           <Field className="settings-card__spaced-field" label="Системное объявление"><textarea rows={3} value={settings.incidentBanner} onChange={(event) => patch({ incidentBanner: event.target.value })} placeholder="Пусто — объявление не показывается" /></Field>
         </Card>
+        <StorageCleanupSettings key={`storage-${accessGeneration}`} refreshKey={storageRefreshKey} onAccessError={handleChatCleanupAccessError} />
         <AiChatCleanupSettings key={accessGeneration} onAccessError={handleChatCleanupAccessError} />
       </section>
 
@@ -961,7 +969,7 @@ export function SettingsPage() {
       </aside>
     </div>
 
-    <div className="settings-save-bar"><p>Изменения параметров вступят в силу после сохранения.</p><Button loading={saving} onClick={() => void save()}><Save size={16} /> Сохранить настройки</Button></div>
+    <div className="settings-save-bar"><p>Изменения параметров вступят в силу после сохранения.</p><Button loading={saving} disabled={Boolean(storageLimitError)} onClick={() => void save()}><Save size={16} /> Сохранить настройки</Button></div>
     <LmsSyncErrorDialog
       open={Boolean(syncErrorCourse)}
       courseTitle={syncErrorCourse?.title ?? ''}

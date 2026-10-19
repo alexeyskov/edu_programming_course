@@ -36,6 +36,7 @@ from app.services.build_profile import effective_attempt_build_profile
 from app.services.common import DomainError
 from app.services.policy import require_submission_review_access
 from app.services.review import require_teacher_experiment_access
+from app.services.storage_state import lock_submission_payload, require_submission_payload
 from app.services.workspace import ensure_attempt_not_finalized_in_moodle
 
 router = APIRouter(tags=["code-intelligence"])
@@ -139,6 +140,8 @@ async def _authorized_sources(
             allow_system_settings_read=auth.has_capability("SYSTEM_SETTINGS"),
         )
         attempt = access.attempt
+        submission = await lock_submission_payload(db, access.submission)
+        require_submission_payload(submission)
         if attempt.submission_source == "MOODLE_DELETED":
             raise DomainError(404, "SUBMISSION_NOT_FOUND", "Submission was not found")
         if experiment is not None:
@@ -154,7 +157,7 @@ async def _authorized_sources(
             )
             files = [{"path": row.path, "content": row.content} for row in rows]
         else:
-            snapshot = await db.get(Snapshot, access.submission.snapshot_id)
+            snapshot = await db.get(Snapshot, submission.snapshot_id, populate_existing=True)
             if snapshot is None:
                 raise DomainError(404, "SNAPSHOT_MISSING", "Submission snapshot is missing")
             files = [{"path": row["path"], "content": row["content"]} for row in snapshot.files]

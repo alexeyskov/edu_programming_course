@@ -171,6 +171,22 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); window.sessionStorage.clear(); });
 
 describe('reviewed submission', () => {
+  it('explains locally archived answers and blocks code-dependent actions until a Moodle reimport', async () => {
+    mocks.getSubmission.mockResolvedValue({ ...submission, files: [], courseId: 'course-1', payloadEvictedAt: '2026-10-19T09:00:00Z' });
+    renderPage();
+    expect(await screen.findByText('Локальная копия ответа очищена', { selector: 'strong' })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Открыть курс для синхронизации' })).toHaveAttribute('href', '/courses/course-1');
+    expect(screen.queryByTestId('code-workspace')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Открыть преподавательскую песочницу' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Компилировать и запустить код' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Проверить работу через ИИ' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Перепроверить' })).toBeDisabled();
+    expect(screen.getByLabelText('Итоговый балл')).toHaveValue(9);
+    expect(mocks.createExperiment).not.toHaveBeenCalled();
+    expect(mocks.startAiCodeReview).not.toHaveBeenCalled();
+    expect(mocks.claimSubmission).not.toHaveBeenCalled();
+  });
+
   it('shows a single grading heading only on the task tab and preserves unsaved fields across tabs', async () => {
     mockUngradedQuestionGroup();
     renderPage('/review/question-1');
@@ -236,6 +252,150 @@ describe('reviewed submission', () => {
     expect(mocks.saveReview).not.toHaveBeenCalled(); expect(mocks.finalizeReview).not.toHaveBeenCalled();
   });
 
+  it('lets a teacher claim, grade, comment and save a mobile review without running or changing code', async () => {
+    vi.stubGlobal('matchMedia', () => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    mockUngradedQuestionGroup();
+    renderPage('/review/question-1');
+    await screen.findByText('Код работы');
+    expect(mocks.claimSubmission).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Задание' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Начать проверку' }));
+    await waitFor(() => expect(screen.getByLabelText('Итоговый балл')).toBeEnabled());
+    fireEvent.change(screen.getByLabelText('Итоговый балл'), { target: { value: '4' } });
+    fireEvent.change(screen.getByLabelText('Комментарий студенту'), { target: { value: 'Комментарий с телефона' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Сохранить черновик' }));
+    await waitFor(() => expect(mocks.saveReview).toHaveBeenCalledWith('question-1', 4, 'Комментарий с телефона'));
+    expect(document.querySelector('.toast')).toBeNull();
+    expect(mocks.claimSubmission).toHaveBeenCalledExactlyOnceWith('question-1');
+    expect(mocks.createExperiment).not.toHaveBeenCalled();
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Вернуться к работам' }));
+    await screen.findByText('Список работ');
+    expect(mocks.releaseClaim).toHaveBeenCalledExactlyOnceWith('claim-question-1');
+  });
+
+  it('starts one AI check from mobile code, prevents repeat clicks and tracks explicit checks on exit', async () => {
+    vi.stubGlobal('matchMedia', () => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    mocks.startAiCodeReview.mockResolvedValue({ id: 'phone-check', enabled: true, state: 'QUEUED', recommendationStatus: 'PENDING', summary: '', findings: [] });
+    renderPage();
+    const start = await screen.findByRole('button', { name: 'Проверить работу через ИИ' });
+    await waitFor(() => expect(start).toBeEnabled());
+    fireEvent.click(start); fireEvent.click(start);
+    await screen.findByRole('button', { name: 'ИИ-проверка выполняется' });
+    expect(mocks.startAiCodeReview).toHaveBeenCalledExactlyOnceWith('graded', false);
+    expect(screen.getByRole('button', { name: 'ИИ-проверка выполняется' })).toBeDisabled();
+    expect(mocks.claimSubmission).not.toHaveBeenCalled();
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Вернуться к работам' }));
+    await screen.findByText('Список работ');
+    expect(mocks.discardAiCodeReview).toHaveBeenCalledExactlyOnceWith('graded', 'phone-check');
+    expect(mocks.releaseClaim).not.toHaveBeenCalled();
+  });
+
+  it('saves a mobile comment before a grade is entered', async () => {
+    vi.stubGlobal('matchMedia', () => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    mockUngradedQuestionGroup();
+    renderPage('/review/question-1');
+    await screen.findByText('Код работы');
+    fireEvent.click(screen.getByRole('button', { name: 'Задание' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Начать проверку' }));
+    const comment = screen.getByLabelText('Комментарий студенту');
+    await waitFor(() => expect(comment).toBeEnabled());
+    fireEvent.change(comment, { target: { value: 'Предварительный комментарий' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Сохранить черновик' }));
+    await waitFor(() => expect(mocks.saveReview).toHaveBeenCalledWith('question-1', null, 'Предварительный комментарий'));
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+  });
+
+  it('lets the same mobile teacher renew an expired reservation before editing again', async () => {
+    vi.stubGlobal('matchMedia', () => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    mocks.getSubmission.mockResolvedValue({ ...submission, status: 'CLAIMED', claim: { id: 'old-claim', mine: true, ownerName: 'Teacher' } });
+    mocks.heartbeatClaim.mockRejectedValueOnce(new Error('Закрепление истекло'));
+    renderPage();
+    await screen.findByText('Право на изменение проверки потеряно');
+    fireEvent.click(screen.getByRole('button', { name: 'Задание' }));
+    expect(screen.getByLabelText('Итоговый балл')).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Начать проверку' }));
+    await waitFor(() => expect(screen.getByLabelText('Итоговый балл')).toBeEnabled());
+    expect(mocks.claimSubmission).toHaveBeenCalledExactlyOnceWith('graded');
+    expect(mocks.saveReview).not.toHaveBeenCalled();
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+  });
+
+  it('copies an AI response into mobile fields and exports only after explicit confirmation', async () => {
+    vi.stubGlobal('matchMedia', () => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    mocks.getAiCodeReview.mockResolvedValue({ id: 'phone-ai', enabled: true, state: 'COMPLETED', recommendationStatus: 'PENDING', summary: '', findings: [], recommendedGrade: 4, recommendedComment: 'Оценка ИИ' });
+    mocks.finalizeReview.mockResolvedValue({ id: 'new-decision', lmsExportState: 'PENDING' });
+    renderPage();
+    await screen.findByText('Код работы');
+    fireEvent.click(screen.getByRole('button', { name: 'Задание' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Поставить оценку и комментарий от ИИ' }));
+    await waitFor(() => expect(screen.getByLabelText('Итоговый балл')).toHaveValue(4));
+    expect(screen.getByLabelText('Комментарий студенту')).toHaveValue('Оценка ИИ');
+    expect(screen.getByLabelText('Комментарий студенту')).toBeEnabled();
+    expect(mocks.claimSubmission).toHaveBeenCalledExactlyOnceWith('graded');
+    expect(mocks.saveReview).not.toHaveBeenCalled();
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+    expect(document.querySelector('.toast')).toBeNull();
+    fireEvent.change(screen.getByLabelText('Комментарий студенту'), { target: { value: 'Уточнение преподавателя' } });
+    fireEvent.click(within(document.querySelector('.grading-panel')!).getByRole('button', { name: 'Утвердить' }));
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Утвердить и отправить' }));
+    await screen.findByText('Список работ');
+    expect(mocks.finalizeReview).toHaveBeenCalledExactlyOnceWith('graded', 4, 'Уточнение преподавателя', 'phone-ai');
+    expect(mocks.startAiCodeReview).not.toHaveBeenCalled();
+    expect(mocks.createExperiment).not.toHaveBeenCalled();
+  });
+
+  it('saves a mobile draft before switching questions and releases its reservation', async () => {
+    vi.stubGlobal('matchMedia', () => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    mockUngradedQuestionGroup();
+    renderPage('/review/question-1');
+    await screen.findByText('Код работы');
+    fireEvent.click(screen.getByRole('button', { name: 'Задание' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Начать проверку' }));
+    await waitFor(() => expect(screen.getByLabelText('Итоговый балл')).toBeEnabled());
+    fireEvent.change(screen.getByLabelText('Итоговый балл'), { target: { value: '3' } });
+    fireEvent.change(screen.getByLabelText('Комментарий студенту'), { target: { value: 'Сохранить при переходе' } });
+    fireEvent.click(screen.getByRole('tab', { name: /№2 Задача 2/ }));
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/review/question-2'));
+    expect(mocks.saveReview).toHaveBeenCalledWith('question-1', 3, 'Сохранить при переходе');
+    expect(mocks.releaseClaim).toHaveBeenCalledWith('claim-question-1');
+    expect(mocks.claimSubmission).toHaveBeenCalledExactlyOnceWith('question-1');
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+  });
+
+  it('respects another teacher reservation on mobile and does not replace grade fields', async () => {
+    vi.stubGlobal('matchMedia', () => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    mocks.getSubmission.mockResolvedValue({ ...submission, claim: { id: 'foreign-claim', mine: false, ownerName: 'Другой преподаватель' } });
+    mocks.getAiCodeReview.mockResolvedValue({ id: 'phone-ai', enabled: true, state: 'COMPLETED', recommendationStatus: 'PENDING', summary: '', findings: [], recommendedGrade: 4, recommendedComment: 'Оценка ИИ' });
+    renderPage();
+    await screen.findByText('Код работы');
+    fireEvent.click(screen.getByRole('button', { name: 'Задание' }));
+    expect(await screen.findByRole('button', { name: 'Поставить оценку и комментарий от ИИ' })).toBeDisabled();
+    expect(screen.getByLabelText('Итоговый балл')).toBeDisabled();
+    expect(screen.getByLabelText('Итоговый балл')).toHaveValue(9);
+    expect(mocks.claimSubmission).not.toHaveBeenCalled();
+    expect(mocks.saveReview).not.toHaveBeenCalled();
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+  });
+
+  it('clears an applied automatic mobile AI draft on exit without starting another paid check', async () => {
+    vi.stubGlobal('matchMedia', () => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    mocks.getAiCodeReview.mockResolvedValue({ id: 'automatic-phone-ai', automatic: true, enabled: true, state: 'COMPLETED', recommendationStatus: 'PENDING', summary: '', findings: [], recommendedGrade: 4, recommendedComment: 'Сохранённый ответ' });
+    renderPage();
+    await screen.findByText('Код работы');
+    fireEvent.click(screen.getByRole('button', { name: 'Задание' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Поставить оценку и комментарий от ИИ' }));
+    await waitFor(() => expect(screen.getByLabelText('Итоговый балл')).toHaveValue(4));
+    fireEvent.click(screen.getByRole('button', { name: 'Вернуться к работам' }));
+    await screen.findByText('Список работ');
+    expect(mocks.discardAiCodeReview).toHaveBeenCalledExactlyOnceWith('graded', 'automatic-phone-ai');
+    expect(mocks.releaseClaim).toHaveBeenCalledOnce();
+    expect(mocks.startAiCodeReview).not.toHaveBeenCalled();
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+  });
+
   it('shows the exhausted AI error on the task tab without changing Moodle fields', async () => {
     mocks.getAiCodeReview.mockResolvedValue({ id: 'ai-failed', enabled: true, state: 'FAILED', attemptCount: 3, maxAttempts: 3, error: 'ИИ вернул некорректный формат отчёта.', summary: '', findings: [] });
     renderPage();
@@ -289,7 +449,7 @@ describe('reviewed submission', () => {
     await screen.findByRole('region', { name: 'Ответ ИИ' });
     expect(screen.getByText(/Ответ автоматической проверки и подсветка замечаний сохраняются/)).toBeVisible();
     if (action !== 'viewed') {
-      fireEvent.click(screen.getByRole('button', { name: 'Подставить оценку и комментарий' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Поставить оценку и комментарий от ИИ' }));
       await waitFor(() => expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(4));
       expect(screen.getByLabelText('Комментарий студенту')).toHaveValue('Совет ИИ');
       if (action === 'saved') {
@@ -392,7 +552,7 @@ describe('reviewed submission', () => {
     expect(screen.getByLabelText('Финальный комментарий студенту')).toHaveValue('Хорошая работа');
     expect(mocks.finalizeReview).not.toHaveBeenCalled();
     expect(mocks.claimSubmission).not.toHaveBeenCalled();
-    fireEvent.click(within(recommendation).getByRole('button', { name: 'Подставить оценку и комментарий' }));
+    fireEvent.click(within(recommendation).getByRole('button', { name: 'Поставить оценку и комментарий от ИИ' }));
     await waitFor(() => expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(7.5));
     expect(screen.getByLabelText('Комментарий студенту')).toHaveValue('Исправьте граничный случай.');
     expect(screen.getByLabelText('Комментарий студенту')).toBeEnabled();
@@ -414,7 +574,7 @@ describe('reviewed submission', () => {
     await screen.findByRole('region', { name: 'Ответ ИИ' });
     fireEvent.change(screen.getByLabelText(/Итоговый балл/), { target: { value: '6' } });
     fireEvent.change(screen.getByLabelText('Комментарий студенту'), { target: { value: 'Мой черновик' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Подставить оценку и комментарий' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Поставить оценку и комментарий от ИИ' }));
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(0);
     expect(screen.getByLabelText('Комментарий студенту')).toHaveValue('Не соответствует условию.');
@@ -438,7 +598,7 @@ describe('reviewed submission', () => {
     mocks.getAiCodeReview.mockResolvedValue({ id: 'ai-report', recommendationStatus: 'PENDING', enabled: true, state: 'COMPLETED', summary: '', findings: [], recommendedGrade: 4, recommendedComment: 'Совет' });
     mocks.claimSubmission.mockRejectedValue(new Error('Работа закреплена за другим преподавателем'));
     renderPage();
-    fireEvent.click(await screen.findByRole('button', { name: 'Подставить оценку и комментарий' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Поставить оценку и комментарий от ИИ' }));
     await screen.findByText('Не удалось подставить рекомендацию');
     expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(9);
     expect(screen.getByLabelText('Финальный комментарий студенту')).toHaveValue('Хорошая работа');
@@ -449,7 +609,7 @@ describe('reviewed submission', () => {
   it('tags a saved AI draft for discard on exit without approving or exporting it', async () => {
     mocks.getAiCodeReview.mockResolvedValue({ id: 'ai-report', recommendationStatus: 'PENDING', enabled: true, state: 'COMPLETED', summary: '', findings: [], recommendedGrade: 4, recommendedComment: 'Совет' });
     renderPage();
-    fireEvent.click(await screen.findByRole('button', { name: 'Подставить оценку и комментарий' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Поставить оценку и комментарий от ИИ' }));
     await waitFor(() => expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(4));
     fireEvent.click(screen.getByRole('button', { name: 'Сохранить черновик' }));
     await waitFor(() => expect(mocks.saveReview).toHaveBeenCalledWith('graded', 4, 'Совет', 'ai-report'));
@@ -652,7 +812,8 @@ describe('reviewed submission', () => {
     await screen.findByText('Вы проверяете работу');
     fireEvent.click(screen.getAllByRole('button', { name: 'Утвердить' })[0]);
     fireEvent.click(screen.getByRole('button', { name: 'Утвердить и отправить' }));
-    await screen.findByText('Оценка утверждена');
+    await screen.findByText('Список работ');
+    expect(document.querySelector('.toast')).toBeNull();
     await act(async () => { rejectHeartbeat(new Error('Резервирование работы больше не действует.')); });
     expect(screen.queryByText('Право на изменение проверки потеряно')).not.toBeInTheDocument();
     expect(mocks.releaseClaim).not.toHaveBeenCalled();
@@ -666,6 +827,18 @@ describe('reviewed submission', () => {
     renderPage();
     expect(await screen.findByText('Право на изменение проверки потеряно')).toBeVisible();
     expect(screen.getByLabelText(/Итоговый балл/)).toBeDisabled();
+  });
+
+  it.each(['BLOCKED', 'FAILED'])('keeps the important %s Moodle delivery error visible', async (state) => {
+    mocks.getSubmission.mockResolvedValue({ ...submission, status: 'CLAIMED', claim: { id: 'claim-1', mine: true, ownerName: 'Teacher' } });
+    mocks.finalizeReview.mockResolvedValue({ id: 'new-decision', lmsExportState: state });
+    renderPage();
+    await screen.findByText('Вы проверяете работу');
+    fireEvent.click(screen.getAllByRole('button', { name: 'Утвердить' })[0]);
+    fireEvent.click(screen.getByRole('button', { name: 'Утвердить и отправить' }));
+    await screen.findByText('Список работ');
+    expect(screen.getByText('Не удалось отправить оценку в Moodle')).toBeVisible();
+    expect(document.querySelector('.toast')).toHaveClass('toast--error');
   });
 
   it('shows the network and browser audit context in writing history', async () => {
@@ -964,7 +1137,7 @@ describe('reviewed submission', () => {
     expect(screen.getByTestId('location')).toHaveTextContent('/review/question-1?view=all');
   });
 
-  it('explains the limits of a historical Moodle submission and localizes its decision status', async () => {
+  it('keeps a historical Moodle decision status inline without an import notification', async () => {
     mocks.getSubmission.mockResolvedValue({
       ...submission,
       source: 'MOODLE_IMPORT',
@@ -975,9 +1148,8 @@ describe('reviewed submission', () => {
     const view = renderPage();
 
     expect(await screen.findByText('Работа проверена')).toBeInTheDocument();
-    const notice = document.querySelector('.toast');
-    expect(notice).toHaveTextContent('Импортировано из Moodle');
-    expect(notice).toHaveTextContent('Доступен итоговый код и решение; истории набора в Moodle нет.');
+    expect(screen.getByText('Импортировано из Moodle')).toBeVisible();
+    expect(document.querySelector('.toast')).toBeNull();
     expect(document.querySelector('.moodle-import-banner')).toBeNull();
     expect(screen.queryByText('LMS: IMPORTED')).not.toBeInTheDocument();
 
@@ -985,7 +1157,7 @@ describe('reviewed submission', () => {
     renderPage();
     await screen.findByText('Работа проверена');
     expect(document.querySelector('.toast')).toBeNull();
-    expect(window.sessionStorage.getItem('eduprog:moodle-import-notice:graded')).toBe('1');
+    expect(window.sessionStorage.getItem('eduprog:moodle-import-notice:graded')).toBeNull();
   });
 
   it('renders the final decision read-only and obtains a claim only after explicit recheck', async () => {

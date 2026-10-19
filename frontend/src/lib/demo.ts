@@ -146,6 +146,7 @@ export const demoExperiment: TeacherExperiment = {
 };
 
 export const demoSettings: SystemSettings = {
+  storageLimitGb: 128,
   aiEnabled: true, studentAiEnabled: true, runnerEnabled: true, runnerCpuSeconds: 4,
   runnerMemoryMb: 256, retentionDays: 365, allowedLmsOrigins: ['https://edu.mmcs.sfedu.ru'],
   incidentBanner: '', services: [

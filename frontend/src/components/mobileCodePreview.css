@@ -1,0 +1,64 @@
+.mobile-code-preview {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: var(--surface);
+  color: var(--ink);
+  font: 13px/26px 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  tab-size: 4;
+}
+.mobile-code-preview__lines { position: relative; width: 100%; }
+.mobile-code-preview__line {
+  position: absolute;
+  inset-inline: 0;
+  display: flex;
+  align-items: center;
+  padding: 0 12px 0 0;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  white-space: pre;
+}
+.mobile-code-preview__line code { font: inherit; background: transparent; color: inherit; padding: 0; }
+.mobile-code-token--comment { color: #008000; }
+.mobile-code-token--keyword { color: #0000ff; }
+.mobile-code-token--string { color: #a31515; }
+.mobile-code-token--number { color: #098658; }
+.mobile-code-token--type { color: #267f99; }
+:root[data-theme='dark'] .mobile-code-token--comment { color: #6a9955; }
+:root[data-theme='dark'] .mobile-code-token--keyword { color: #c586c0; }
+:root[data-theme='dark'] .mobile-code-token--string { color: #ce9178; }
+:root[data-theme='dark'] .mobile-code-token--number { color: #b5cea8; }
+:root[data-theme='dark'] .mobile-code-token--type { color: #4ec9b0; }
+.mobile-code-preview__number {
+  position: sticky;
+  left: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  width: 64px;
+  flex: 0 0 64px;
+  padding-right: 10px;
+  margin-right: 10px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 11px;
+}
+.mobile-code-preview__line--ai { background: var(--purple-soft); cursor: pointer; }
+.mobile-code-preview__line--ai .mobile-code-preview__number { color: var(--purple); box-shadow: inset 3px 0 var(--purple); }
+.mobile-code-preview__line--ai:active { background: color-mix(in srgb, var(--purple) 18%, var(--surface)); }
+.mobile-code-preview__line--ai:focus-visible { outline: 2px solid var(--purple); outline-offset: -2px; }
+.mobile-code-findings article + article { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--line); }
+.mobile-code-findings header { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.mobile-code-findings header > span:last-child { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.mobile-code-findings p { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; line-height: 1.65; margin-bottom: 0; }

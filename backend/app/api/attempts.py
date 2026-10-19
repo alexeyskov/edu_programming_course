@@ -93,6 +93,7 @@ from app.services.policy import (
     require_submission_review_access,
     resolve_assigned_task_version,
 )
+from app.services.storage_state import pruned_history_notice
 from app.services.workspace import (
     create_clipboard_receipt,
     create_workspace_file,
@@ -1165,6 +1166,9 @@ async def get_attempt_history(
                 client=normalize_client_context(run.client_context) or None,
             )
         )
+    notice = pruned_history_notice(attempt, workspace.current_revision)
+    if notice is not None and (before is None or notice.at < before):
+        rows.append(notice)
     rows.sort(key=lambda row: (_aware(row.at) or datetime.min.replace(tzinfo=UTC), row.revision))
     return rows[-limit:]
 

@@ -38,6 +38,9 @@ from app.schemas.system import (
     AIChatCleanupPreviewRead,
     AIChatCleanupRequest,
     ServiceHealthRead,
+    StorageCleanupRead,
+    StorageCleanupRequest,
+    StorageStatusRead,
     SyncOutboxRead,
     SyncOutboxRetryRequest,
     SystemSettingsRead,
@@ -55,6 +58,7 @@ from app.services.policy import (
     require_submission_review_access,
     visible_submission_ids_for_review,
 )
+from app.services.storage_cleanup import cleanup_storage, get_storage_status
 from app.services.teacher_tokens import (
     generate_teacher_token,
     teacher_membership_is_authorized,
@@ -86,6 +90,7 @@ def _default_values(settings: Settings) -> dict[str, Any]:
         "runner_cpu_seconds": 4,
         "runner_memory_mb": 256,
         "retention_days": 365,
+        "storage_limit_gb": 128,
         "allowed_lms_origins": origins,
         "incident_banner": "",
     }
@@ -121,6 +126,7 @@ async def _settings_read(db: AsyncSession, settings: Settings) -> SystemSettings
         runner_cpu_seconds=int(values["runner_cpu_seconds"]),
         runner_memory_mb=int(values["runner_memory_mb"]),
         retention_days=int(values["retention_days"]),
+        storage_limit_gb=int(values["storage_limit_gb"]),
         allowed_lms_origins=values["allowed_lms_origins"],
         incident_banner=str(values["incident_banner"]),
         services=services,
@@ -161,6 +167,40 @@ async def clean_up_ai_chats(
                 metadata_json={
                     **result.model_dump(),
                     "closed_before": body.closed_before.isoformat(),
+                },
+            ))
+        return result
+    except DomainError as exc:
+        _domain_error(exc)
+
+
+@router.get("/system/storage", response_model=StorageStatusRead)
+async def get_system_storage(
+    _admin: SystemAdmin, request: Request, db: Database,
+) -> StorageStatusRead:
+    return await get_storage_status(db, request.app.state.settings)
+
+
+@router.post("/system/storage/cleanup", response_model=StorageCleanupRead)
+async def clean_up_system_storage(
+    body: StorageCleanupRequest, admin: SystemAdmin, request: Request, db: Database,
+) -> StorageCleanupRead:
+    try:
+        async with db.begin():
+            result = await cleanup_storage(
+                db, request.app.state.settings,
+                category=body.category, eligible_before=body.eligible_before,
+            )
+            db.add(AuditEntry(
+                actor_id=admin.principal_id,
+                action="storage.cleaned_up",
+                object_type="Storage",
+                request_id=str(getattr(request.state, "request_id", ""))[:100],
+                metadata_json={
+                    **result.model_dump(mode="json"),
+                    "category": body.category,
+                    "eligible_before": body.eligible_before.isoformat(),
+                    "automatic": False,
                 },
             ))
         return result

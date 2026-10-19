@@ -110,6 +110,7 @@ from app.services.review import (
     save_review_draft,
     update_experiment_file,
 )
+from app.services.storage_state import pruned_history_notice
 from app.services.submission_origin import resolve_submission_origin
 
 router = APIRouter()
@@ -943,7 +944,11 @@ async def _submission_history(
                 id=snapshot.id,
                 type="snapshot",
                 label="Синхронизировано с Moodle",
-                detail="Ответ совпадает с отправленным из Практикума; история написания сохранена",
+                detail=(
+                    "Ответ совпадает с отправленным из Практикума; история написания очищена"
+                    if (source_attempt.integrity_policy or {}).get("history_available") is False
+                    else "Ответ совпадает с отправленным из Практикума; история написания сохранена"
+                ),
                 at=snapshot.created_at,
                 revision=source_snapshot.revision,
             ))
@@ -1012,6 +1017,9 @@ async def _snapshot_history(
         for item in snapshot.files if item.get("id") and item.get("path")
     })
     history: list[AttemptHistoryEventRead] = []
+    notice = pruned_history_notice(attempt, snapshot.revision)
+    if notice is not None:
+        history.append(notice)
     details = edit_details(edit_events, snapshots)
     for event in edit_events:
         is_paste = event.source == "INTERNAL_PASTE"
@@ -1295,6 +1303,7 @@ async def get_submission(
     return SubmissionTeacherRead(
         **base.model_dump(exclude={"review_group"}),
         attempt_id=attempt.id,
+        payload_evicted_at=submission.payload_evicted_at,
         assigned_task_version_id=attempt.assigned_task_version_id,
         task_statement=version.statement if version else assessment.instructions,
         moodle_feedback_comment=str(
@@ -1308,7 +1317,9 @@ async def get_submission(
         source=submission.source,
         late=submission.late,
         lms_export_state=submission.lms_export_state,
-        files=[_snapshot_file(snapshot, item) for item in snapshot.files],
+        files=[] if submission.payload_evicted_at is not None else [
+            _snapshot_file(snapshot, item) for item in snapshot.files
+        ],
         history=await _submission_history(
             db,
             submission=submission,

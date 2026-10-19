@@ -3026,6 +3026,7 @@ async def _finish_delivered(
                 assessment=assessment,
                 actor_external_subject=context.actor_external_subject,
                 items=items,
+                restore_evicted=bool(context.payload.get("manual_run_id")),
             )
             scan_only = result.get("scan_only") is True
             answers_queued = 0
