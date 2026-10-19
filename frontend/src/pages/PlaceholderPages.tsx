@@ -5,6 +5,7 @@ import { Badge, Button, Card, EmptyState, Field, InlineError, Modal, PageLoader,
 import { useAuth } from '../context/AuthContext';
 import { api, ApiError } from '../lib/api';
 import { formatDate, kindLabel } from '../lib/utils';
+import { useMediaQuery } from '../lib/workspaceLayout';
 import type { Assessment, AssessmentPublicationTargets, Course, CourseGroup, HiddenTestCase, HiddenTestManifestV1, TaskBankItem } from '../types';
 
 type TaskBankForm = {
@@ -49,6 +50,7 @@ export function formatPublicationIssues(issues: PublicationIssue[]): string {
 }
 
 export function AssessmentIntroPage() {
+  const mobile = useMediaQuery('(max-width: 767px)');
   const { primaryRole, session } = useAuth();
   const canManageAiReview = session?.capabilities.includes('SYSTEM_SETTINGS') ?? false;
   const { assessmentId = '' } = useParams();
@@ -78,6 +80,7 @@ export function AssessmentIntroPage() {
   const notOpened = Boolean(item.startsAt && new Date(item.startsAt).getTime() > Date.now());
   const closed = item.status === 'CLOSED' || Boolean(item.deadlineAt && new Date(item.deadlineAt).getTime() <= Date.now());
   async function start() {
+    if (mobile) return;
     if (startController.current) return;
     const controller = new AbortController();
     startController.current = controller;
@@ -104,7 +107,7 @@ export function AssessmentIntroPage() {
         <p>Название, условие, сроки, максимальный балл и число попыток загружаются из Moodle. В Мехмат.Практикуме вы выбираете группы преподавателя и разрешаете или запрещаете ИИ-помощь. Возможность сдачи для конкретного студента и способ отправки проверяются непосредственно в Moodle при запуске.</p>
         {canManageAiReview && <AssessmentAiReviewPolicy key={item.id} assessment={item} onUpdated={(updated) => setAssessment((current) => current?.id === updated.id ? updated : current)} />}
         {item.publicationStatus !== 'CLOSED' && <div><Button size="lg" onClick={() => setEditing(true)}><ShieldCheck size={16} /> {item.publicationStatus === 'DRAFT' ? 'Настроить доступ' : 'Изменить доступ'}</Button></div>}
-      </div> : <><div className="self-check"><CheckCircle2 /><span><strong>Интерфейс готов к началу</strong><small>{lmsManaged ? 'При запуске Moodle проверит доступность работы именно для вашей учётной записи.' : 'Окончательную доступность, срок и число попыток проверит сервер.'}</small></span></div>{item.attemptId ? <Button size="lg" loading={starting} onClick={() => lmsManaged ? void start() : navigate(`/ide/${item.attemptId}`)}>Продолжить попытку</Button> : <Button size="lg" loading={starting} disabled={!lmsManaged && (notOpened || closed)} onClick={() => void start()}>{!lmsManaged && closed ? 'Работа закрыта' : !lmsManaged && notOpened ? `Откроется ${formatDate(item.startsAt)}` : 'Начать попытку'}</Button>}</>}
+      </div> : <><div className="self-check"><CheckCircle2 /><span><strong>Интерфейс готов к началу</strong><small>{lmsManaged ? 'При запуске Moodle проверит доступность работы именно для вашей учётной записи.' : 'Окончательную доступность, срок и число попыток проверит сервер.'}</small></span></div>{item.attemptId ? <Button size="lg" loading={starting} onClick={() => mobile || !lmsManaged ? navigate(`/ide/${item.attemptId}`) : void start()}>{mobile ? 'Посмотреть код' : 'Продолжить попытку'}</Button> : <Button size="lg" loading={starting} disabled={mobile || (!lmsManaged && (notOpened || closed))} onClick={() => void start()}>{!lmsManaged && closed ? 'Работа закрыта' : !lmsManaged && notOpened ? `Откроется ${formatDate(item.startsAt)}` : 'Начать попытку'}</Button>}{mobile && <p className="mobile-availability-note">На телефоне доступны условия, результаты и просмотр начатой работы. Новую попытку начните на компьютере.</p>}{item.status === 'GRADED' && item.score != null && <p className="intro-result"><CheckCircle2 size={18} /> Результат: <strong>{item.score} / {item.maxScore}</strong></p>}</>}
     </Card>
     {editing && <MoodlePublicationEditor assessment={item} onUpdated={setAssessment} onClose={() => setEditing(false)} />}
   </div>;

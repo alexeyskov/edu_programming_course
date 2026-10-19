@@ -168,9 +168,74 @@ beforeEach(() => {
   mocks.claimSubmission.mockResolvedValue(claim);
   mocks.heartbeatClaim.mockResolvedValue(claim);
 });
-afterEach(() => { cleanup(); vi.useRealTimers(); window.sessionStorage.clear(); });
+afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); window.sessionStorage.clear(); });
 
 describe('reviewed submission', () => {
+  it('shows a single grading heading only on the task tab and preserves unsaved fields across tabs', async () => {
+    mockUngradedQuestionGroup();
+    renderPage('/review/question-1');
+    const grade = await screen.findByLabelText('Итоговый балл');
+    await waitFor(() => expect(grade).toBeEnabled());
+    const comment = screen.getByLabelText('Комментарий студенту');
+    fireEvent.change(grade, { target: { value: '4' } });
+    fireEvent.change(comment, { target: { value: 'Проверьте граничные значения.' } });
+    expect(screen.getAllByRole('heading', { name: 'Оценка и комментарий' })).toHaveLength(1);
+    expect(screen.queryByText('Решение преподавателя')).not.toBeInTheDocument();
+
+    for (const name of ['ИИ', 'История', 'Плагиат']) {
+      fireEvent.click(screen.getByRole('tab', { name }));
+      expect(grade).not.toBeVisible();
+      expect(comment).not.toBeVisible();
+      expect(screen.queryByRole('button', { name: 'Оценка и комментарий' })).not.toBeInTheDocument();
+      expect(grade.closest('.grading-panel')).toHaveAttribute('hidden');
+      expect(document.querySelector('.review-side')).toHaveClass('review-side--no-grading');
+    }
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Задание' }));
+    expect(grade).toBeVisible();
+    expect(grade).toHaveValue(4);
+    expect(comment).toHaveValue('Проверьте граничные значения.');
+    expect(document.querySelector('.review-side')).not.toHaveClass('review-side--no-grading');
+    expect(mocks.saveReview).not.toHaveBeenCalled();
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+  });
+
+  it('allows an explicit review claim after enlarging a mobile preview without reloading source', async () => {
+    const listeners = new Set<() => void>();
+    const media = { matches: true, addEventListener: (_type: string, fn: () => void) => listeners.add(fn), removeEventListener: (_type: string, fn: () => void) => listeners.delete(fn) };
+    vi.stubGlobal('matchMedia', () => media);
+    mockUngradedQuestionGroup(); renderPage('/review/question-1');
+    await screen.findByText('Код работы'); expect(mocks.claimSubmission).not.toHaveBeenCalled();
+    act(() => { media.matches = false; listeners.forEach((fn) => fn()); });
+    fireEvent.click(await screen.findByRole('button', { name: 'Начать проверку' }));
+    await screen.findByText('Вы проверяете работу');
+    expect(mocks.claimSubmission).toHaveBeenCalledWith('question-1');
+    expect(screen.getByLabelText('Итоговый балл')).toBeEnabled();
+    expect(mocks.getSubmission).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens and switches mobile views without taking claims, creating a sandbox or discarding AI results', async () => {
+    vi.stubGlobal('matchMedia', () => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    mockUngradedQuestionGroup();
+    mocks.getAiCodeReview.mockResolvedValue({ id: 'mobile-report', enabled: true, state: 'COMPLETED', automatic: false,
+      recommendationStatus: 'PENDING', recommendedGrade: 3, recommendedComment: 'Ответ модели', summary: '', findings: [] });
+    renderPage('/review/question-1');
+    await screen.findByText('Код работы');
+    expect(screen.getByLabelText('Итоговый балл')).toBeDisabled();
+    expect(screen.getByLabelText('Итоговый балл')).not.toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Оценка' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Задание' }));
+    expect(screen.getByLabelText('Итоговый балл')).toBeVisible();
+    expect(mocks.claimSubmission).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('tab', { name: /№2 Задача 2/ }));
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/review/question-2'));
+    fireEvent.click(screen.getByRole('button', { name: 'Вернуться к работам' }));
+    await screen.findByText('Список работ');
+    expect(mocks.claimSubmission).not.toHaveBeenCalled(); expect(mocks.releaseClaim).not.toHaveBeenCalled();
+    expect(mocks.createExperiment).not.toHaveBeenCalled(); expect(mocks.discardAiCodeReview).not.toHaveBeenCalled();
+    expect(mocks.saveReview).not.toHaveBeenCalled(); expect(mocks.finalizeReview).not.toHaveBeenCalled();
+  });
+
   it('shows the exhausted AI error on the task tab without changing Moodle fields', async () => {
     mocks.getAiCodeReview.mockResolvedValue({ id: 'ai-failed', enabled: true, state: 'FAILED', attemptCount: 3, maxAttempts: 3, error: 'ИИ вернул некорректный формат отчёта.', summary: '', findings: [] });
     renderPage();
@@ -224,11 +289,11 @@ describe('reviewed submission', () => {
     await screen.findByRole('region', { name: 'Ответ ИИ' });
     expect(screen.getByText(/Ответ автоматической проверки и подсветка замечаний сохраняются/)).toBeVisible();
     if (action !== 'viewed') {
-      fireEvent.click(screen.getByRole('button', { name: 'Утвердить рекомендацию ИИ' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Подставить оценку и комментарий' }));
       await waitFor(() => expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(4));
       expect(screen.getByLabelText('Комментарий студенту')).toHaveValue('Совет ИИ');
       if (action === 'saved') {
-        fireEvent.click(screen.getByRole('button', { name: 'Сохранить' }));
+        fireEvent.click(screen.getByRole('button', { name: 'Сохранить черновик' }));
         await waitFor(() => expect(mocks.saveReview).toHaveBeenCalledWith('graded', 4, 'Совет ИИ', 'automatic-report'));
       }
     }
@@ -327,7 +392,7 @@ describe('reviewed submission', () => {
     expect(screen.getByLabelText('Финальный комментарий студенту')).toHaveValue('Хорошая работа');
     expect(mocks.finalizeReview).not.toHaveBeenCalled();
     expect(mocks.claimSubmission).not.toHaveBeenCalled();
-    fireEvent.click(within(recommendation).getByRole('button', { name: 'Утвердить рекомендацию ИИ' }));
+    fireEvent.click(within(recommendation).getByRole('button', { name: 'Подставить оценку и комментарий' }));
     await waitFor(() => expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(7.5));
     expect(screen.getByLabelText('Комментарий студенту')).toHaveValue('Исправьте граничный случай.');
     expect(screen.getByLabelText('Комментарий студенту')).toBeEnabled();
@@ -349,7 +414,7 @@ describe('reviewed submission', () => {
     await screen.findByRole('region', { name: 'Ответ ИИ' });
     fireEvent.change(screen.getByLabelText(/Итоговый балл/), { target: { value: '6' } });
     fireEvent.change(screen.getByLabelText('Комментарий студенту'), { target: { value: 'Мой черновик' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Утвердить рекомендацию ИИ' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Подставить оценку и комментарий' }));
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(0);
     expect(screen.getByLabelText('Комментарий студенту')).toHaveValue('Не соответствует условию.');
@@ -373,7 +438,7 @@ describe('reviewed submission', () => {
     mocks.getAiCodeReview.mockResolvedValue({ id: 'ai-report', recommendationStatus: 'PENDING', enabled: true, state: 'COMPLETED', summary: '', findings: [], recommendedGrade: 4, recommendedComment: 'Совет' });
     mocks.claimSubmission.mockRejectedValue(new Error('Работа закреплена за другим преподавателем'));
     renderPage();
-    fireEvent.click(await screen.findByRole('button', { name: 'Утвердить рекомендацию ИИ' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Подставить оценку и комментарий' }));
     await screen.findByText('Не удалось подставить рекомендацию');
     expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(9);
     expect(screen.getByLabelText('Финальный комментарий студенту')).toHaveValue('Хорошая работа');
@@ -384,9 +449,9 @@ describe('reviewed submission', () => {
   it('tags a saved AI draft for discard on exit without approving or exporting it', async () => {
     mocks.getAiCodeReview.mockResolvedValue({ id: 'ai-report', recommendationStatus: 'PENDING', enabled: true, state: 'COMPLETED', summary: '', findings: [], recommendedGrade: 4, recommendedComment: 'Совет' });
     renderPage();
-    fireEvent.click(await screen.findByRole('button', { name: 'Утвердить рекомендацию ИИ' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Подставить оценку и комментарий' }));
     await waitFor(() => expect(screen.getByLabelText(/Итоговый балл/)).toHaveValue(4));
-    fireEvent.click(screen.getByRole('button', { name: 'Сохранить' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Сохранить черновик' }));
     await waitFor(() => expect(mocks.saveReview).toHaveBeenCalledWith('graded', 4, 'Совет', 'ai-report'));
     fireEvent.click(screen.getByRole('button', { name: 'Вернуться к работам' }));
     await screen.findByText('Список работ');
@@ -722,7 +787,7 @@ describe('reviewed submission', () => {
     renderPage('/review/question-1');
     await screen.findByText('Вы проверяете работу');
     fireEvent.change(screen.getByLabelText(/^Комментарий студенту/), { target: { value: 'Проверить границы массива.' } });
-    expect(screen.getByRole('button', { name: 'Сохранить' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Сохранить черновик' })).toBeEnabled();
     fireEvent.click(screen.getByRole('tab', { name: /№2 Задача 2/ }));
     await waitFor(() => expect(screen.getByRole('tab', { name: /№2 Задача 2/ })).toHaveAttribute('aria-selected', 'true'));
     expect(mocks.saveReview).toHaveBeenCalledWith('question-1', null, 'Проверить границы массива.');
@@ -931,7 +996,7 @@ describe('reviewed submission', () => {
     expect(screen.getByLabelText(/Итоговый балл/)).toBeDisabled();
     expect(screen.getByLabelText(/Финальный комментарий студенту/)).toBeDisabled();
     expect(screen.getByLabelText(/Финальный комментарий студенту/)).toHaveValue('Хорошая работа');
-    expect(screen.getByLabelText(/Финальный комментарий студенту/)).toHaveAttribute('rows', '8');
+    expect(screen.getByLabelText(/Финальный комментарий студенту/)).toHaveAttribute('rows', '4');
     expect(screen.getAllByText('Коваленко А.').length).toBeGreaterThan(0);
     expect(screen.getByText(/версия 2/)).toBeInTheDocument();
 

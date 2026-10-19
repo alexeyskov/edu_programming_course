@@ -196,7 +196,7 @@ export function CoursesPage() {
         <span className="eyebrow">Курсов: {courses.length}</span>
         <h1>{primaryRole === 'TEACHER' ? 'Курсы и работы' : 'Мои работы'}</h1>
         <p>{primaryRole === 'TEACHER'
-          ? 'Синхронизируйте курс вручную, чтобы обновить список работ и участников. Ответы студентов загружаются отдельно кнопкой у каждой работы.'
+          ? 'Обновляйте список работ и участников из Moodle. Ответы студентов загружаются отдельно у каждой работы.'
           : 'Все доступные задания из ваших курсов.'}</p>
       </div>
     </div>
@@ -227,14 +227,14 @@ export function CoursesPage() {
         return <Card className={`course-detail${collapsed ? ' course-detail--collapsed' : ''}`} key={course.id}>
           <header>
             <span className="course-detail__icon"><BookOpen /></span>
-            <div><h2>{course.title}</h2><p>{course.shortName}{course.group && ` · группа ${course.group}`}</p></div>
+            <div><h2>{course.title}</h2><p>{course.shortName}{course.group && ` · группа ${course.group}`}</p>{course.syncedAt && <small className="course-detail__updated">Список обновлён: {formatDate(course.syncedAt)}</small>}</div>
             {course.syncStatus === 'ERROR'
               ? <button type="button" className="sync-error-trigger" onClick={() => setSyncErrorCourse(course)} aria-label={`Показать ошибку синхронизации курса ${course.title}`}><Badge tone="danger"><RefreshCw size={12} /> Ошибка LMS</Badge></button>
               : <Badge tone={course.syncStatus === 'SYNCED' ? 'success' : syncingCourse ? 'info' : 'warning'}><RefreshCw size={12} className={syncingCourse ? 'spin' : ''} /> {syncingCourse ? 'Синхронизируется' : course.syncStatus === 'SYNCED' ? 'Список курса загружен' : 'Курс не синхронизирован'}</Badge>}
             {canSync && <Button size="sm" variant="secondary" disabled={syncingCourse || syncingAnswers || Boolean(statusError)}
-              aria-label={`Синхронизировать курс ${course.title}`}
+              aria-label={`Обновить список курса ${course.title}`}
               title={syncingAnswers ? 'Дождитесь синхронизации ответов в этом курсе' : 'Обновить список работ, студентов и преподавателей; ответы не загружаются'}
-              onClick={() => void startSync(course)}><RefreshCw size={15} className={syncingCourse ? 'spin' : ''} /> Синхронизировать курс</Button>}
+              onClick={() => void startSync(course)}><RefreshCw size={15} className={syncingCourse ? 'spin' : ''} /> Обновить список</Button>}
             {course.externalUrl && <a href={course.externalUrl} target="_blank" rel="noreferrer" aria-label="Открыть в LMS"><ExternalLink size={17} /></a>}
             <Button type="button" variant="ghost" size="icon" className="course-detail__toggle"
               aria-label={toggleLabel} title={toggleLabel} aria-expanded={!collapsed} aria-controls={worksId}
@@ -268,7 +268,7 @@ export function CoursesPage() {
               <Badge tone={assessmentDisplayStatus(item) === 'DRAFT' ? 'warning' : item.status === 'GRADED' ? 'success' : item.status === 'IN_PROGRESS' ? 'info' : 'neutral'}>{assessmentDisplayStatus(item) === 'DRAFT' ? 'Не включена' : statusLabel[item.status]}</Badge><ArrowRight size={17} />
             </Link>{canSync && <button type="button" className={`work-sync-button${syncTone}`}
               disabled={syncingCourse || syncing || Boolean(statusError)}
-              aria-label={`Синхронизировать ответы: ${item.title}`}
+              aria-label={`Загрузить ответы: ${item.title}`}
               title={syncingCourse ? 'Сначала дождитесь синхронизации курса' : syncDescription}
               onClick={() => void startSync(course, item)}><RefreshCw size={18} className={syncing ? 'spin' : ''} /><span className="sr-only">{syncDescription}</span></button>}</div>;
             })}

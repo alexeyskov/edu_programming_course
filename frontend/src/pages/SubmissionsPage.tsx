@@ -7,6 +7,7 @@ import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-do
 import { Badge, Button, Card, EmptyState, InlineError, PageLoader, useToast } from '../components/ui';
 import { api } from '../lib/api';
 import { formatDate } from '../lib/utils';
+import { useMediaQuery } from '../lib/workspaceLayout';
 import type { MoodleHistoryImportEvent, Submission } from '../types';
 
 type SubmissionView = 'all' | 'pending' | 'reviewed';
@@ -18,6 +19,8 @@ const views: Array<{ id: SubmissionView; label: string }> = [
 ];
 
 export function SubmissionsPage() {
+  const mobile = useMediaQuery('(max-width: 767px)');
+  const [filtersOpen, setFiltersOpen] = useState(false);
   const [items, setItems] = useState<Submission[]>([]);
   const [historyImports, setHistoryImports] = useState<MoodleHistoryImportEvent[]>([]);
   const [historyStatusError, setHistoryStatusError] = useState(false);
@@ -38,6 +41,8 @@ export function SubmissionsPage() {
   const query = searchParams.get('q') ?? '';
   const courseId = searchParams.get('course') ?? '';
   const assessmentId = courseId ? searchParams.get('assessment') ?? '' : '';
+  const group = searchParams.get('group') ?? '';
+  const sort = searchParams.get('sort') ?? 'newest';
 
   const loadSubmissions = useCallback(async () => {
     if (submissionsInFlight.current) return;
@@ -114,9 +119,11 @@ export function SubmissionsPage() {
   const assessmentOptions = useMemo(() => filterOptions(items
     .filter((item) => courseId && item.courseId === courseId)
     .map((item) => [workId(item), item.parentAssessmentTitle ?? item.assessmentTitle])), [items, courseId]);
+  const groupOptions = useMemo(() => [...new Set(items.filter((item) => !courseId || item.courseId === courseId)
+    .map((item) => item.studentGroup).filter((value) => value && value !== '—'))].sort((a, b) => a.localeCompare(b, 'ru', { numeric: true })), [items, courseId]);
   const scopedItems = useMemo(() => items.filter((item) => (
-    (!courseId || item.courseId === courseId) && (!assessmentId || workId(item) === assessmentId)
-  )), [items, courseId, assessmentId]);
+    (!courseId || item.courseId === courseId) && (!assessmentId || workId(item) === assessmentId) && (!group || item.studentGroup === group)
+  )), [items, courseId, assessmentId, group]);
   const counts = useMemo(() => ({
     all: scopedItems.length,
     pending: scopedItems.filter((item) => item.reviewRequired !== false && (item.status === 'UNGRADED' || item.status === 'CLAIMED')).length,
@@ -129,14 +136,15 @@ export function SubmissionsPage() {
   )), [scopedItems, view]);
   const filtered = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
-    if (!normalizedQuery) return viewItems;
-    return viewItems.filter((item) => `${item.studentName} ${item.studentGroup} ${item.courseTitle ?? ''} ${item.assessmentTitle}`.toLowerCase().includes(normalizedQuery));
-  }, [viewItems, query]);
+    const result = viewItems.filter((item) => !normalizedQuery || `${item.studentName} ${item.studentGroup} ${item.courseTitle ?? ''} ${item.assessmentTitle}`.toLowerCase().includes(normalizedQuery));
+    return result.sort((a, b) => sort === 'student' ? a.studentName.localeCompare(b.studentName, 'ru')
+      : ((Date.parse(a.submittedAt) || 0) - (Date.parse(b.submittedAt) || 0)) * (sort === 'oldest' ? 1 : -1));
+  }, [viewItems, query, sort]);
 
   function setParam(name: string, value: string) {
     const next = new URLSearchParams(searchParams);
     if (value) next.set(name, value); else next.delete(name);
-    if (name === 'course') next.delete('assessment');
+    if (name === 'course') { next.delete('assessment'); next.delete('group'); }
     setSearchParams(next, { replace: true });
   }
 
@@ -145,6 +153,7 @@ export function SubmissionsPage() {
   }
 
   async function claimAndOpen(item: Submission, recheck = false) {
+    if (mobile) { navigate(reviewUrl(item)); return; }
     setClaiming(item.id);
     try {
       await api.claimSubmission(item.id);
@@ -179,6 +188,8 @@ export function SubmissionsPage() {
 
     <div className="filter-bar submission-filters">
       <div className="search-input"><Search size={17} /><input value={query} onChange={(event) => setParam('q', event.target.value)} placeholder="Студент, группа, курс или работа" aria-label="Поиск по работам" /></div>
+      {mobile && <button type="button" className="submission-filter-toggle" aria-expanded={filtersOpen} aria-controls="submission-filter-fields" onClick={() => setFiltersOpen((value) => !value)}>Фильтры{[courseId, assessmentId, group].filter(Boolean).length > 0 && ` · ${[courseId, assessmentId, group].filter(Boolean).length}`}<span>{filtersOpen ? 'Скрыть' : 'Показать'}</span></button>}
+      <div id="submission-filter-fields" className="submission-filter-fields" hidden={mobile && !filtersOpen}>
       <label className="submission-filter"><span>Курс</span><select aria-label="Курс" value={courseId} onChange={(event) => setParam('course', event.target.value)}>
         <option value="">Все курсы</option>
         {courseId && !courseOptions.some((option) => option.id === courseId) && <option value={courseId}>Выбранный курс (нет сдач)</option>}
@@ -190,12 +201,14 @@ export function SubmissionsPage() {
         {assessmentOptions.map((option) => <option key={option.id} value={option.id}>{option.title}</option>)}
       </select></label>
     </div>
+    </div>
+    <div className="submission-filters__extra" hidden={mobile && !filtersOpen}><label>Группа<select aria-label="Группа" value={group} onChange={(event) => setParam('group', event.target.value)}><option value="">Все группы</option>{groupOptions.map((value) => <option key={value} value={value}>{value}</option>)}</select></label><label>Порядок<select aria-label="Сортировка работ" value={sort} onChange={(event) => setParam('sort', event.target.value)}><option value="newest">Сначала новые</option><option value="oldest">Сначала старые</option><option value="student">По имени студента</option></select></label></div>
     {filtered.length ? <Card className="submission-table"><div className="submission-table__head"><span>Студент</span><span>Работа</span><span>Проверки</span><span>Статус</span><span>Действия</span></div>{filtered.map((item) => <div className="submission-row" key={item.id}>
       <span className="student-cell"><span className="student-avatar">{item.studentName.split(' ').map((part) => part[0]).join('').slice(0, 2)}</span><span><strong>{item.studentName}</strong><small>{item.studentGroup !== '—' ? `Группа ${item.studentGroup} · ` : ''}{formatDate(item.submittedAt)}</small></span></span>
-      <span><strong>{item.assessmentTitle}</strong><small>{item.reviewGroup ? `${taskCountLabel(item.reviewGroup.items.length)} · ` : ''}{item.courseTitle ? `${item.courseTitle} · ` : ''}{item.testsTotal > 0 ? `${item.testsPassed}/${item.testsTotal} тестов по данным API` : 'Результаты тестов не предоставлены'}</small></span>
-      <span className="evidence-cell"><Badge tone={item.risk === 'HIGH' ? 'danger' : item.risk === 'MEDIUM' ? 'warning' : item.risk === 'LOW' ? 'success' : 'neutral'}>{item.risk === 'HIGH' ? <AlertTriangle size={12} /> : <ShieldQuestion size={12} />} {riskLabel(item.risk)}</Badge></span>
-      <span>{item.reviewRequired === false ? <Badge>Проверка не требуется</Badge> : item.status === 'CLAIMED' && item.claim ? <span className="claim-owner"><LockKeyhole size={14} /><span><strong>{item.claim.mine ? 'Вы проверяете' : item.claim.ownerName}</strong><small>до {formatDate(item.claim.expiresAt, { hour: '2-digit', minute: '2-digit' })}</small></span></span> : item.status === 'GRADED' ? <Badge tone="success"><CheckCircle2 size={12} /> {item.score}/{item.maxScore}</Badge> : item.status === 'CONFLICT' ? <Badge tone="danger">Конфликт LMS</Badge> : <Badge>Не проверено</Badge>}</span>
-      <span className="submission-actions">{item.status === 'UNGRADED' && item.canReview !== false ? <Button size="sm" loading={claiming === item.id} onClick={() => void claimAndOpen(item)}><UserCheck size={14} /> Открыть</Button> : item.status === 'CLAIMED' ? <Button size="sm" variant={item.claim?.mine ? 'primary' : 'secondary'} onClick={() => navigate(reviewUrl(item))}><ArrowRight size={14} /> {item.claim?.mine ? 'Продолжить' : 'Открыть'}</Button> : item.status === 'GRADED' ? <><Button size="sm" variant="secondary" onClick={() => navigate(reviewUrl(item))}><ArrowRight size={14} /> Открыть результат</Button>{item.canReview !== false && <Button size="sm" variant="ghost" loading={claiming === item.id} onClick={() => void claimAndOpen(item, true)}><RotateCcw size={14} /> Перепроверить</Button>}</> : <Button size="sm" variant="secondary" onClick={() => navigate(reviewUrl(item))}><ArrowRight size={14} /> Открыть</Button>}</span>
+      <span><strong>{item.assessmentTitle}</strong><small>{item.reviewGroup ? `${taskCountLabel(item.reviewGroup.items.length)} · ` : ''}{item.courseTitle ? `${item.courseTitle} · ` : ''}{item.testsTotal > 0 ? `${item.testsPassed}/${item.testsTotal} тестов пройдено` : 'Результаты тестов не предоставлены'}</small></span>
+      <span className="evidence-cell" data-label="Проверки"><Badge tone={item.risk === 'HIGH' ? 'danger' : item.risk === 'MEDIUM' ? 'warning' : item.risk === 'LOW' ? 'success' : 'neutral'}>{item.risk === 'HIGH' ? <AlertTriangle size={12} /> : <ShieldQuestion size={12} />} {riskLabel(item.risk)}</Badge></span>
+      <span data-label="Статус">{item.reviewRequired === false ? <Badge>Проверка не требуется</Badge> : item.status === 'CLAIMED' && item.claim ? <span className="claim-owner"><LockKeyhole size={14} /><span><strong>{item.claim.mine ? 'Вы проверяете' : item.claim.ownerName}</strong><small>до {formatDate(item.claim.expiresAt, { hour: '2-digit', minute: '2-digit' })}</small></span></span> : item.status === 'GRADED' ? <Badge tone="success"><CheckCircle2 size={12} /> {item.score}/{item.maxScore}</Badge> : item.status === 'CONFLICT' ? <Badge tone="danger">Конфликт LMS</Badge> : <Badge>Не проверено</Badge>}</span>
+      <span className="submission-actions">{item.status === 'UNGRADED' && item.canReview !== false ? <Button size="sm" loading={claiming === item.id} onClick={() => void claimAndOpen(item)}><UserCheck size={14} /> Открыть</Button> : item.status === 'CLAIMED' ? <Button size="sm" variant={item.claim?.mine ? 'primary' : 'secondary'} onClick={() => navigate(reviewUrl(item))}><ArrowRight size={14} /> {item.claim?.mine ? 'Продолжить' : 'Открыть'}</Button> : item.status === 'GRADED' ? <><Button size="sm" variant="secondary" onClick={() => navigate(reviewUrl(item))}><ArrowRight size={14} /> Открыть результат</Button>{!mobile && item.canReview !== false && <Button size="sm" variant="ghost" loading={claiming === item.id} onClick={() => void claimAndOpen(item, true)}><RotateCcw size={14} /> Перепроверить</Button>}</> : <Button size="sm" variant="secondary" onClick={() => navigate(reviewUrl(item))}><ArrowRight size={14} /> Открыть</Button>}</span>
     </div>)}</Card> : <Card className="submission-empty"><EmptyState icon={<Inbox />} title={viewItems.length ? 'По запросу ничего не найдено' : emptyState.title} text={viewItems.length ? 'Измените поисковый запрос.' : emptyState.text} action={!viewItems.length && !items.length ? <><Button variant="secondary" loading={refreshing} onClick={load}><RotateCcw size={15} /> Обновить список</Button>{historyUnavailable && <Link className="button button--secondary button--md" to="/courses">К синхронизации работ</Link>}</> : undefined} /></Card>}
     <div className="table-footer"><span>Показано {filtered.length} из {viewItems.length}</span></div>
   </div>;

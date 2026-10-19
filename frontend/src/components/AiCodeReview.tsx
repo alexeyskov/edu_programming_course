@@ -128,7 +128,7 @@ export function AiReviewRecommendation({ report, maxScore, canApprove, onApprove
       : `Кнопка подставит балл и комментарий в поля формы. Отправка в Moodle — только через «Утвердить». ${report.automatic
         ? 'При выходе отменяется только неутверждённый ИИ-черновик в форме. Ответ автоматической проверки и подсветка замечаний сохраняются.'
         : 'При выходе без утверждения ИИ-черновик и рекомендация ручной проверки отменяются.'}`}</small>
-    {report.id && report.recommendationStatus === 'PENDING' && validGrade && report.recommendedComment?.trim() && <Button size="sm" variant="secondary" disabled={!canApprove} loading={applying} onClick={onApprove}>Утвердить рекомендацию ИИ</Button>}
+    {report.id && report.recommendationStatus === 'PENDING' && validGrade && report.recommendedComment?.trim() && <Button size="sm" variant="secondary" disabled={!canApprove} loading={applying} onClick={onApprove}>Подставить оценку и комментарий</Button>}
   </section>;
 }
 
@@ -153,7 +153,7 @@ export function AiHighlightsToggle({ report, checked, onChange, onStart, startin
   if (!completed) return <span title={title} className="ai-review-launch-tooltip">
     <button type="button" className={cn('ai-review-launch', canStart && 'ai-review-launch--ready')} disabled={!canStart}
       aria-label={busy ? 'ИИ-проверка выполняется' : 'Проверить работу через ИИ'} aria-busy={busy} onClick={onStart}>
-      <span className="ai-highlights-toggle__track" aria-hidden="true" /><Bot size={14} />
+      <Bot size={14} />
       <span>{starting ? 'Запуск ИИ…' : report?.state === 'QUEUED' ? (report.attemptCount ? `Повтор ИИ ${Math.min(attempt, maximum)}/${maximum}…` : 'В очереди ИИ') : report?.state === 'RUNNING' ? `Проверка ИИ ${attempt}/${maximum}…` : report?.state === 'FAILED' ? 'Повторить ИИ' : 'Проверить ИИ'}</span>
     </button>
   </span>;

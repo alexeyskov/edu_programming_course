@@ -66,7 +66,7 @@ describe('AI recommendation until explicit review exit', () => {
     expect(screen.getByText('7.5/10')).toBeVisible();
     expect(screen.getByText(/Кнопка подставит балл и комментарий в поля формы/)).toBeVisible();
     expect(approve).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: 'Утвердить рекомендацию ИИ' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Подставить оценку и комментарий' }));
     expect(approve).toHaveBeenCalledOnce();
   });
   it('does not offer a discarded recommendation even if a stale payload contains its score', () => {

@@ -3,7 +3,7 @@ import {
   LogOut, Menu, Moon, PanelLeftClose, PanelLeftOpen, Settings, ShieldCheck,
   SlidersHorizontal, Sun, X,
 } from 'lucide-react';
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { NavLink, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
@@ -23,9 +23,14 @@ export function AppShell({ children, fullBleed = false }: { children: ReactNode;
   const { session, primaryRole, logout, elevate } = useAuth();
   const { theme, toggleTheme } = useTheme();
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
-    try { return window.localStorage.getItem(SIDEBAR_STORAGE_KEY) === 'true'; } catch { return false; }
+  const [sidebarPreference, setSidebarCollapsed] = useState<boolean | null>(() => {
+    try { const stored = window.localStorage.getItem(SIDEBAR_STORAGE_KEY); return stored === null ? null : stored === 'true'; } catch { return null; }
   });
+  const sidebarCollapsed = sidebarPreference ?? fullBleed;
+  const sidebarRef = useRef<HTMLElement>(null);
+  const mainRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLButtonElement>(null);
+  const profileRef = useRef<HTMLDivElement>(null);
   const [profileOpen, setProfileOpen] = useState(false);
   const [elevationOpen, setElevationOpen] = useState(false);
   const [adminToken, setAdminToken] = useState(() => loadRememberedTokens().adminToken);
@@ -43,8 +48,42 @@ export function AppShell({ children, fullBleed = false }: { children: ReactNode;
 
   useEffect(() => { setSidebarOpen(false); setProfileOpen(false); }, [location.pathname]);
   useEffect(() => {
-    try { window.localStorage.setItem(SIDEBAR_STORAGE_KEY, String(sidebarCollapsed)); } catch { /* Storage may be blocked. */ }
-  }, [sidebarCollapsed]);
+    if (sidebarPreference === null) return;
+    try { window.localStorage.setItem(SIDEBAR_STORAGE_KEY, String(sidebarPreference)); } catch { /* Storage may be blocked. */ }
+  }, [sidebarPreference]);
+  useEffect(() => {
+    if (!profileOpen) return;
+    const outside = (event: PointerEvent) => { if (!profileRef.current?.contains(event.target as Node)) setProfileOpen(false); };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !event.defaultPrevented) { setProfileOpen(false); profileRef.current?.querySelector<HTMLButtonElement>('.profile-button')?.focus(); }
+    };
+    document.addEventListener('pointerdown', outside); document.addEventListener('keydown', escape);
+    return () => { document.removeEventListener('pointerdown', outside); document.removeEventListener('keydown', escape); };
+  }, [profileOpen]);
+  useEffect(() => {
+    if (!sidebarOpen || !sidebarRef.current) return;
+    const panel = sidebarRef.current;
+    const main = mainRef.current;
+    const overflow = document.body.style.overflow;
+    const wasInert = main?.hasAttribute('inert') ?? false;
+    main?.setAttribute('inert', ''); document.body.style.overflow = 'hidden';
+    const targets = () => Array.from(panel.querySelectorAll<HTMLElement>('a,button')).filter((element) => getComputedStyle(element).display !== 'none');
+    targets()[0]?.focus();
+    const keyboard = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      if (event.key === 'Escape') { event.preventDefault(); setSidebarOpen(false); }
+      if (event.key === 'Tab') {
+        const elements = targets(); const index = elements.indexOf(document.activeElement as HTMLElement);
+        if (event.shiftKey && index <= 0) { event.preventDefault(); elements.at(-1)?.focus(); }
+        else if (!event.shiftKey && (index < 0 || index === elements.length - 1)) { event.preventDefault(); elements[0]?.focus(); }
+      }
+    };
+    document.addEventListener('keydown', keyboard);
+    return () => {
+      document.removeEventListener('keydown', keyboard); main?.toggleAttribute('inert', wasInert);
+      document.body.style.overflow = overflow; menuRef.current?.focus();
+    };
+  }, [sidebarOpen]);
 
   const nav = primaryRole === 'TEACHER' ? [
     { to: '/', label: 'Обзор', icon: LayoutDashboard },
@@ -73,7 +112,7 @@ export function AppShell({ children, fullBleed = false }: { children: ReactNode;
   }
 
   return <div className={cn('app-shell', fullBleed && 'app-shell--full', sidebarCollapsed && 'app-shell--sidebar-collapsed')}>
-    <aside className={cn('sidebar', sidebarOpen && 'is-open', sidebarCollapsed && 'is-collapsed')}>
+    <aside ref={sidebarRef} id="main-sidebar" className={cn('sidebar', sidebarOpen && 'is-open', sidebarCollapsed && 'is-collapsed')}>
       <div className="brand"><span className="brand__mark"><img src={sfeduLogoUrl} alt="" /></span><span><strong>{appName}</strong><small>C/C++ · обучение</small></span><button className="sidebar__collapse" onClick={() => setSidebarCollapsed(true)} aria-label="Скрыть основное меню" title="Скрыть основное меню"><PanelLeftClose size={17} /></button><button className="sidebar__close" onClick={() => setSidebarOpen(false)} aria-label="Закрыть меню"><X /></button></div>
       <div className="sidebar__scope"><span className="eyebrow">Режим</span><strong>{roleLabel}</strong><small>{session?.providerName}</small></div>
       <nav className="sidebar__nav" aria-label="Основная навигация">
@@ -87,9 +126,9 @@ export function AppShell({ children, fullBleed = false }: { children: ReactNode;
       <span aria-hidden="true">Меню</span>
     </aside>}
     {sidebarOpen && <button className="sidebar-overlay" onClick={() => setSidebarOpen(false)} aria-label="Закрыть меню" />}
-    <div className="app-main">
+    <div ref={mainRef} className="app-main">
       <header className="topbar">
-        <button className="topbar__menu" onClick={() => setSidebarOpen(true)} aria-label="Открыть меню"><Menu /></button>
+        <button ref={menuRef} className="topbar__menu" onClick={() => setSidebarOpen(true)} aria-label="Открыть меню" aria-expanded={sidebarOpen} aria-controls="main-sidebar"><Menu /></button>
         <div><span className="topbar__crumb">{appName} /</span><strong>{pageTitle}</strong></div>
         <div className="topbar__actions">
           {elevated && <Badge tone="purple"><ShieldCheck size={13} /> Системный доступ</Badge>}
@@ -100,9 +139,9 @@ export function AppShell({ children, fullBleed = false }: { children: ReactNode;
             aria-label={theme === 'dark' ? 'Включить светлую тему' : 'Включить тёмную тему'}
             title={theme === 'dark' ? 'Светлая тема' : 'Тёмная тема'}
           >{theme === 'dark' ? <Sun size={17} /> : <Moon size={17} />}</button>
-          <div className="profile-wrap">
-            <button className="profile-button" onClick={() => setProfileOpen((value) => !value)}><span className="avatar">{initials(session?.displayName ?? '')}</span><span className="profile-button__name"><strong>{session?.displayName}</strong><small>{roleLabel}</small></span><ChevronDown size={16} /></button>
-            {profileOpen && <div className="profile-menu">
+          <div ref={profileRef} className="profile-wrap">
+            <button className="profile-button" aria-label={`Меню профиля: ${session?.displayName ?? roleLabel}`} aria-expanded={profileOpen} aria-controls={profileOpen ? 'profile-menu' : undefined} onClick={() => setProfileOpen((value) => !value)}><span className="avatar">{initials(session?.displayName ?? '')}</span><span className="profile-button__name"><strong>{session?.displayName}</strong><small>{roleLabel}</small></span><ChevronDown size={16} /></button>
+            {profileOpen && <div id="profile-menu" className="profile-menu">
               <div><strong>{session?.displayName}</strong><small>{session?.providerName}</small></div>
               {!elevated && <button onClick={() => { setAdminToken(loadRememberedTokens().adminToken); setElevationOpen(true); }}><ShieldCheck size={16} />Токен администратора</button>}
               {elevated && <button onClick={() => navigate('/settings')}><SlidersHorizontal size={16} />Настройки системы</button>}

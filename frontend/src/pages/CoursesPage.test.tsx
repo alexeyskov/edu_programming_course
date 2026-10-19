@@ -104,7 +104,7 @@ describe('teacher courses page', () => {
     }]);
     render(<MemoryRouter><ToastProvider><CoursesPage /></ToastProvider></MemoryRouter>);
     fireEvent.click(await screen.findByRole('button', { name: 'Развернуть список работ курса C++' }));
-    const button = screen.getByRole('button', { name: 'Синхронизировать ответы: Работа 1' });
+    const button = screen.getByRole('button', { name: 'Загрузить ответы: Работа 1' });
     expect(button.title).toContain(description);
     if (tone) expect(button).toHaveClass(tone);
     else expect(button).not.toHaveClass('work-sync-button--success', 'work-sync-button--failed');
@@ -121,13 +121,13 @@ describe('teacher courses page', () => {
     }]);
     render(<MemoryRouter><ToastProvider><CoursesPage /></ToastProvider></MemoryRouter>);
     fireEvent.click(await screen.findByRole('button', { name: 'Развернуть список работ курса C++' }));
-    const sync = screen.getByRole('button', { name: 'Синхронизировать ответы: Работа 1' });
+    const sync = screen.getByRole('button', { name: 'Загрузить ответы: Работа 1' });
     expect(sync).toBeEnabled();
     expect(sync).toHaveClass('work-sync-button--failed');
     expect(sync).not.toHaveClass('work-sync-button--success');
     expect(sync.title).toContain('ARTIFACT_OMITTED');
     expect(sync.title).toContain('Загруженные работы можно проверять');
-    expect(screen.getByRole('button', { name: 'Синхронизировать курс C++' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Обновить список курса C++' })).toBeEnabled();
   });
 
   it('starts all courses collapsed and toggles each independently while keeping header actions available', async () => {
@@ -141,10 +141,10 @@ describe('teacher courses page', () => {
     expect(toggle).toHaveAttribute('aria-expanded', 'false');
     expect(panel).not.toBeVisible();
     expect(screen.queryByRole('link', { name: /Работа C\+\+/ })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Синхронизировать ответы: Работа C++' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Загрузить ответы: Работа C++' })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: /Работа Python/ })).not.toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'C++' })).toBeVisible();
-    expect(screen.getByRole('button', { name: 'Синхронизировать курс C++' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Обновить список курса C++' })).toBeEnabled();
 
     fireEvent.click(toggle);
     expect(toggle).toHaveAccessibleName('Свернуть список работ курса C++');
@@ -201,9 +201,9 @@ describe('teacher courses page', () => {
     mocks.getCourses.mockResolvedValue([course]);
     mocks.getAssessments.mockResolvedValue([assessment]);
     render(<MemoryRouter><ToastProvider><CoursesPage /></ToastProvider></MemoryRouter>);
-    expect(await screen.findByRole('button', { name: 'Синхронизировать курс C++' })).toBeEnabled();
+    expect(await screen.findByRole('button', { name: 'Обновить список курса C++' })).toBeEnabled();
     fireEvent.click(screen.getByRole('button', { name: 'Развернуть список работ курса C++' }));
-    const sync = screen.getByRole('button', { name: 'Синхронизировать ответы: Работа 1' });
+    const sync = screen.getByRole('button', { name: 'Загрузить ответы: Работа 1' });
     expect(sync).toBeEnabled();
     expect(sync.closest('a')).toBeNull();
     expect(mocks.syncCourse).not.toHaveBeenCalled();
@@ -217,16 +217,16 @@ describe('teacher courses page', () => {
     let finish!: (value: unknown) => void;
     mocks.syncCourse.mockReturnValue(new Promise((resolve) => { finish = resolve; }));
     render(<MemoryRouter><ToastProvider><CoursesPage /></ToastProvider></MemoryRouter>);
-    const button = await screen.findByRole('button', { name: 'Синхронизировать курс C++' });
+    const button = await screen.findByRole('button', { name: 'Обновить список курса C++' });
     fireEvent.click(screen.getByRole('button', { name: 'Развернуть список работ курса C++' }));
     fireEvent.click(screen.getByRole('button', { name: 'Развернуть список работ курса Python' }));
     fireEvent.click(button);
     fireEvent.click(button);
     expect(mocks.syncCourse).toHaveBeenCalledTimes(1);
     expect(button).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Синхронизировать ответы: course-1' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Синхронизировать курс Python' })).toBeEnabled();
-    expect(screen.getByRole('button', { name: 'Синхронизировать ответы: course-2' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Загрузить ответы: course-1' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Обновить список курса Python' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Загрузить ответы: course-2' })).toBeEnabled();
     await act(async () => finish({ ...course, syncStatus: 'SYNCING' }));
     expect(button).toBeDisabled();
     expect(mocks.syncAssessment).not.toHaveBeenCalled();
@@ -238,13 +238,13 @@ describe('teacher courses page', () => {
     mocks.syncAssessment.mockResolvedValue({ assessmentId: 'assessment-1', status: 'SYNCING' });
     render(<MemoryRouter><ToastProvider><CoursesPage /></ToastProvider></MemoryRouter>);
     fireEvent.click(await screen.findByRole('button', { name: 'Развернуть список работ курса C++' }));
-    const button = screen.getByRole('button', { name: 'Синхронизировать ответы: Работа 1' });
+    const button = screen.getByRole('button', { name: 'Загрузить ответы: Работа 1' });
     fireEvent.click(button);
     fireEvent.click(button);
     await waitFor(() => expect(mocks.syncAssessment).toHaveBeenCalledTimes(1));
     expect(button).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Синхронизировать курс C++' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Синхронизировать ответы: Работа 2' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Обновить список курса C++' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Загрузить ответы: Работа 2' })).toBeEnabled();
   });
 
   it('polls shared task states to reflect another teacher and unlock completed jobs', async () => {
@@ -256,11 +256,11 @@ describe('teacher courses page', () => {
       render(<MemoryRouter><ToastProvider><CoursesPage /></ToastProvider></MemoryRouter>);
       await act(async () => { await vi.advanceTimersByTimeAsync(1); });
       fireEvent.click(screen.getByRole('button', { name: 'Развернуть список работ курса C++' }));
-      expect(screen.getByRole('button', { name: 'Синхронизировать ответы: Работа 1' })).toBeDisabled();
+      expect(screen.getByRole('button', { name: 'Загрузить ответы: Работа 1' })).toBeDisabled();
       mocks.getAssessmentSyncStatuses.mockResolvedValue([{ assessmentId: 'assessment-1', status: 'COMPLETED' }]);
       await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
-      expect(screen.getByRole('button', { name: 'Синхронизировать ответы: Работа 1' })).toBeEnabled();
-      expect(screen.getByRole('button', { name: 'Синхронизировать курс C++' })).toBeEnabled();
+      expect(screen.getByRole('button', { name: 'Загрузить ответы: Работа 1' })).toBeEnabled();
+      expect(screen.getByRole('button', { name: 'Обновить список курса C++' })).toBeEnabled();
       expect(mocks.syncCourse).not.toHaveBeenCalled();
       expect(mocks.syncAssessment).not.toHaveBeenCalled();
     } finally { cleanup(); vi.useRealTimers(); }
@@ -273,7 +273,7 @@ describe('teacher courses page', () => {
       mocks.getAssessments.mockResolvedValue([assessment]);
       render(<MemoryRouter><ToastProvider><CoursesPage /></ToastProvider></MemoryRouter>);
       await act(async () => { await vi.advanceTimersByTimeAsync(1); });
-      const sync = screen.getByRole('button', { name: 'Синхронизировать курс C++' });
+      const sync = screen.getByRole('button', { name: 'Обновить список курса C++' });
       expect(sync).toBeDisabled();
       let finishRead!: (value: unknown[]) => void;
       mocks.getAssessments.mockReturnValueOnce(new Promise((resolve) => { finishRead = resolve; }));
@@ -298,7 +298,7 @@ describe('teacher courses page', () => {
       mocks.syncCourse.mockResolvedValue({ ...course, syncStatus: 'SYNCING' });
       render(<MemoryRouter><ToastProvider><CoursesPage /></ToastProvider></MemoryRouter>);
       await act(async () => { await vi.advanceTimersByTimeAsync(1); });
-      const sync = screen.getByRole('button', { name: 'Синхронизировать курс C++' });
+      const sync = screen.getByRole('button', { name: 'Обновить список курса C++' });
       await act(async () => { fireEvent.click(sync); });
       expect(sync).toBeDisabled();
       mocks.getCourseSyncStatus.mockResolvedValue({ courseId: course.id, syncStatus: 'SYNCED' });
@@ -323,8 +323,8 @@ describe('teacher courses page', () => {
         : new Promise(() => {}));
       render(<MemoryRouter><ToastProvider><CoursesPage /></ToastProvider></MemoryRouter>);
       await act(async () => { await vi.advanceTimersByTimeAsync(1); });
-      expect(screen.getByRole('button', { name: 'Синхронизировать курс C++' })).toBeEnabled();
-      expect(screen.getByRole('button', { name: 'Синхронизировать курс Python' })).toBeDisabled();
+      expect(screen.getByRole('button', { name: 'Обновить список курса C++' })).toBeEnabled();
+      expect(screen.getByRole('button', { name: 'Обновить список курса Python' })).toBeDisabled();
     } finally { cleanup(); vi.useRealTimers(); }
   });
 
@@ -335,7 +335,7 @@ describe('teacher courses page', () => {
       mocks.getCourseSyncStatus.mockRejectedValueOnce(new Error('Нет соединения'));
       render(<MemoryRouter><ToastProvider><CoursesPage /></ToastProvider></MemoryRouter>);
       await act(async () => { await vi.advanceTimersByTimeAsync(1); });
-      const sync = screen.getByRole('button', { name: 'Синхронизировать курс C++' });
+      const sync = screen.getByRole('button', { name: 'Обновить список курса C++' });
       expect(sync).toBeDisabled();
       await act(async () => { await vi.advanceTimersByTimeAsync(1_500); });
       expect(mocks.getCourseSyncStatus).toHaveBeenCalledTimes(2);
@@ -366,7 +366,7 @@ describe('teacher courses page', () => {
       hidden.mockReturnValue(false);
       await act(async () => { document.dispatchEvent(new Event('visibilitychange')); });
       expect(screen.getByRole('button', { name: 'Показать ошибку синхронизации курса C++' })).toBeInTheDocument();
-      expect(screen.getByRole('button', { name: 'Синхронизировать курс C++' }).querySelector('.spin')).toBeNull();
+      expect(screen.getByRole('button', { name: 'Обновить список курса C++' }).querySelector('.spin')).toBeNull();
       expect(mocks.syncCourse).not.toHaveBeenCalled();
     } finally { cleanup(); hidden.mockRestore(); vi.useRealTimers(); }
   });
@@ -382,7 +382,7 @@ describe('teacher courses page', () => {
       mocks.getAssessmentSyncStatuses.mockRejectedValue(new Error('Нет соединения'));
       await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
       expect(screen.getByRole('link', { name: /Работа 1/ })).toHaveAttribute('href', '/assessments/assessment-1');
-      expect(screen.getByRole('button', { name: 'Синхронизировать ответы: Работа 1' })).toBeDisabled();
+      expect(screen.getByRole('button', { name: 'Загрузить ответы: Работа 1' })).toBeDisabled();
       expect(screen.getByText('Нет соединения')).toBeInTheDocument();
     } finally { cleanup(); vi.useRealTimers(); }
   });

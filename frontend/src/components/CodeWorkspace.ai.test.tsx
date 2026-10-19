@@ -17,6 +17,7 @@ const mock = vi.hoisted(() => {
   const modelListeners = new Set<() => void>();
   const disposeListeners = new Set<() => void>();
   const collections: { items: unknown[]; clear: ReturnType<typeof vi.fn>; set(items: unknown[]): void }[] = [];
+  const mount = { deferred: false, pending: undefined as (() => void) | undefined };
   let current: Model | null = null;
   const editor = {
     addAction: vi.fn((_action: Monaco.editor.IActionDescriptor) => ({ dispose: vi.fn() })),
@@ -56,15 +57,18 @@ const mock = vi.hoisted(() => {
     current = models.get(path)!;
     modelListeners.forEach((listener) => listener());
   }
-  return { models, collections, monaco, editor, switchModel, disposeListeners, modelListeners };
+  return { models, collections, monaco, editor, switchModel, disposeListeners, modelListeners, mount };
 });
 
 vi.mock('./MonacoEditors', () => ({
   MonacoEditor: ({ path, value, onMount }: { path: string; value: string; onMount: (editor: typeof mock.editor, monaco: typeof mock.monaco) => void }) => {
     useLayoutEffect(() => { mock.switchModel(path, value); }, [path, value]);
     useEffect(() => {
-      onMount(mock.editor, mock.monaco);
-      return () => { mock.disposeListeners.forEach((listener) => listener()); };
+      // @monaco-editor/react keeps the initial onMount callback while loading.
+      const mount = () => onMount(mock.editor, mock.monaco);
+      if (mock.mount.deferred) mock.mount.pending = mount;
+      else mount();
+      return () => { mock.mount.pending = undefined; mock.disposeListeners.forEach((listener) => listener()); };
     }, []);
     return <div data-testid="editor" />;
   },
@@ -93,19 +97,57 @@ beforeEach(() => {
   mock.disposeListeners.clear();
   mock.monaco.editor.setModelMarkers.mockClear();
   mock.editor.addAction.mockClear();
+  mock.mount.deferred = false;
+  mock.mount.pending = undefined;
 });
 
 describe('CodeWorkspace AI recommendations', () => {
-  it('adds separate, explicitly advisory markers and escaped untrusted hovers', () => {
-    render(workspace([{ ...finding, message: '[открыть](command:run) <script>alert(1)</script> **текст**' }]));
-    expect(aiMarkers()).toEqual([expect.objectContaining({ startLineNumber: 2, source: 'Ответ ИИ', message: expect.stringContaining('Ответ ИИ:') })]);
+  it('applies a saved report that arrives before the editor finishes loading', () => {
+    mock.mount.deferred = true;
+    const onAskAi = vi.fn();
+    const view = render(workspace([], 'main', 'submission-1', onAskAi));
+    view.rerender(workspace([finding], 'main', 'submission-1', onAskAi));
+    expect(aiMarkers()).toBeUndefined();
+
+    expect(mock.mount.pending).toBeTypeOf('function');
+    act(() => mock.mount.pending!());
+    expect(aiMarkers()).toEqual([expect.objectContaining({ message: finding.message })]);
+    expect(mock.collections.at(-1)?.items).toHaveLength(1);
+    expect(onAskAi).not.toHaveBeenCalled();
+  });
+
+  it('does not restore highlights switched off before the editor finishes loading', () => {
+    mock.mount.deferred = true;
+    const view = render(workspace([finding]));
+    view.rerender(workspace([]));
+    act(() => mock.mount.pending!());
+    expect(aiMarkers() ?? []).toEqual([]);
+  });
+
+  it('uses the latest file and submission if they change before editor readiness', () => {
+    mock.mount.deferred = true;
+    const view = render(workspace([finding]));
+    const latest = { ...finding, path: 'array.h', line: 1, message: 'Замечание к другому файлу новой сдачи.' };
+    view.rerender(workspace([latest], 'header', 'submission-2'));
+    act(() => mock.mount.pending!());
+    expect(aiMarkers('inmemory:///submission-2/array.h')).toEqual([expect.objectContaining({ message: latest.message })]);
+    expect(aiMarkers()).toBeUndefined();
+  });
+
+  it('applies newly completed findings immediately to an already mounted editor', () => {
+    const view = render(workspace([]));
+    view.rerender(workspace([finding]));
+    expect(aiMarkers()).toEqual([expect.objectContaining({ message: finding.message })]);
+  });
+
+  it('shows advisory text only in the plain-text marker, without a duplicate decoration hover', () => {
+    const message = '[открыть](command:run) <script>alert(1)</script> **текст**';
+    render(workspace([{ ...finding, message }]));
+    expect(aiMarkers()).toEqual([expect.objectContaining({ startLineNumber: 2, source: 'Ответ ИИ', message })]);
     expect(mock.monaco.editor.setModelMarkers).toHaveBeenCalledWith(expect.anything(), 'compiler', [expect.objectContaining({ message: 'Compiler error' })]);
     expect(mock.collections.at(-1)?.items).toEqual([expect.objectContaining({ options: expect.objectContaining({
       className: 'ai-review-line',
-      hoverMessage: {
-        value: 'Ответ ИИ: \\[открыть\\]\\(command:run\\) \\<script\\>alert\\(1\\)\\</script\\> \\*\\*текст\\*\\*',
-        isTrusted: false, supportHtml: false,
-      },
+      hoverMessage: undefined,
     }) })]);
   });
 
@@ -132,6 +174,9 @@ describe('CodeWorkspace AI recommendations', () => {
     const registeredCommand = `editor-test:${action.id}`;
     expect(hover.isTrusted).toEqual({ enabledCommands: [registeredCommand] });
     expect(hover.supportHtml).toBe(false);
+    expect(hover.value).toMatch(/^\[Спросить у ИИ\]\(command:/);
+    expect(hover.value).not.toContain(finding.message);
+    expect(aiMarkers()).toEqual([expect.objectContaining({ message: finding.message, source: 'Ответ ИИ' })]);
     const link = hover.value.match(/\[Спросить у ИИ\]\(command:([^?]+)\?(.+)\)$/)!;
     expect(link[1]).toBe(registeredCommand);
     const args = JSON.parse(decodeURIComponent(link[2])) as unknown[];

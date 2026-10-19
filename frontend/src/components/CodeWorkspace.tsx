@@ -8,6 +8,7 @@ import { cn, languageForPath } from '../lib/utils';
 import { installEditorClipboardGuard, type EditorClipboardSession } from '../lib/editorClipboard';
 import { installAiSelectionAction, type AiCodeSelection } from '../lib/editorAiSelection';
 import { installCodeIntelligence, type CodeIntelligenceScope, type CodeIntelligenceStatus } from '../lib/codeIntelligence';
+import { useMediaQuery } from '../lib/workspaceLayout';
 import type { AiCodeFinding, Diagnostic, InternalPasteRange, WorkspaceFile } from '../types';
 import { Badge, Button } from './ui';
 import './aiAnnotations.css';
@@ -61,10 +62,12 @@ const severityMap: Record<Diagnostic['severity'], Monaco.MarkerSeverity> = {
 
 export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function CodeWorkspace({
   files, activeFileId, onActiveFile, onChange, onCreateFile, onDeleteFile, canDeleteFile,
-  readOnly = false, strictPaste = false,
+  readOnly: requestedReadOnly = false, strictPaste = false,
   scopeId, diagnostics = [], aiFindings = [], onAskAi, onAskAiSelection, highlights = [], theme: requestedTheme, experiment = false, explorerVisible = true, explorerId,
   onExplorerCollapse, onPasteBlocked, onInternalCopy, clipboardScopeId, clipboardSession, intelligenceScope,
 }, ref) {
+  const mobile = useMediaQuery('(max-width: 767px)');
+  const readOnly = requestedReadOnly || mobile;
   const { theme: applicationTheme } = useTheme();
   const theme = requestedTheme ?? applicationTheme;
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
@@ -201,7 +204,7 @@ export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function Cod
         endLineNumber: item.endLine ?? item.line,
         endColumn: model.getLineMaxColumn(item.endLine ?? item.line),
       },
-      message: `Ответ ИИ: ${item.message.trim().slice(0, 4000)}`,
+      message: item.message.trim().slice(0, 4000),
       findingIndex: aiFindings.indexOf(item),
       fingerprint: `${item.line}:${item.endLine}:${item.message}`,
       severity: severityMap[item.severity],
@@ -216,12 +219,12 @@ export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function Cod
         isWholeLine: true,
         className: 'ai-review-line',
         linesDecorationsClassName: 'ai-review-gutter',
-        hoverMessage: {
-          value: item.message.replace(/[\\`*_{}[\]()<>#+.!|~-]/g, '\\$&') + (hoverCommand
-            ? `\n\n[Спросить у ИИ](command:${hoverCommand}?${encodeURIComponent(JSON.stringify([scopeId, active.path, item.findingIndex, item.fingerprint]))})` : ''),
-          // Trust only our own draft-opening action, never model-provided commands or HTML.
-          isTrusted: hoverCommand ? { enabledCommands: [hoverCommand] } : false, supportHtml: false,
-        },
+        // Monaco already renders the marker's message and source in the hover.
+        // The decoration adds only our action, never a duplicate message or model-provided Markdown.
+        hoverMessage: hoverCommand ? {
+          value: `[Спросить у ИИ](command:${hoverCommand}?${encodeURIComponent(JSON.stringify([scopeId, active.path, item.findingIndex, item.fingerprint]))})`,
+          isTrusted: { enabledCommands: [hoverCommand] }, supportHtml: false,
+        } : undefined,
       },
     })));
   }, [active, aiFindings, aiMarkerOwner, aiAskCommand, onAskAi, readOnly, experiment, clearAiAnnotations, scopeId]);
@@ -278,7 +281,10 @@ export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function Cod
   const handleMount: OnMount = (editor, monaco) => {
     editorRef.current = editor; monacoRef.current = monaco;
     aiSelectionRef.current = installAiSelectionAction(editor, monaco, () => ({ ...selectionConfigRef.current, path: activeRef.current?.path }));
-    refreshAiAction(); setMarkers(); setHighlights(); setAiAnnotations();
+    refreshAiAction(); setMarkers(); setHighlights();
+    // Monaco keeps the initial onMount callback during asynchronous startup.
+    // Apply the current report, file and toggle state, not the captured initial ones.
+    refreshAiAnnotationsRef.current();
     const aiModelListener = editor.onDidChangeModel(() => refreshAiAnnotationsRef.current());
     intelligenceRef.current = installCodeIntelligence(editor, monaco, () => intelligenceConfigRef.current);
     const dom = clipboardRootRef.current;
@@ -320,10 +326,11 @@ export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function Cod
   if (!active) return <div className="editor-empty"><FileCode2 /><p>В рабочей области пока нет файлов</p>{onCreateFile && <Button variant="secondary" onClick={onCreateFile}><FilePlus2 size={16} /> Создать файл</Button>}</div>;
 
   return <div ref={clipboardRootRef} className={cn('code-workspace', experiment && 'code-workspace--experiment', !explorerVisible && 'code-workspace--explorer-hidden')}>
+    {mobile && <label className="workspace-file-picker"><FileCode2 size={17} /><select aria-label="Файл для просмотра" value={active.id} onChange={(event) => onActiveFile(event.target.value)}>{files.map((file) => <option key={file.id} value={file.id}>{file.path}</option>)}</select><LockKeyhole size={14} aria-label="Только чтение" /></label>}
     <aside id={explorerId} className="file-explorer" hidden={!explorerVisible}><header><span>Файлы</span><span className="file-explorer__actions">{onCreateFile && !readOnly && <button onClick={onCreateFile} title="Создать файл" aria-label="Создать файл"><FilePlus2 size={15} /></button>}{onExplorerCollapse && <button onClick={onExplorerCollapse} title="Скрыть панель файлов" aria-label="Скрыть файлы"><PanelLeftClose size={15} /></button>}</span></header><div className="folder-label"><ChevronRight size={14} /><Folder size={15} /><span>workspace</span></div><div className="file-list">{files.map((file) => <div key={file.id} className={cn('file-entry', file.id === activeFileId && 'is-active')}><button className="file-entry__open" onClick={() => onActiveFile(file.id)}><FileCode2 size={15} /><span>{file.path}</span>{file.readOnly && <LockKeyhole size={12} />}</button>{onDeleteFile && !readOnly && !file.readOnly && (canDeleteFile?.(file) ?? files.length > 1) && <button className="file-entry__delete" onClick={() => onDeleteFile(file)} title={`Удалить ${file.path}`} aria-label={`Удалить ${file.path}`}><Trash2 size={13} /></button>}</div>)}</div><footer><span>Файлов: {files.length}</span></footer></aside>
     <section className="editor-stage"><div className="editor-tabs">{openFiles.map((id) => { const file = files.find((item) => item.id === id); return file ? <button key={id} className={cn(id === activeFileId && 'is-active')} onClick={() => onActiveFile(id)}><FileCode2 size={14} /><span>{file.path.split('/').at(-1)}</span>{openFiles.length > 1 && <X size={13} onClick={(event) => { event.stopPropagation(); closeTab(id); }} />}</button> : null; })}<span className="editor-tabs__fill" />{intelligenceScope && <div className="code-intelligence-tools"><span className={`code-intelligence-status code-intelligence-status--${intelligenceStatus}`} title={intelligenceStatus === 'ready' ? 'Подсказки C/C++, параметры функций, переход к определению (F12), ссылки (Shift+F12), символы файла (Ctrl/Cmd+Shift+O). Диагностика редактора не заменяет запуск компилятора.' : intelligenceStatus === 'fallback' ? 'clangd временно недоступен. Работают локальные подсказки; сохранение, сдача и запуск кода доступны.' : 'Подключение подсказок C/C++. Сохранение и запуск кода доступны.'}>{intelligenceStatus === 'ready' ? 'C/C++' : intelligenceStatus === 'fallback' ? 'Базовые подсказки' : 'C/C++…'}</span>{!readOnly && !active.readOnly && <button type="button" className="code-intelligence-format" aria-label="Форматировать код" title="Форматировать код (Shift+Alt+F)" onClick={() => { void intelligenceRef.current?.format(); }}><WrapText size={15} /></button>}</div>}</div>
       <Editor path={`inmemory:///${scopeId}/${active.path}`} value={active.content} language={active.language ?? languageForPath(active.path)} beforeMount={beforeMount} onMount={handleMount}
-        onChange={(value) => onChange(active.id, value ?? '', internalPasteRef.current ? 'internal_paste' : 'typing', internalPasteRef.current ? internalPasteReceiptRef.current : undefined, internalPasteRef.current ? internalPasteRangeRef.current : undefined)}
+        onChange={(value) => { if (!readOnly && !active.readOnly) onChange(active.id, value ?? '', internalPasteRef.current ? 'internal_paste' : 'typing', internalPasteRef.current ? internalPasteReceiptRef.current : undefined, internalPasteRef.current ? internalPasteRangeRef.current : undefined); }}
         theme={theme === 'dark' ? 'eduprog-dark' : 'eduprog-light'} options={{
           // Keep clickable teacher AI hovers outside the editor row's overflow clip.
           fixedOverflowWidgets: Boolean(onAskAi || onAskAiSelection),
@@ -332,7 +339,7 @@ export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function Cod
           // highlighting and explicit reference navigation remain available.
           occurrencesHighlight: 'off',
           quickSuggestionsDelay: 200,
-          readOnly: readOnly || active.readOnly, readOnlyMessage: { value: 'Редактирование недоступно в режиме чтения.' }, minimap: { enabled: true, maxColumn: 80 }, fontSize: 14, lineHeight: 23, fontFamily: "'JetBrains Mono', 'SFMono-Regular', Consolas, monospace", fontLigatures: true, padding: { top: 14, bottom: 18 }, smoothScrolling: true, cursorSmoothCaretAnimation: 'on', automaticLayout: true, scrollBeyondLastLine: false, bracketPairColorization: { enabled: true }, guides: { bracketPairs: true, indentation: true }, suggest: { showSnippets: false }, quickSuggestions: !readOnly, inlineSuggest: { enabled: false }, contextmenu: !strictPaste, pasteAs: { enabled: !strictPaste }, dropIntoEditor: { enabled: !strictPaste }, dragAndDrop: !strictPaste, wordWrap: 'off', renderValidationDecorations: 'on',
+          readOnly: readOnly || active.readOnly, readOnlyMessage: { value: mobile ? 'На телефоне доступен просмотр. Продолжите редактирование на компьютере.' : 'Редактирование недоступно в режиме чтения.' }, minimap: { enabled: !mobile, maxColumn: 80 }, fontSize: 14, lineHeight: 23, lineNumbersMinChars: mobile ? 3 : 4, fontFamily: "'JetBrains Mono', 'SFMono-Regular', Consolas, monospace", fontLigatures: true, padding: { top: 14, bottom: 18 }, smoothScrolling: true, cursorSmoothCaretAnimation: 'on', automaticLayout: true, scrollBeyondLastLine: false, bracketPairColorization: { enabled: true }, guides: { bracketPairs: true, indentation: true }, suggest: { showSnippets: false }, quickSuggestions: !readOnly, inlineSuggest: { enabled: false }, contextmenu: !strictPaste, pasteAs: { enabled: !strictPaste }, dropIntoEditor: { enabled: !strictPaste }, dragAndDrop: !strictPaste, wordWrap: mobile ? 'on' : 'off', renderValidationDecorations: 'on',
         }} />
     </section>
   </div>;

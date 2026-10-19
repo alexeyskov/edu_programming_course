@@ -162,7 +162,8 @@ async function copyText(text: string): Promise<void> {
   textarea.style.pointerEvents = 'none';
 
   const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-  document.body.appendChild(textarea);
+  // Keep the HTTP clipboard fallback inside an open dialog's focus boundary.
+  (previouslyFocused?.closest('[role="dialog"]') ?? document.body).appendChild(textarea);
   try {
     textarea.focus();
     textarea.select();
@@ -372,7 +373,7 @@ export function SettingsPage() {
   if (elevationRequired || !elevated) return <div className="content-width settings-page">
     <div className="page-heading">
       <div>
-        <span className="eyebrow">SYSTEM_SETTINGS</span>
+        <span className="eyebrow">Администрирование</span>
         <h1>Возобновление доступа</h1>
         <p>{elevationRequired
           ? 'Время повышенного доступа истекло. Введите административный токен ещё раз, чтобы продолжить работу с настройками.'
@@ -681,7 +682,7 @@ export function SettingsPage() {
   return <div className="content-width settings-page">
     <div className="page-heading">
       <div>
-        <span className="eyebrow">SYSTEM_SETTINGS</span>
+        <span className="eyebrow">Администрирование</span>
         <h1>Настройки системы</h1>
         <p>Повышенный доступ действует только в текущей сессии и не расширяет права на курсы.</p>
       </div>
@@ -705,9 +706,10 @@ export function SettingsPage() {
       <Badge tone="purple">{session?.adminElevationExpiresAt ? 'продлевается при работе' : 'текущая сессия'}</Badge>
     </div>
 
+    <nav className="settings-section-nav" aria-label="Разделы настроек"><a href="#settings-courses">Курсы</a><a href="#settings-access">Доступ</a><a href="#settings-ai">ИИ</a><a href="#settings-runner">Запуск кода</a><a href="#settings-storage">Хранение</a><a href="#settings-health">Диагностика</a></nav>
     <div className="settings-grid">
       <section>
-        <Card className="settings-card system-course-card">
+        <Card id="settings-courses" className="settings-card system-course-card">
           <header>
             <span><BookOpen /></span>
             <div>
@@ -790,7 +792,7 @@ export function SettingsPage() {
                 </div>}
         </Card>
 
-        <Card className="settings-card teacher-token-card">
+        <Card id="settings-access" className="settings-card teacher-token-card">
           <header>
             <span><KeyRound /></span>
             <div>
@@ -911,14 +913,14 @@ export function SettingsPage() {
                 </div>}
         </Card>
 
-        <Card className="settings-card">
+        <Card id="settings-ai" className="settings-card">
           <header><span><Bot /></span><div><h2>Искусственный интеллект</h2><p>Глобальные ограничения поверх настроек курсов.</p></div></header>
           <Toggle checked={settings.aiEnabled} onChange={(value) => patch({ aiEnabled: value })} label="ИИ-функции системы" description="Анализ для преподавателя и учебный помощник" />
           <Toggle checked={settings.studentAiEnabled} disabled={!settings.aiEnabled} onChange={(value) => patch({ studentAiEnabled: value })} label="Учебный помощник студентам" description="Курс может дополнительно отключить его для конкретной работы" />
           <small className="muted">Провайдер, модель и бюджет задаются конфигурацией сервера и не выдаются этим API.</small>
         </Card>
 
-        <Card className="settings-card">
+        <Card id="settings-runner" className="settings-card">
           <header><span><Server /></span><div><h2>Компиляция и запуск</h2><p>Верхние границы ресурсов отдельного runner-контейнера.</p></div></header>
           <Toggle checked={settings.runnerEnabled} onChange={(value) => patch({ runnerEnabled: value })} label="Разрешить запуски" description="Отключение не мешает писать и сдавать код" />
           <div className="setting-inline">
@@ -928,7 +930,7 @@ export function SettingsPage() {
           <div className="risk-note"><TriangleAlert /><p><strong>Временный режим без песочницы</strong>Код выполняется обычным процессом внутри runner-контейнера. Файловая и сетевая изоляция отдельных запусков отключена; сохраняются лимиты времени, памяти и вывода.</p></div>
         </Card>
 
-        <Card className="settings-card">
+        <Card id="settings-storage" className="settings-card">
           <header><span><Database /></span><div><h2>Хранение</h2><p>История, снимки, эксперименты и аудит.</p></div></header>
           <Field label="Срок хранения учебных записей"><div className="unit-input"><input type="number" value={settings.retentionDays} onChange={(event) => patch({ retentionDays: Number(event.target.value) })} /><span>дней</span></div></Field>
           <Field className="settings-card__spaced-field" label="Системное объявление"><textarea rows={3} value={settings.incidentBanner} onChange={(event) => patch({ incidentBanner: event.target.value })} placeholder="Пусто — объявление не показывается" /></Field>
@@ -937,7 +939,7 @@ export function SettingsPage() {
       </section>
 
       <aside>
-        <Card className="health-card">
+        <Card id="settings-health" className="health-card">
           <header><div><span><Activity /></span><div><h2>Состояние backend</h2><p>Ответ `/system/health`</p></div></div><button onClick={() => void load()} aria-label="Обновить состояние"><RefreshCcw /></button></header>
           {health ? <>
             <div><span className={`status-dot status-dot--${health.status === 'ok' ? 'ok' : health.status === 'degraded' ? 'warning' : 'danger'}`} /><span><strong>Основной API</strong><small>build {health.build}</small></span><Badge tone={health.status === 'ok' ? 'success' : health.status === 'degraded' ? 'warning' : 'danger'}>{health.status}</Badge></div>
@@ -959,6 +961,7 @@ export function SettingsPage() {
       </aside>
     </div>
 
+    <div className="settings-save-bar"><p>Изменения параметров вступят в силу после сохранения.</p><Button loading={saving} onClick={() => void save()}><Save size={16} /> Сохранить настройки</Button></div>
     <LmsSyncErrorDialog
       open={Boolean(syncErrorCourse)}
       courseTitle={syncErrorCourse?.title ?? ''}

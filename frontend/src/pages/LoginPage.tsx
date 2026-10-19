@@ -1,4 +1,4 @@
-import { ArrowRight, Check, GraduationCap, KeyRound, LockKeyhole, Shield, Trash2 } from 'lucide-react';
+import { ArrowRight, Check, ChevronDown, Eye, EyeOff, GraduationCap, KeyRound, LockKeyhole, Shield, Trash2 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Navigate, useNavigate, useSearchParams } from 'react-router-dom';
 import { Button, Field, InlineError } from '../components/ui';
@@ -22,6 +22,8 @@ export function LoginPage() {
   );
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [passwordVisible, setPasswordVisible] = useState(false);
+  const [additionalOpen, setAdditionalOpen] = useState(Boolean(initialRememberedTokens.adminToken || initialRememberedTokens.teacherToken));
   const [role, setRole] = useState<Role>('STUDENT');
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -83,7 +85,7 @@ export function LoginPage() {
         <div className="login-features">
           <span><Check /> Браузерная IDE и сборка</span>
           <span><Check /> Версионированная история</span>
-          <span><Check /> СППР для преподавателя</span>
+          <span><Check /> Инструменты проверки преподавателя</span>
           <span><Check /> ИИ помощник для студента</span>
         </div>
       </div>
@@ -95,17 +97,18 @@ export function LoginPage() {
         {error && <InlineError title="Не удалось войти" message={error} />}
         {!loading && credentialConnections.map((connection) => <form className="moodle-credential-login" key={connection.id} onSubmit={(event) => { event.preventDefault(); void loginWithCredentials(connection.id); }}>
           <Field label="Логин Moodle"><input autoComplete="username" maxLength={255} value={username} onChange={(event) => setUsername(event.target.value)} /></Field>
-          <Field label="Пароль Moodle"><div className="input-with-icon"><LockKeyhole size={18} /><input type="password" autoComplete="current-password" maxLength={4096} value={password} onChange={(event) => setPassword(event.target.value)} /></div></Field>
+          <Field label="Пароль Moodle"><div className="input-with-icon input-with-icon--password"><LockKeyhole size={18} /><input type={passwordVisible ? 'text' : 'password'} autoComplete="current-password" maxLength={4096} value={password} onChange={(event) => setPassword(event.target.value)} /><button type="button" className="password-toggle" aria-label={passwordVisible ? 'Скрыть пароль' : 'Показать пароль'} aria-pressed={passwordVisible} onClick={() => setPasswordVisible((value) => !value)}>{passwordVisible ? <EyeOff size={18} /> : <Eye size={18} />}</button></div></Field>
           <Button type="submit" size="lg" className="login-provider" loading={submitting} disabled={!connection.enabled || !username.trim() || !password}><span className="provider-mark">M</span><span>Войти через {connection.name}</span><ArrowRight /></Button>
         </form>)}
         {!loading && redirectConnections.map((connection) => <Button key={connection.id} size="lg" className="login-provider" loading={submitting} disabled={!connection.enabled} onClick={() => void login(connection.id)}><span className="provider-mark">M</span><span>Войти через {connection.name}</span><ArrowRight /></Button>)}
         {!loading && !moodleConnections.length && !showDev && <InlineError message="Подключение Moodle для входа пока не настроено." />}
-        <div className="divider"><span>дополнительно</span></div>
+        <details className="login-additional" open={additionalOpen} onToggle={(event) => setAdditionalOpen(event.currentTarget.open)}><summary><KeyRound size={16} /><span>Дополнительный доступ<small>Для преподавателей и администратора</small></span><ChevronDown size={16} /></summary><div>
         <Field label="Токен преподавателя" hint="После успешного входа сохраняется только в этом браузере и подставляется при следующих входах."><div className="input-with-icon"><KeyRound size={18} /><input type="password" autoComplete="off" data-1p-ignore maxLength={512} spellCheck={false} value={teacherToken} onChange={(event) => setTeacherToken(event.target.value)} placeholder="Оставьте пустым для входа студента" /></div></Field>
         <Field label="Токен администратора" hint="После успешного входа сохраняется только в этом браузере и позволяет повторно восстановить системный доступ."><div className="input-with-icon"><KeyRound size={18} /><input type="password" autoComplete="off" data-1p-ignore maxLength={1024} spellCheck={false} value={adminToken} onChange={(event) => setAdminToken(event.target.value)} placeholder="Оставьте пустым для обычного входа" /></div></Field>
         {hasRememberedTokens && <div className="login-remembered-tokens"><small>На этом устройстве есть сохранённые токены доступа.</small><Button type="button" size="sm" variant="ghost" onClick={forgetRememberedTokens}><Trash2 size={14} /> Забыть сохранённые токены</Button></div>}
+        </div></details>
         {showDev && <div className="dev-login"><div><Shield size={17} /><span><strong>Локальная демонстрация</strong><small>Без обращения к Moodle</small></span></div><div className="segmented"><button className={role === 'STUDENT' ? 'is-active' : ''} onClick={() => setRole('STUDENT')}>Студент</button><button className={role === 'TEACHER' ? 'is-active' : ''} onClick={() => setRole('TEACHER')}>Преподаватель</button></div><Button variant="secondary" loading={submitting} onClick={() => void loginDev()}>Открыть демо</Button></div>}
-        <div className="login-security"><LockKeyhole size={17} /><p>Пароль Moodle используется один раз изолированным браузерным коннектором и никогда не сохраняется. Токены доступа сохраняются в localStorage этого браузера; используйте эту возможность только на доверенном устройстве.</p></div>
+        <div className="login-security"><LockKeyhole size={17} /><p>Пароль Moodle не сохраняется. Дополнительный доступ запоминается в этом браузере — используйте его только на доверенном устройстве.</p></div>
       </div>
     </main>
   </div>;

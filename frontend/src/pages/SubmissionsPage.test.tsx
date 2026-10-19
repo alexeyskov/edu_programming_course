@@ -56,9 +56,31 @@ beforeEach(() => {
   mocks.retryMoodleHistoryImport.mockReset();
   mocks.claimSubmission.mockReset().mockResolvedValue({ id: 'new-claim', ownerId: 'teacher', ownerName: 'Коваленко А.', expiresAt: '2026-08-25T12:00:00Z', mine: true });
 });
-afterEach(cleanup);
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 describe('course and work filters', () => {
+  it('filters groups and preserves ordering in the URL used to return from review', async () => {
+    mocks.getSubmissions.mockResolvedValue([
+      { ...queue[0], submittedAt: '2026-08-25T10:00:00Z', studentGroup: '1.1' },
+      { ...queue[1], submittedAt: '2026-08-25T09:00:00Z', studentGroup: '1.2' },
+      { ...queue[3], submittedAt: '2026-08-25T08:00:00Z', studentGroup: '1.1' },
+    ]);
+    renderPage();
+    fireEvent.change(await screen.findByRole('combobox', { name: 'Группа' }), { target: { value: '1.1' } });
+    fireEvent.change(screen.getByRole('combobox', { name: 'Сортировка работ' }), { target: { value: 'oldest' } });
+    expect(screen.queryByText('Илья Морозов')).not.toBeInTheDocument();
+    expect(document.querySelector('.submission-row')).toHaveTextContent('Софья Лебедева');
+    fireEvent.click(within(rowFor('Софья Лебедева')).getByRole('button', { name: 'Открыть результат' }));
+    expect(screen.getByTestId('location')).toHaveTextContent('/review/graded?group=1.1&sort=oldest');
+  });
+
+  it('opens mobile submission previews without reserving a review', async () => {
+    vi.stubGlobal('matchMedia', () => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    renderPage(); await screen.findByText('Мария Воронова');
+    fireEvent.click(within(rowFor('Мария Воронова')).getByRole('button', { name: 'Открыть' }));
+    await screen.findByText('Экран проверки'); expect(mocks.claimSubmission).not.toHaveBeenCalled();
+  });
+
   const queue: Submission[] = [
     { ...items[0], courseId: 'course-a', courseTitle: 'Программирование на C++', assessmentId: 'essay-1', parentAssessmentId: 'quiz-a', parentAssessmentTitle: 'Контрольная №1' },
     { ...items[1], courseId: 'course-a', courseTitle: 'Программирование на C++', assessmentId: 'quiz-b', assessmentTitle: 'Лабораторная №2' },

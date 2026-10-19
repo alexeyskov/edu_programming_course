@@ -81,9 +81,21 @@ beforeEach(() => {
   mocks.retryAttemptSubmission.mockResolvedValue({ receipt_id: 'receipt-1' });
 });
 
-afterEach(() => { cleanup(); window.sessionStorage.clear(); vi.restoreAllMocks(); vi.useRealTimers(); });
+afterEach(() => { cleanup(); window.sessionStorage.clear(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe('student interactive console', () => {
+  it('keeps mobile source read-only and does not start, save or submit a program', async () => {
+    vi.stubGlobal('matchMedia', () => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    renderPage();
+    expect(await screen.findByTestId('code-workspace')).toHaveAttribute('data-read-only', 'true');
+    const edit = screen.getByRole('button', { name: 'Изменить файл' });
+    expect(edit).toBeDisabled(); fireEvent.click(edit);
+    expect(screen.getByRole('button', { name: 'Запустить' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Завершить работу' })).toBeDisabled();
+    expect(mocks.saveFile).not.toHaveBeenCalled(); expect(mocks.startInteractiveAttempt).not.toHaveBeenCalled();
+    expect(mocks.submitAttempt).not.toHaveBeenCalled();
+  });
+
   it.each([true, false])('offers one clear completion action with hasTimeLimit=%s', async (hasTimeLimit) => {
     mocks.getAttempt.mockResolvedValue({ ...attempt, hasTimeLimit });
     renderPage();

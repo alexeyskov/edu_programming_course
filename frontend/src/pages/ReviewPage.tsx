@@ -1,11 +1,11 @@
 import { MonacoDiffEditor as DiffEditor } from '../components/MonacoEditors';
 import {
-  AlertTriangle, Check, CheckCircle2, ChevronLeft, ChevronRight,
+  AlertTriangle, Check, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp,
   FlaskConical, GitCompareArrows, Info, Play, RefreshCcw,
   PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, RotateCcw, Save,
-  Send, ShieldCheck, Square, UserCheck, X,
+  Send, ShieldCheck, Smartphone, Square, UserCheck, X,
 } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState, type MutableRefObject } from 'react';
+import { useCallback, useEffect, useRef, useState, type CSSProperties, type MutableRefObject } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { CodeWorkspace, type CodeWorkspaceHandle } from '../components/CodeWorkspace';
 import { AiHighlightsToggle, AiReviewFeedback, AiReviewRecommendation, useAiCodeReview } from '../components/AiCodeReview';
@@ -13,6 +13,8 @@ import { TeacherAiChat, type AiAttachmentDraft } from '../components/TeacherAiCh
 import { ReviewWritingHistory } from '../components/ReviewWritingHistory';
 import { ConsoleTranscript, type ConsoleInput } from '../components/ConsoleTranscript';
 import { Badge, Button, Field, InlineError, Modal, PageLoader, useToast } from '../components/ui';
+import { PaneResizer } from '../components/PaneResizer';
+import { useMediaQuery, usePanelSize } from '../lib/workspaceLayout';
 import { useTheme } from '../context/ThemeContext';
 import { api } from '../lib/api';
 import type { AiCodeSelection } from '../lib/editorAiSelection';
@@ -54,6 +56,12 @@ function SubmissionReview({ submissionId, prefetchedGroupedReview, pendingAiRevi
   prefetchedGroupedReview: MutableRefObject<PrefetchedReview | null>;
   pendingAiReviews: MutableRefObject<Map<string, string>>;
 }) {
+  const mobile = useMediaQuery('(max-width: 767px)');
+  const mobileRef = useRef(mobile); mobileRef.current = mobile;
+  const [mobilePanel, setMobilePanel] = useState<'code' | EvidenceTab>('code');
+  const [reviewWidth, setReviewWidth] = usePanelSize('eduprog.layout.review-width', 420, 320, 640);
+  const [gradingHeight, setGradingHeight] = usePanelSize('eduprog.layout.grading-height', 300, 200, 600);
+  const [gradingOpen, setGradingOpen] = useState(true);
   const [submission, setSubmission] = useState<Submission | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -99,10 +107,10 @@ function SubmissionReview({ submissionId, prefetchedGroupedReview, pendingAiRevi
   const aiReview = useAiCodeReview(submission?.id);
   useEffect(() => {
     const report = aiReview.report;
-    if (!report?.id || leavingReviewRef.current) return;
+    if (!report?.id || leavingReviewRef.current || mobileRef.current) return;
     if (report.recommendationStatus === 'APPROVED' || report.recommendationStatus === 'DISCARDED') pendingAiReviews.current.delete(submissionId);
     else pendingAiReviews.current.set(submissionId, report.id);
-  }, [aiReview.report, submissionId, pendingAiReviews]);
+  }, [aiReview.report, submissionId, pendingAiReviews, mobile]);
   const [closingExperiment, setClosingExperiment] = useState(false);
   const [switchingSubmissionId, setSwitchingSubmissionId] = useState<string | null>(null);
   const editorRef = useRef<CodeWorkspaceHandle>(null);
@@ -208,13 +216,13 @@ function SubmissionReview({ submissionId, prefetchedGroupedReview, pendingAiRevi
         if (item.source === 'MOODLE_IMPORT' && markMoodleImportNoticeShown(item.id)) {
           toastRef.current.push('info', 'Импортировано из Moodle', 'Доступен итоговый код и решение; истории набора в Moodle нет.');
         }
-        if (item.canReview !== false && requiresReview && !item.claim && (item.status === 'UNGRADED' || draft?.aiReviewId)) {
+        if (!mobileRef.current && item.canReview !== false && requiresReview && !item.claim && (item.status === 'UNGRADED' || draft?.aiReviewId)) {
           const claim = await api.claimSubmission(item.id);
           openableItem = { ...item, status: 'CLAIMED', claim };
         }
         setSubmission(openableItem);
         const finalDecision = item.latestDecision ?? item.decisionHistory[0];
-        const useAiDraft = Boolean(draft?.aiReviewId && openableItem.claim?.mine);
+        const useAiDraft = Boolean(!mobileRef.current && draft?.aiReviewId && openableItem.claim?.mine);
         const finalDecisionIsReadOnly = !useAiDraft && (item.status === 'GRADED' || Boolean(finalDecision && !item.claim?.mine));
         setAppliedAiReviewId(useAiDraft ? draft!.aiReviewId! : null);
         if (useAiDraft) pendingAiReviews.current.set(item.id, draft!.aiReviewId!);
@@ -223,7 +231,7 @@ function SubmissionReview({ submissionId, prefetchedGroupedReview, pendingAiRevi
           : draft ? draft.grade?.toString() ?? '' : finalDecision?.grade.toString() ?? item.score?.toString() ?? '');
         setComment(finalDecisionIsReadOnly ? finalDecision?.comment ?? '' : draft?.comment ?? finalDecision?.comment ?? ''); setReviewDirty(false); setError(null);
         const storedInteractive = readInteractiveExperimentSession(item.id);
-        if (storedInteractive) {
+        if (storedInteractive && !mobileRef.current) {
           try {
             const restoredExperiment = await api.createExperiment(item.id);
             if (restoredExperiment.submissionId !== item.id || restoredExperiment.id !== storedInteractive.experimentId) {
@@ -537,13 +545,13 @@ function SubmissionReview({ submissionId, prefetchedGroupedReview, pendingAiRevi
   }
 
   async function startRecheck() {
-    if (!submission || submission.canReview === false || submission.status !== 'GRADED' || rechecking) return;
+    if (mobile || !submission || submission.canReview === false || !['GRADED', 'UNGRADED'].includes(submission.status) || rechecking) return;
     setRechecking(true);
     try {
       const claim = await api.claimSubmission(submission.id);
       setClaimLost(false);
       setSubmission({ ...submission, status: 'CLAIMED', claim });
-      toast.push('success', 'Перепроверка начата', 'Предыдущее решение сохранено в истории. Новое решение потребует отдельного утверждения.');
+      toast.push('success', submission.status === 'GRADED' ? 'Перепроверка начата' : 'Проверка начата', 'Результат отправится в Moodle после утверждения.');
     } catch (caught) {
       toast.push('error', 'Не удалось начать перепроверку', caught instanceof Error ? caught.message : 'Обновите страницу и попробуйте снова.');
     } finally { setRechecking(false); }
@@ -576,7 +584,7 @@ function SubmissionReview({ submissionId, prefetchedGroupedReview, pendingAiRevi
       const targetRequiresReview = target.canReview === true
         || (target.reviewRequired ?? assessment?.reviewRequired ?? true);
       let openableTarget = target;
-      if (target.canReview !== false && targetRequiresReview && !target.claim && (target.status === 'UNGRADED' || draft?.aiReviewId)) {
+      if (!mobileRef.current && target.canReview !== false && targetRequiresReview && !target.claim && (target.status === 'UNGRADED' || draft?.aiReviewId)) {
         const targetClaim = await api.claimSubmission(target.id);
         openableTarget = { ...target, status: 'CLAIMED', claim: targetClaim };
       }
@@ -624,6 +632,7 @@ function SubmissionReview({ submissionId, prefetchedGroupedReview, pendingAiRevi
 
   async function leaveReview() {
     if (!submission || finalizing || aiReview.starting || switchingSubmissionId || leavingReviewRef.current || applyingAiRef.current) return;
+    if (mobile && !reviewDirty && !experimentMode) { navigate(`/submissions${location.search}`); return; }
     leavingReviewRef.current = true;
     setLeavingReview(true);
     try {
@@ -649,6 +658,7 @@ function SubmissionReview({ submissionId, prefetchedGroupedReview, pendingAiRevi
   }
 
   async function applyAiRecommendation() {
+    if (mobile) return;
     const report = aiReview.report;
     const proposed = report?.recommendedGrade;
     if (!submission || submission.canReview === false || !reviewRequired || finalizing || leavingReviewRef.current || applyingAiRef.current || switchingSubmissionId || decisionOpen
@@ -671,6 +681,8 @@ function SubmissionReview({ submissionId, prefetchedGroupedReview, pendingAiRevi
       setGrade(String(proposed));
       setComment(report.recommendedComment);
       setAppliedAiReviewId(report.id);
+      setGradingOpen(true);
+      setEvidenceTab('task');
       setReviewDirty(true);
       toast.push('info', 'Данные ИИ перенесены в форму', 'Можно изменить балл и комментарий. Для отправки в Moodle нажмите «Утвердить».');
     } catch (caught) {
@@ -705,6 +717,8 @@ function SubmissionReview({ submissionId, prefetchedGroupedReview, pendingAiRevi
   }
 
   async function startAiReview() {
+    if (mobile) return;
+    setGradingOpen(true);
     if (leavingReviewRef.current) return;
     setAiHighlights(true);
     const message = await aiReview.start();
@@ -713,7 +727,7 @@ function SubmissionReview({ submissionId, prefetchedGroupedReview, pendingAiRevi
 
   if (loading) return <PageLoader label="Получаем снимок сдачи и закрепление работы…" />;
   if (error || !submission) return <InlineError message={error ?? 'Сдача не найдена'} retry={() => void load()} />;
-  const canReview = Boolean(submission.canReview !== false && reviewRequired && submission.claim?.mine && !claimLost && !finalizing && !leavingReview && !applyingAi);
+  const canReview = Boolean(!mobile && submission.canReview !== false && reviewRequired && submission.claim?.mine && !claimLost && !finalizing && !leavingReview && !applyingAi);
   const canUseDecisionSupport = submission.canReview !== false && decisionSupportEnabled;
   const canAskTeacherAi = submission.canReview !== false && decisionSupportEnabled;
   const validGrade = grade !== '' && Number.isFinite(Number(grade)) && Number(grade) >= 0 && Number(grade) <= submission.maxScore;
@@ -723,21 +737,24 @@ function SubmissionReview({ submissionId, prefetchedGroupedReview, pendingAiRevi
   const finalDecision = submission.latestDecision ?? submission.decisionHistory[0];
   const foreignClaim = Boolean(submission.claim && !submission.claim.mine);
   const reviewedReadOnly = Boolean(finalDecision && !submission.claim?.mine);
-  const canUseSandbox = Boolean(!switchingSubmissionId && submission.canReview !== false && (canReview || finalDecision || submission.status === 'GRADED'));
+  const canUseSandbox = Boolean(!mobile && !switchingSubmissionId && submission.canReview !== false && (canReview || finalDecision || submission.status === 'GRADED'));
   const interactiveActive = Boolean(interactiveRun && !interactiveRun.terminal);
   const interactiveInputOpen = interactiveActive && !interactiveRun?.inputClosed;
   const editable = Boolean(experimentMode && experiment && canUseSandbox && !closingExperiment);
   const diffFiles = selectDiffFiles(submission.files, experimentFiles, activeFileId);
   const reviewGroupItems = groupedReviewItems(submission);
   const activeGroupIndex = reviewGroupItems.findIndex((item) => item.submissionId === submission.id);
-  return <div className={cn('review-page', experimentMode && 'review-page--experiment', consoleOpen && 'review-page--console')}>
+  const gradingVisible = evidenceTab === 'task' && (!mobile || mobilePanel === 'task');
+  const gradingExpanded = gradingOpen;
+  return <div className={cn('review-page', experimentMode && 'review-page--experiment', consoleOpen && 'review-page--console')} data-mobile-panel={mobilePanel} style={{ '--review-panel-width': `${reviewWidth}px`, '--grading-height': `${gradingHeight}px` } as CSSProperties}>
+    {mobile && <p className="workspace-mobile-note"><Smartphone size={15} /><span>Просмотр на телефоне. Запуск, изменение оценки и отправка в Moodle доступны на компьютере.</span></p>}
     <header className="review-toolbar">
       <div><button className="review-back" aria-label="Вернуться к работам" aria-busy={leavingReview} disabled={leavingReview || finalizing || applyingAi || aiReview.starting || Boolean(switchingSubmissionId)} onClick={() => void leaveReview()}><ChevronLeft /></button><span><small>{submission.assessmentTitle}</small><strong>{submission.studentName}{submission.studentGroup !== '—' ? ` · ${submission.studentGroup}` : ''}</strong></span></div>
       <div className={cn('claim-banner', !canReview && 'claim-banner--other', reviewedReadOnly && !foreignClaim && 'claim-banner--reviewed')}>
         {reviewedReadOnly && !foreignClaim ? <CheckCircle2 size={15} /> : <UserCheck size={15} />}
         <span><strong>{!reviewRequired ? 'Проверка преподавателя не требуется' : foreignClaim ? `Проверяет ${submission.claim?.ownerName}` : reviewedReadOnly ? 'Работа проверена' : canReview ? 'Вы проверяете работу' : 'Работа не закреплена'}</strong><small>{!reviewRequired ? 'страница доступна только для чтения' : foreignClaim ? 'официальная перепроверка заблокирована; личная песочница доступна' : reviewedReadOnly ? `${finalDecision?.reviewerName ?? 'Преподаватель'}${finalDecision?.reviewedAt ? ` · ${formatDate(finalDecision.reviewedAt)}` : ''}` : canReview ? 'работа закреплена за вами; резервирование продлевается автоматически' : submission.canReview === false ? 'у вас нет доступа к проверке этой работы' : 'режим только для чтения'}{foreignClaim && submission.claim?.expiresAt ? ` · до ${formatDate(submission.claim.expiresAt, { hour: '2-digit', minute: '2-digit' })}` : ''}</small></span>
       </div>
-      <div>{!experimentMode ? <><span className="sandbox-tooltip" data-tooltip="Изменения не затрагивают сдачу студента, историю авторства и проверку на плагиат"><Button aria-label="Открыть преподавательскую песочницу" title="Изменения не затрагивают сдачу студента, историю авторства и проверку на плагиат" variant="ghost" disabled={!canUseSandbox || running || closingExperiment} onClick={() => void enableExperiment(true)}><FlaskConical size={15} /> Открыть песочницу</Button></span>{interactiveActive ? <Button aria-label="Остановить программу" variant="secondary" loading={running} onClick={() => void stopExperiment()}><Square size={14} fill="currentColor" /> Остановить</Button> : <Button aria-label="Компилировать и запустить код" variant="secondary" loading={running} disabled={!canUseSandbox || closingExperiment} onClick={() => void runExperiment()}><Play size={15} /> Запустить</Button>}</> : <><Button aria-label="Закрыть преподавательскую песочницу" variant="ghost" loading={closingExperiment} disabled={running} onClick={() => void closeExperimentMode()}><FlaskConical size={15} /> Закрыть песочницу</Button><Button variant="ghost" className="review-compare-toggle" aria-pressed={diffOpen} title={diffOpen ? 'Сравнение включено. Нажмите ещё раз, чтобы вернуться к редактору.' : 'Сравнить с исходным кодом студента'} onClick={() => setDiffOpen((value) => !value)}><GitCompareArrows size={16} /> Сравнить</Button>{interactiveActive ? <Button aria-label="Остановить программу" variant="secondary" loading={running} onClick={() => void stopExperiment()}><Square size={14} fill="currentColor" /> Остановить</Button> : <Button aria-label="Компилировать и запустить код" variant="secondary" loading={running} disabled={!canUseSandbox || closingExperiment} onClick={() => void runExperiment()}><Play size={15} /> Запустить</Button>}</>}{reviewedReadOnly ? submission.canReview !== false ? <Button loading={rechecking} disabled={foreignClaim} onClick={() => void startRecheck()}><RotateCcw size={16} /> Перепроверить</Button> : <Badge>Только просмотр</Badge> : <Button onClick={() => setDecisionOpen(true)} disabled={!canReview || grade === '' || Number(grade) < 0 || Number(grade) > submission.maxScore}><Check size={16} /> Утвердить</Button>}</div>
+      <div>{!experimentMode ? <><span className="sandbox-tooltip" data-tooltip="Изменения не затрагивают сдачу студента, историю авторства и проверку на плагиат"><Button aria-label="Открыть преподавательскую песочницу" title="Изменения не затрагивают сдачу студента, историю авторства и проверку на плагиат" variant="ghost" disabled={!canUseSandbox || running || closingExperiment} onClick={() => void enableExperiment(true)}><FlaskConical size={15} /> Открыть песочницу</Button></span>{interactiveActive ? <Button aria-label="Остановить программу" variant="secondary" loading={running} onClick={() => void stopExperiment()}><Square size={14} fill="currentColor" /> Остановить</Button> : <Button aria-label="Компилировать и запустить код" variant="secondary" loading={running} disabled={!canUseSandbox || closingExperiment} onClick={() => void runExperiment()}><Play size={15} /> Запустить</Button>}</> : <><Button aria-label="Закрыть преподавательскую песочницу" variant="ghost" loading={closingExperiment} disabled={running} onClick={() => void closeExperimentMode()}><FlaskConical size={15} /> Закрыть песочницу</Button><Button variant="ghost" className="review-compare-toggle" aria-pressed={diffOpen} title={diffOpen ? 'Сравнение включено. Нажмите ещё раз, чтобы вернуться к редактору.' : 'Сравнить с исходным кодом студента'} onClick={() => setDiffOpen((value) => !value)}><GitCompareArrows size={16} /> Сравнить</Button>{interactiveActive ? <Button aria-label="Остановить программу" variant="secondary" loading={running} onClick={() => void stopExperiment()}><Square size={14} fill="currentColor" /> Остановить</Button> : <Button aria-label="Компилировать и запустить код" variant="secondary" loading={running} disabled={!canUseSandbox || closingExperiment} onClick={() => void runExperiment()}><Play size={15} /> Запустить</Button>}</>}{reviewedReadOnly ? submission.canReview !== false ? <Button loading={rechecking} disabled={foreignClaim} onClick={() => void startRecheck()}><RotateCcw size={16} /> Перепроверить</Button> : <Badge>Только просмотр</Badge> : !mobile && !submission.claim && !finalDecision && submission.canReview !== false && reviewRequired ? <Button loading={rechecking} onClick={() => void startRecheck()}><UserCheck size={16} /> Начать проверку</Button> : <Button onClick={() => setDecisionOpen(true)} disabled={!canReview || grade === '' || Number(grade) < 0 || Number(grade) > submission.maxScore}><Check size={16} /> Утвердить</Button>}</div>
     </header>
     {reviewGroupItems.length > 1 && <nav className="review-question-switcher" aria-label="Задания в ответе студента">
       <div className="review-question-switcher__heading"><span>Ответ студента</span><strong>{submission.reviewGroup?.title ?? 'Задания Moodle'}</strong><small>Задание {activeGroupIndex + 1} из {reviewGroupItems.length}</small></div>
@@ -755,7 +772,8 @@ function SubmissionReview({ submissionId, prefetchedGroupedReview, pendingAiRevi
       </div>
       <button type="button" className="review-question-switcher__step" aria-label="Следующее задание" disabled={activeGroupIndex < 0 || activeGroupIndex >= reviewGroupItems.length - 1 || Boolean(switchingSubmissionId)} onClick={() => void openGroupedSubmission(reviewGroupItems[activeGroupIndex + 1]?.submissionId)}><ChevronRight size={17} /></button>
     </nav>}
-    <div className={cn('review-layout', !reviewPanelOpen && 'review-layout--review-collapsed', aiExpanded && evidenceTab === 'ai' && reviewPanelOpen && 'review-layout--ai-expanded')}><section className="review-code"><div className="submission-meta"><span><strong>Сдано {formatDate(submission.submittedAt)}</strong><small>Неизменяемый снимок · {submission.files.length} файл</small></span><div className="submission-meta__actions"><AiHighlightsToggle report={aiReview.report} checked={aiHighlights} onChange={setAiHighlights} onStart={() => void startAiReview()} starting={aiReview.starting} error={aiReview.error} originalVisible={!experimentMode} />{!experimentMode && <Badge tone="success"><ShieldCheck size={13} /> Оригинал</Badge>}{experiment?.changed && experimentMode && <Badge tone="warning">Есть изменения</Badge>}</div></div>
+    {mobile && <div className="workspace-mobile-tabs" role="group" aria-label="Разделы сдачи">{(['code', 'task', 'history', 'ai'] as const).map((id) => <button type="button" key={id} aria-pressed={mobilePanel === id} onClick={() => { setMobilePanel(id); setReviewPanelOpen(true); if (id !== 'code') setEvidenceTab(id); }}>{id === 'code' ? 'Код' : id === 'task' ? 'Задание' : id === 'history' ? 'История' : 'ИИ'}</button>)}</div>}
+    <div className={cn('review-layout', !reviewPanelOpen && 'review-layout--review-collapsed', aiExpanded && evidenceTab === 'ai' && reviewPanelOpen && 'review-layout--ai-expanded')}><section className="review-code"><div className="submission-meta"><span><strong>Сдано {formatDate(submission.submittedAt)}</strong><small>Код на момент сдачи · {submission.files.length} файл</small></span><div className="submission-meta__actions"><AiHighlightsToggle report={aiReview.report} checked={aiHighlights} onChange={setAiHighlights} onStart={() => void startAiReview()} starting={aiReview.starting} error={aiReview.error} originalVisible={!experimentMode} />{!experimentMode && <Badge tone="success"><ShieldCheck size={13} /> Оригинал</Badge>}{experiment?.changed && experimentMode && <Badge tone="warning">Есть изменения</Badge>}</div></div>
       <div className={cn('review-editor-shell', !filesPanelOpen && 'review-editor-shell--files-collapsed')}>
         <aside className="review-files-rail workspace-files-rail" aria-label="Панель файлов">
           <button type="button" aria-label={filesPanelOpen ? 'Скрыть файлы' : 'Показать файлы'} title={diffOpen && experimentMode ? 'Файлы доступны в режиме редактора' : filesPanelOpen ? 'Скрыть панель файлов' : 'Показать панель файлов'} aria-expanded={filesPanelOpen && !(diffOpen && experimentMode)} aria-controls={diffOpen && experimentMode ? undefined : 'review-file-explorer'} disabled={diffOpen && experimentMode} onClick={() => setFilesPanelOpen((open) => !open)}>{filesPanelOpen ? <PanelLeftClose size={17} /> : <PanelLeftOpen size={17} />}</button>
@@ -764,16 +782,19 @@ function SubmissionReview({ submissionId, prefetchedGroupedReview, pendingAiRevi
         <div className="review-editor">{diffOpen && experimentMode ? <DiffWorkspace original={diffFiles.original?.content ?? ''} modified={diffFiles.modified?.content ?? ''} path={diffFiles.path} theme={theme} /> : <CodeWorkspace ref={editorRef} files={files} activeFileId={activeFileId} onActiveFile={setActiveFileId} onChange={(id, content) => changeExperimentFile(id, content)} readOnly={!editable} strictPaste={false} scopeId={experimentMode && experiment ? experiment.id : submission.id} intelligenceScope={experimentMode && experiment ? { kind: 'experiment', id: experiment.id } : { kind: 'submission', id: submission.id }} diagnostics={diagnostics} aiFindings={aiHighlights && !experimentMode && aiReview.report?.enabled && aiReview.report.state === 'COMPLETED' ? aiReview.report.findings : []} onAskAi={canAskTeacherAi && !experimentMode ? askAboutFinding : undefined} onAskAiSelection={canAskTeacherAi && !experimentMode ? askAboutSelection : undefined} experiment={experimentMode} explorerId="review-file-explorer" explorerVisible={filesPanelOpen} />}</div>
       </div>
       {consoleOpen && <div className="experiment-console"><header><strong>Консоль программы</strong><span>{interactiveRun ? interactiveStatusLabel(interactiveRun) : 'Готова к запуску'}</span>{diagnostics.length > 0 && <Badge tone="danger">{diagnostics.length} ошибка</Badge>}<Button className="experiment-console__close" size="sm" onClick={() => void closeConsole()}><X size={13} /> Закрыть</Button></header><div className="experiment-console__output">{diagnostics.map((item) => <button key={item.id} onClick={() => editorRef.current?.openDiagnostic(item)}><AlertTriangle size={14} /><span><strong>{item.message}</strong><small>{item.path}:{item.line}:{item.column}</small></span><ChevronRight size={15} /></button>)}{interactiveRun && <ConsoleTranscript sessionId={interactiveRun.sessionId} stdout={interactiveRun.stdout} inputs={consoleInputs} />}{interactiveRun?.stderr && <pre className="is-stderr">{interactiveRun.stderr}</pre>}{interactiveRun?.outputTruncated && <p>Вывод остановлен: достигнут установленный лимит.</p>}{!interactiveRun && <p>Нажмите «Запустить». Если программа запросит данные, введите одну строку ниже и нажмите Enter.</p>}{interactiveRun?.terminal && !interactiveRun.stdout && !interactiveRun.stderr && consoleInputs.length === 0 && diagnostics.length === 0 && <p>Программа завершена без вывода.</p>}</div><form className="experiment-console__input" onSubmit={(event) => { event.preventDefault(); void sendExperimentInput(); }}><input aria-label="Ввод программы" value={interactiveInput} onChange={(event) => setInteractiveInput(event.target.value)} disabled={!interactiveInputOpen} maxLength={65_536} autoComplete="off" spellCheck={false} placeholder={interactiveRun?.terminal ? 'Программа завершена' : interactiveInputOpen ? 'Введите строку и нажмите Enter' : 'Сначала запустите программу'} /><button type="submit" aria-label="Передать строку программе" disabled={!interactiveInputOpen || inputSending}><Send size={14} /> Отправить</button></form></div>}
-    </section>{reviewPanelOpen ? <aside className="review-side"><div className="review-side__top"><button type="button" className="review-side__collapse" aria-label="Скрыть панель проверки" title="Скрыть панель проверки" onClick={() => setReviewPanelOpen(false)}><PanelRightClose size={16} /></button><div className="evidence-tabs" role="tablist" aria-label="Материалы проверки">{(['task', 'integrity', 'history', 'ai'] as EvidenceTab[]).map((id) => <button key={id} type="button" role="tab" aria-selected={evidenceTab === id} className={evidenceTab === id ? 'is-active' : ''} onClick={() => setEvidenceTab(id)}>{id === 'task' ? 'Задание' : id === 'integrity' ? 'Плагиат' : id === 'history' ? 'История' : 'ИИ'}</button>)}</div></div><div className={cn("evidence-body", evidenceTab === "ai" && "evidence-body--ai")}>
+    </section>{reviewPanelOpen || mobile ? <aside className={cn("review-side", !gradingVisible ? "review-side--no-grading" : !gradingExpanded && "review-side--grading-collapsed")}>{!mobile && <PaneResizer label="Ширина панели проверки" edge="left" value={reviewWidth} minimum={320} maximum={640} initial={420} onChange={setReviewWidth} />}<div className="review-side__top"><button type="button" className="review-side__collapse" aria-label="Скрыть панель проверки" title="Скрыть панель проверки" onClick={() => setReviewPanelOpen(false)}><PanelRightClose size={16} /></button><div className="evidence-tabs" role="tablist" aria-label="Материалы проверки">{(['task', 'integrity', 'history', 'ai'] as EvidenceTab[]).map((id) => <button key={id} type="button" role="tab" aria-selected={evidenceTab === id} className={evidenceTab === id ? 'is-active' : ''} onClick={() => setEvidenceTab(id)}>{id === 'task' ? 'Задание' : id === 'integrity' ? 'Плагиат' : id === 'history' ? 'История' : 'ИИ'}</button>)}</div></div><div className={cn("evidence-body", evidenceTab === "ai" && "evidence-body--ai")}>
       {Boolean(submission.sourceWarnings?.length) && <div className="review-source-warning" role="alert"><strong><AlertTriangle size={16} /> Сдача загружена не полностью</strong>{submission.sourceWarnings!.map((warning) => <div key={`${warning.code}:${warning.message}`}><p>{warning.message} Код: {warning.code}.</p>{warning.moodleUrl && <a href={warning.moodleUrl} target="_blank" rel="noopener noreferrer">Открыть ответ в Moodle</a>}</div>)}</div>}
       <EvidencePanel tab={evidenceTab} submission={submission} canUseDecisionSupport={canUseDecisionSupport} decisionSupportEnabled={decisionSupportEnabled} onOpenHistory={() => setEvidenceTab('history')} />
       <div className="review-ai-chat-slot" hidden={evidenceTab !== 'ai'}>{(aiOpened || evidenceTab === 'ai') && <TeacherAiChat key={submission.id} submissionId={submission.id} courseId={courseId} canSend={canAskTeacherAi} teacherComment={comment} draft={aiDraft} expanded={aiExpanded} onExpanded={setAiExpanded} />}</div></div>
-      <div className="grading-panel"><header><div><span className="eyebrow">Решение преподавателя</span><h2>Оценка и комментарий</h2></div><span>{reviewedReadOnly ? 'Утверждено' : canReview ? 'Черновик' : 'Только чтение'}</span></header>
+      <div className={cn('grading-panel', !gradingExpanded && 'grading-panel--collapsed')} hidden={!gradingVisible}>
+        {!mobile && gradingExpanded && <PaneResizer label="Высота формы оценки" edge="top" value={gradingHeight} minimum={200} maximum={600} initial={300} onChange={setGradingHeight} />}
+        <header className="grading-panel__heading"><h2 className="eyebrow"><button type="button" aria-expanded={gradingExpanded} aria-controls="review-grade-form" onClick={() => setGradingOpen(!gradingExpanded)}>Оценка и комментарий{gradingExpanded ? <ChevronDown size={17} /> : <ChevronUp size={17} />}</button></h2><span>{reviewedReadOnly ? 'Утверждено' : canReview ? 'Черновик' : 'Только чтение'}</span></header>
+        <div id="review-grade-form" className="grading-panel__body" hidden={!gradingExpanded}>
         <AiReviewFeedback report={aiReview.report} error={aiReview.error} starting={aiReview.starting} canRetry={!experimentMode && !leavingReview && !switchingSubmissionId} onRetry={() => void startAiReview()} />
         {!finalDecision && submission.moodleFeedbackComment && <section className="moodle-feedback-comment" aria-label="Комментарий из Moodle"><strong>Комментарий преподавателя из Moodle · без балла</strong><p>{submission.moodleFeedbackComment}</p></section>}
-        <AiReviewRecommendation report={aiReview.report} maxScore={submission.maxScore} canApprove={submission.canReview !== false && reviewRequired && !foreignClaim && !finalizing && !switchingSubmissionId && !leavingReview && !decisionOpen} applying={applyingAi} onApprove={() => void applyAiRecommendation()} />
+        <AiReviewRecommendation report={aiReview.report} maxScore={submission.maxScore} canApprove={!mobile && submission.canReview !== false && reviewRequired && !foreignClaim && !finalizing && !switchingSubmissionId && !leavingReview && !decisionOpen} applying={applyingAi} onApprove={() => void applyAiRecommendation()} />
         {reviewedReadOnly && <div className="review-decision-meta"><CheckCircle2 size={16} /><span><strong>{finalDecision?.reviewerName ?? 'Преподаватель'}</strong><small>{finalDecision?.reviewedAt ? formatDate(finalDecision.reviewedAt) : 'Дата решения не предоставлена'}{finalDecision?.revision ? ` · версия ${finalDecision.revision}` : ''}{submission.decisionHistory.length > 1 ? ` · решений в истории: ${submission.decisionHistory.length}` : ''}</small></span>{finalDecision?.lmsExportState && <Badge tone={finalDecision.lmsExportState === 'DELIVERED' ? 'success' : finalDecision.lmsExportState === 'BLOCKED' || finalDecision.lmsExportState === 'FAILED' ? 'danger' : 'neutral'}>{lmsExportStateLabel(finalDecision.lmsExportState)}</Badge>}</div>}
-        <div className="grade-input"><Field label="Итоговый балл"><div><input type="number" min="0" max={submission.maxScore} disabled={!canReview} value={grade} onChange={(event) => { setGrade(event.target.value); setReviewDirty(true); }} /><span>/ {submission.maxScore}</span></div></Field></div><p className="no-recommendation">Оценка определяется преподавателем по доступным проверкам в приложении.</p><Field label={reviewedReadOnly ? 'Финальный комментарий студенту' : 'Комментарий студенту'}><textarea rows={8} disabled={!canReview} value={comment} onChange={(event) => { setComment(event.target.value); setReviewDirty(true); }} placeholder={reviewedReadOnly ? 'Комментарий не добавлен' : 'Объясните сильные стороны и что стоит исправить…'} /></Field>{canReview && <footer><Button variant="secondary" disabled={!validDraft || !reviewDirty || Boolean(switchingSubmissionId)} onClick={() => void saveDraft()}><Save size={15} /> Сохранить</Button><Button onClick={() => setDecisionOpen(true)} disabled={!validGrade}>Утвердить <ChevronRight size={15} /></Button></footer>}</div>
+        <div className="grade-input"><Field label="Итоговый балл"><div><input type="number" min="0" max={submission.maxScore} disabled={!canReview} value={grade} onChange={(event) => { setGrade(event.target.value); setReviewDirty(true); }} /><span>/ {submission.maxScore}</span></div></Field></div><p className="no-recommendation">В Moodle отправятся балл и комментарий из этой формы.</p><Field label={reviewedReadOnly ? 'Финальный комментарий студенту' : 'Комментарий студенту'}><textarea rows={4} disabled={!canReview} value={comment} onChange={(event) => { setComment(event.target.value); setReviewDirty(true); }} placeholder={reviewedReadOnly ? 'Комментарий не добавлен' : 'Объясните сильные стороны и что стоит исправить…'} /></Field>{canReview && <footer><Button variant="secondary" disabled={!validDraft || !reviewDirty || Boolean(switchingSubmissionId)} onClick={() => void saveDraft()}><Save size={15} /> Сохранить черновик</Button><Button onClick={() => setDecisionOpen(true)} disabled={!validGrade}>Утвердить <ChevronRight size={15} /></Button></footer>}</div></div>
     </aside> : <aside className="review-side-rail" aria-label="Панель проверки скрыта"><button type="button" aria-label="Показать панель проверки" title="Показать панель проверки" onClick={() => setReviewPanelOpen(true)}><PanelRightOpen size={17} /></button><span aria-hidden="true">Проверка</span></aside>}</div>
     <Modal open={decisionOpen} title="Утвердить решение" onClose={closeDecision} footer={<><Button variant="ghost" disabled={finalizing} onClick={closeDecision}>Отмена</Button><Button loading={finalizing} onClick={() => void finalize()}><CheckCircle2 size={16} /> Утвердить и отправить</Button></>}>
       <div className="decision-summary"><span className="decision-grade">{grade}<small>/{submission.maxScore}</small></span><div><strong>{submission.studentName}</strong><p>{comment || 'Комментарий не добавлен'}</p></div></div>
