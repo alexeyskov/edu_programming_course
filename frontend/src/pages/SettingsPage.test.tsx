@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   updateSettings: vi.fn(),
   getHealth: vi.fn(),
   getCourseCatalog: vi.fn(),
+  updateCourseComment: vi.fn(),
   createCourseImport: vi.fn(),
   confirmCourseImport: vi.fn(),
   deleteCourseCatalogEntry: vi.fn(),
@@ -46,6 +47,7 @@ vi.mock('../lib/api', async (importOriginal) => {
     updateSettings: mocks.updateSettings,
     getHealth: mocks.getHealth,
     getCourseCatalog: mocks.getCourseCatalog,
+    updateCourseComment: mocks.updateCourseComment,
     createCourseImport: mocks.createCourseImport,
     confirmCourseImport: mocks.confirmCourseImport,
     deleteCourseCatalogEntry: mocks.deleteCourseCatalogEntry,
@@ -159,6 +161,9 @@ beforeEach(() => {
   });
   mocks.getHealth.mockResolvedValue({ status: 'ok', database: 'ok', build: 'test' });
   mocks.getCourseCatalog.mockResolvedValue([course]);
+  mocks.updateCourseComment.mockImplementation(async (_courseId: string, comment: string) => ({
+    ...course, comment: comment.trim().replace(/\s+/g, ' '),
+  }));
   mocks.deleteCourseCatalogEntry.mockResolvedValue(undefined);
   mocks.getTeacherTokens.mockResolvedValue([]);
   mocks.revealTeacherToken.mockResolvedValue({ token: issuedTeacherToken.token });
@@ -447,6 +452,80 @@ describe('administrator teacher token pool', () => {
 afterEach(cleanup);
 
 describe('administrator course catalog settings', () => {
+  async function openCommentEditor() {
+    fireEvent.click(await screen.findByRole('button', { name: /Изменить комментарий к курсу/ }));
+    return screen.getByRole('dialog', { name: 'Комментарий к курсу' });
+  }
+
+  it('saves a local course comment quietly and displays it beside the unchanged title', async () => {
+    renderSettings();
+    const dialog = await openCommentEditor();
+    const input = within(dialog).getByLabelText('Комментарий к курсу');
+    expect(input).toHaveAttribute('maxlength', '255');
+    fireEvent.change(input, { target: { value: 'Осень 2026' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Сохранить' }));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Комментарий к курсу' })).not.toBeInTheDocument());
+    expect(mocks.updateCourseComment).toHaveBeenCalledWith(course.id, 'Осень 2026');
+    const note = screen.getByText('Осень 2026');
+    expect(note).toHaveClass('course-title__comment');
+    expect(note.closest('strong')).toHaveTextContent(course.title);
+    expect(mocks.updateSettings).not.toHaveBeenCalled();
+    expect(screen.queryByText('Комментарий сохранён')).not.toBeInTheDocument();
+  });
+
+  it('clears an existing comment and keeps the course in the catalog', async () => {
+    mocks.getCourseCatalog.mockResolvedValue([{ ...course, comment: 'Весна 2026' }]);
+    renderSettings();
+    const dialog = await openCommentEditor();
+    const input = within(dialog).getByLabelText('Комментарий к курсу');
+    expect(input).toHaveValue('Весна 2026');
+    fireEvent.change(input, { target: { value: '' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Сохранить' }));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Комментарий к курсу' })).not.toBeInTheDocument());
+    expect(mocks.updateCourseComment).toHaveBeenCalledWith(course.id, '');
+    expect(screen.queryByText('Весна 2026')).not.toBeInTheDocument();
+    expect(screen.getByText(course.title)).toBeInTheDocument();
+    expect(mocks.deleteCourseCatalogEntry).not.toHaveBeenCalled();
+  });
+
+  it('does not save cancelled or unchanged edits', async () => {
+    renderSettings();
+    const dialog = await openCommentEditor();
+    expect(within(dialog).getByRole('button', { name: 'Сохранить' })).toBeDisabled();
+    fireEvent.change(within(dialog).getByLabelText('Комментарий к курсу'), { target: { value: 'Do not save' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Отмена' }));
+    const reopened = await openCommentEditor();
+    expect(within(reopened).getByLabelText('Комментарий к курсу')).toHaveValue('');
+    expect(mocks.updateCourseComment).not.toHaveBeenCalled();
+  });
+
+  it('retains a failed comment draft for retry', async () => {
+    mocks.updateCourseComment.mockRejectedValueOnce(new Error('Сервер недоступен'));
+    renderSettings();
+    const dialog = await openCommentEditor();
+    fireEvent.change(within(dialog).getByLabelText('Комментарий к курсу'), { target: { value: 'Осень 2026' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Сохранить' }));
+    expect(await within(dialog).findByText('Сервер недоступен')).toBeInTheDocument();
+    expect(within(dialog).getByLabelText('Комментарий к курсу')).toHaveValue('Осень 2026');
+    expect(within(dialog).getByRole('button', { name: 'Сохранить' })).toBeEnabled();
+    expect(document.querySelector('.system-course-title .course-title__comment')).toBeNull();
+  });
+
+  it('blocks duplicate saves and closing while the comment request is pending', async () => {
+    const pending = deferred<CourseCatalogEntry>();
+    mocks.updateCourseComment.mockReturnValueOnce(pending.promise);
+    renderSettings();
+    const dialog = await openCommentEditor();
+    fireEvent.change(within(dialog).getByLabelText('Комментарий к курсу'), { target: { value: 'Осень 2026' } });
+    const form = within(dialog).getByLabelText('Комментарий к курсу').closest('form')!;
+    fireEvent.submit(form); fireEvent.submit(form);
+    expect(mocks.updateCourseComment).toHaveBeenCalledTimes(1);
+    expect(within(dialog).getByLabelText('Комментарий к курсу')).toBeDisabled();
+    expect(within(dialog).getByRole('button', { name: 'Отмена' })).toBeDisabled();
+    pending.resolve({ ...course, comment: 'Осень 2026' });
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Комментарий к курсу' })).not.toBeInTheDocument());
+  });
+
   it('shows the global course name, LMS connection and external id', async () => {
     renderSettings();
 

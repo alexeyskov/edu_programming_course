@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup, Tag
 
 from .config import exact_https_origin
 from .parsers import MoodleMarkupError
+from .statements import statement_node_content
 
 QUIZ_START_FORM_SELECTOR = "form[action*='startattempt.php']"
 QUIZ_DIRECT_START_FORM_SELECTOR = "form[action*='startattempt.php']:not(#mod_quiz_preflight_form)"
@@ -85,6 +86,7 @@ class QuizAttempt:
     page: int = 0
     question_max_mark: float | None = None
     questions: tuple[QuizAttempt, ...] = ()
+    question_text_legacy_hashes: tuple[str, ...] = ()
 
 
 def essay_slot_selector(slot: str) -> str:
@@ -345,7 +347,9 @@ def parse_attempt_page(
     question_nodes = essay.select(".qtext")
     if len(question_nodes) > 1:
         raise MoodleMarkupError("Moodle essay question text is ambiguous")
-    question_text = _text(question_nodes[0], maximum=50_000) if question_nodes else ""
+    question_statement = statement_node_content(
+        question_nodes[0] if question_nodes else None, base_url=base_url
+    )
     managers = essay.select(".filemanager")
     if len(managers) > 1:
         raise MoodleMarkupError("Moodle essay file manager is ambiguous")
@@ -431,7 +435,8 @@ def parse_attempt_page(
         available_transports=tuple(transports),
         online_text_control_name=control_name,
         attachment_urls=tuple(sorted(attachment_urls)),
-        question_text=question_text,
+        question_text=question_statement.text,
+        question_text_legacy_hashes=question_statement.legacy_hashes,
         remaining_seconds=_remaining_seconds(html, soup),
         page=int(pages[0]),
         question_max_mark=mark_max,

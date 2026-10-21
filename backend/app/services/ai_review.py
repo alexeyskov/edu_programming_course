@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import timedelta
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -163,19 +163,113 @@ async def enqueue_ai_code_review(
     return report
 
 
+def _feedback_remote_attempt_id(value: object) -> str | None:
+    """Only numeric Quiz IDs have the documented ``attempt:`` spelling alias."""
+    if isinstance(value, bool) or not isinstance(value, str | int):
+        return None
+    raw = str(value).strip()
+    if not raw or len(raw) > 160:
+        return None
+    numeric = raw.removeprefix("attempt:")
+    if numeric.isascii() and numeric.isdecimal():
+        return str(int(numeric)) if int(numeric) > 0 else None
+    return raw  # Assignment/other opaque identities remain exact, not fuzzy aliases.
+
+
+async def _feedback_question_identity(
+    db: AsyncSession, submission: Submission, attempt: Attempt, assessment: Assessment,
+) -> tuple[uuid.UUID, str, str] | None:
+    """Resolve one parent activity, remote attempt and exact question slot.
+
+    Before delivery, a native Quiz receipt can be empty. The durable relation
+    and both pinned integrity policies must agree before filling that gap;
+    conflicting receipt fields never get overridden by a convenient fallback.
+    """
+    receipt = submission.external_receipt or {}
+    integrity = attempt.integrity_policy or {}
+    policy = assessment.policy or {}
+    question = await quiz_question_for_attempt(db, attempt.id)
+    parent_id = assessment.id
+    remote = _feedback_remote_attempt_id(receipt.get("moodle_parent_attempt_id"))
+    slot = str(receipt.get("moodle_response_id") or "").strip()
+    if question is not None:
+        root = await db.get(Attempt, question.root_attempt_id)
+        parent = await db.get(Assessment, root.assessment_id) if root is not None else None
+        root_integrity = (root.integrity_policy or {}) if root is not None else {}
+        pinned_remote = _feedback_remote_attempt_id(integrity.get("moodle_attempt_id"))
+        if (
+            root is None or parent is None
+            or attempt.state not in {"SUBMITTED", "AUTO_SUBMITTED", "LOCKED"}
+            or root.state not in {"SUBMITTED", "AUTO_SUBMITTED", "LOCKED"}
+            or root.principal_id != attempt.principal_id
+            or parent.course_id != assessment.course_id
+            or str(integrity.get("moodle_quiz_root_attempt_id")) != str(root.id)
+            or str(root_integrity.get("moodle_quiz_root_attempt_id")) != str(root.id)
+            or str(integrity.get("moodle_parent_assessment_id")) != str(parent.id)
+            or str(root_integrity.get("moodle_parent_assessment_id")) != str(parent.id)
+            or not pinned_remote or not pinned_remote.isascii() or not pinned_remote.isdecimal()
+            or pinned_remote != _feedback_remote_attempt_id(root_integrity.get("moodle_attempt_id"))
+            or (remote is not None and remote != pinned_remote)
+            or (slot and slot != question.question_slot)
+            or str(integrity.get("moodle_question_slot")) != question.question_slot
+        ):
+            return None
+        parent_id, remote, slot = parent.id, pinned_remote, question.question_slot
+    else:
+        if integrity.get("moodle_quiz_root_attempt_id"):
+            return None  # A textual root pointer without its durable relation is not proof.
+        raw_parent = policy.get("moodle_parent_assessment_id")
+        if raw_parent not in (None, ""):
+            try:
+                parent_id = uuid.UUID(str(raw_parent))
+            except (ValueError, TypeError, AttributeError):
+                return None
+        elif policy.get("moodle_quiz_question_split") is True:
+            return None
+        if parent_id != assessment.id:
+            parent = await db.get(Assessment, parent_id)
+            if parent is None or parent.course_id != assessment.course_id:
+                return None
+    for value in (
+        policy.get("moodle_parent_assessment_id"),
+        receipt.get("moodle_parent_assessment_id"),
+        integrity.get("moodle_parent_assessment_id"),
+    ):
+        if value not in (None, ""):
+            try:
+                if uuid.UUID(str(value)) != parent_id:
+                    return None
+            except (ValueError, TypeError, AttributeError):
+                return None
+    if (
+        not remote or not slot
+        or (policy.get("moodle_response_id") not in (None, "", slot))
+        or (receipt.get("moodle_parent_attempt_id") not in (None, "")
+            and _feedback_remote_attempt_id(receipt["moodle_parent_attempt_id"]) != remote)
+    ):
+        return None
+    return parent_id, remote, slot
+
+
 async def has_teacher_review(db: AsyncSession, submission: Submission) -> bool:
     """Human decisions (including a zero mark or comment-only Moodle feedback) win."""
+    own_feedback = (submission.external_receipt or {}).get("moodle_review") or {}
+    if own_feedback.get("grade") is not None or str(own_feedback.get("comment") or "").strip():
+        return True
     candidates = [submission]
-    receipt = submission.external_receipt or {}
-    remote_attempt = receipt.get("moodle_parent_attempt_id")
-    slot = receipt.get("moodle_response_id")
     attempt = await db.get(Attempt, submission.attempt_id)
     assessment = await db.get(Assessment, attempt.assessment_id) if attempt else None
-    if remote_attempt and slot and attempt is not None and assessment is not None:
+    identity = (
+        await _feedback_question_identity(db, submission, attempt, assessment)
+        if attempt is not None and assessment is not None and attempt.state != "VOID"
+        else None
+    )
+    if identity is not None:
+        parent_id, remote, slot = identity
         # Native Quiz answers and their Moodle read-backs have different local
         # IDs. A reviewed read-back must also prevent backfilling AI on its twin.
-        candidates.extend((await db.scalars(
-            select(Submission)
+        rows = (await db.execute(
+            select(Submission, Attempt, Assessment)
             .join(Attempt, Attempt.id == Submission.attempt_id)
             .join(Assessment, Assessment.id == Attempt.assessment_id)
             .where(
@@ -184,11 +278,22 @@ async def has_teacher_review(db: AsyncSession, submission: Submission) -> bool:
                 Attempt.state != "VOID",
                 Attempt.principal_id == attempt.principal_id,
                 Assessment.course_id == assessment.course_id,
-                Submission.external_receipt["moodle_parent_attempt_id"].as_string()
-                == str(remote_attempt),
+                or_(
+                    Assessment.id == parent_id,
+                    Assessment.policy["moodle_parent_assessment_id"].as_string() == str(parent_id),
+                ),
                 Submission.external_receipt["moodle_response_id"].as_string() == str(slot),
             )
-        )).all())
+        )).all()
+        for imported, imported_attempt, imported_assessment in rows:
+            if _feedback_remote_attempt_id(
+                (imported.external_receipt or {}).get("moodle_parent_attempt_id")
+            ) != remote:
+                continue
+            if await _feedback_question_identity(
+                db, imported, imported_attempt, imported_assessment,
+            ) == identity:
+                candidates.append(imported)
     for candidate in candidates:
         feedback = (candidate.external_receipt or {}).get("moodle_review") or {}
         if feedback.get("grade") is not None or str(feedback.get("comment") or "").strip():

@@ -170,6 +170,9 @@ async def test_new_submission_defaults_to_advisory_review_and_respects_opt_out(d
         assert reports[0].submission_id == submission.id
         assert reports[0].snapshot_id == submission.snapshot_id
         assert reports[0].state == "QUEUED"
+        assert reports[0].manual_requested is False
+        assert reports[0].approved_decision_id is None
+    assert await db.scalar(select(func.count()).select_from(ReviewDecision)) == 0
     assert await db.scalar(select(func.count()).select_from(SyncOutbox)) >= 1
 
 
@@ -235,7 +238,7 @@ async def test_worker_analyzes_committed_submission_without_opening_review(
 
 async def test_multi_question_submission_enqueues_each_snapshot_using_parent_policy(db):
     student, _, assessment, root, questions = await _start_multi_quiz(db)
-    assessment.ai_review_enabled = True
+    assert assessment.ai_review_enabled is True
     await submit_attempt(
         db, attempt_id=root.id, principal_id=student.id, expected_revision=0,
     )
@@ -271,7 +274,7 @@ async def test_history_import_and_changed_snapshot_enqueue_without_duplicate_job
     async with session_factory() as db, db.begin():
         course = await db.get(Course, ids["course_id"])
         assessment = await db.get(Assessment, ids["assessment_id"])
-        assessment.ai_review_enabled = True
+        assert assessment.ai_review_enabled is True
         created = await materialize_historical_submissions(
             db, course=course, assessment=assessment, actor_external_subject="42",
             items=[history_item()],

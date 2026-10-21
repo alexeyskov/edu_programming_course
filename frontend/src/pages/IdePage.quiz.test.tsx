@@ -12,7 +12,7 @@ const mocks = vi.hoisted(() => ({
   startInteractiveAttempt: vi.fn(), getInteractiveAttempt: vi.fn(), stopInteractiveAttempt: vi.fn(),
   submitAttempt: vi.fn(), retryAttemptSubmission: vi.fn(),
   createClipboardReceipt: vi.fn(), workspaceProps: vi.fn(),
-  createStudentAiThread: vi.fn(), sendAiMessage: vi.fn(),
+  createStudentAiThread: vi.fn(), sendAiMessageStream: vi.fn(),
 }));
 
 vi.mock('../lib/api', () => ({
@@ -98,7 +98,7 @@ beforeEach(() => {
   mocks.getHistory.mockResolvedValue([]);
   mocks.createClipboardReceipt.mockResolvedValue({ id: 'clipboard-receipt' });
   mocks.createStudentAiThread.mockImplementation(async (id: string) => ({ id: `ai-${id}` }));
-  mocks.sendAiMessage.mockResolvedValue({ content: 'Проверьте границы массива.', citations: [] });
+  mocks.sendAiMessageStream.mockResolvedValue({ content: 'Проверьте границы массива.', citations: [] });
   mocks.resolveCourseId.mockResolvedValue('course-1');
   mocks.saveFile.mockImplementation(async (...args: Parameters<typeof saveToServer>) => saveToServer(...args));
   mocks.startInteractiveAttempt.mockImplementation(async (id: string) => runningSession(id));
@@ -130,17 +130,17 @@ describe('student Moodle quiz question workspaces', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Отправить' }));
     await waitFor(() => expect(mocks.saveFile).toHaveBeenCalled());
     expect(mocks.createStudentAiThread).not.toHaveBeenCalled();
-    expect(mocks.sendAiMessage).not.toHaveBeenCalled();
+    expect(mocks.sendAiMessageStream).not.toHaveBeenCalled();
     await act(async () => pendingSave.resolve());
     await screen.findByText('Проверьте границы массива.');
     expect(mocks.createStudentAiThread).toHaveBeenCalledWith('question-1', 'course-1', 2);
-    expect(mocks.sendAiMessage).toHaveBeenCalledWith('ai-question-1', 'Почему такой результат?', { revision: 2 });
+    expect(mocks.sendAiMessageStream).toHaveBeenCalledWith('ai-question-1', 'Почему такой результат?', { revision: 2 }, expect.anything());
     expect(attempts.get('question-1')!.files.map((file) => file.content)).toEqual(['// latest main', '// latest helper']);
 
     fireEvent.change(screen.getByLabelText('Код решения'), { target: { value: '// revised helper' } });
     fireEvent.change(screen.getByPlaceholderText('Ваш вопрос…'), { target: { value: 'А теперь?' } });
     fireEvent.click(screen.getByRole('button', { name: 'Отправить' }));
-    await waitFor(() => expect(mocks.sendAiMessage).toHaveBeenLastCalledWith('ai-question-1', 'А теперь?', { revision: 3 }));
+    await waitFor(() => expect(mocks.sendAiMessageStream).toHaveBeenLastCalledWith('ai-question-1', 'А теперь?', { revision: 3 }, expect.anything()));
     expect(mocks.createStudentAiThread).toHaveBeenCalledTimes(1);
   });
 
@@ -154,18 +154,18 @@ describe('student Moodle quiz question workspaces', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Отправить' }));
     await screen.findByText(/Помощник сейчас недоступен: Не удалось сохранить код/);
     expect(mocks.createStudentAiThread).not.toHaveBeenCalled();
-    expect(mocks.sendAiMessage).not.toHaveBeenCalled();
+    expect(mocks.sendAiMessageStream).not.toHaveBeenCalled();
   });
 
   it('isolates AI chats and late responses when changing the current question', async () => {
     for (const attempt of attempts.values()) attempt.aiEnabled = true;
     const pendingAnswer = deferred<{ content: string; citations: [] }>();
-    mocks.sendAiMessage.mockReturnValueOnce(pendingAnswer.promise);
+    mocks.sendAiMessageStream.mockReturnValueOnce(pendingAnswer.promise);
     renderQuiz(); await screen.findByLabelText('Код решения');
     fireEvent.click(screen.getByRole('button', { name: 'Помощь ИИ' }));
     fireEvent.change(screen.getByPlaceholderText('Ваш вопрос…'), { target: { value: 'Вопрос о строках' } });
     fireEvent.click(screen.getByRole('button', { name: 'Отправить' }));
-    await waitFor(() => expect(mocks.sendAiMessage).toHaveBeenCalledWith('ai-question-1', 'Вопрос о строках', { revision: 0 }));
+    await waitFor(() => expect(mocks.sendAiMessageStream).toHaveBeenCalledWith('ai-question-1', 'Вопрос о строках', { revision: 0 }, expect.anything()));
 
     fireEvent.click(screen.getByRole('tab', { name: 'Задача 2 Массивы' }));
     await screen.findByText('Условие задачи 2');
@@ -175,7 +175,7 @@ describe('student Moodle quiz question workspaces', () => {
     expect(screen.queryByText('Старый ответ о строках')).not.toBeInTheDocument();
     fireEvent.change(screen.getByPlaceholderText('Ваш вопрос…'), { target: { value: 'Вопрос о массивах' } });
     fireEvent.click(screen.getByRole('button', { name: 'Отправить' }));
-    await waitFor(() => expect(mocks.sendAiMessage).toHaveBeenLastCalledWith('ai-question-2', 'Вопрос о массивах', { revision: 0 }));
+    await waitFor(() => expect(mocks.sendAiMessageStream).toHaveBeenLastCalledWith('ai-question-2', 'Вопрос о массивах', { revision: 0 }, expect.anything()));
     expect(mocks.createStudentAiThread).toHaveBeenLastCalledWith('question-2', 'course-1', 0);
   });
 

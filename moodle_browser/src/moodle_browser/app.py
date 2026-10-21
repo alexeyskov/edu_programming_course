@@ -30,6 +30,8 @@ from .models import (
     QuizEssayPrepareResponse,
     QuizEssaySyncRequest,
     QuizEssaySyncResponse,
+    SessionKeepaliveRequest,
+    SessionKeepaliveResponse,
 )
 from .security import AuthenticationError, ReplayError, RequestAuthenticator
 from .service import (
@@ -284,6 +286,17 @@ def create_app(
             )
         except TimeoutError as exc:
             raise BrowserUnavailable("Moodle login exceeded its bounded deadline") from exc
+
+    @application.post(
+        "/internal/v1/moodle/session/keepalive",
+        response_model=SessionKeepaliveResponse,
+        dependencies=signature,
+    )
+    async def keepalive(payload: SessionKeepaliveRequest) -> SessionKeepaliveResponse:
+        try:
+            return await asyncio.wait_for(actual_service.keepalive(payload), timeout=20)
+        except TimeoutError as exc:
+            raise BrowserUnavailable("Moodle session keepalive exceeded its deadline") from exc
 
     @application.post(
         "/internal/v1/moodle/course/discover",

@@ -1,4 +1,5 @@
 import { Fragment } from 'react';
+import './consoleTranscript.css';
 
 export interface ConsoleInput {
   sessionId: string;

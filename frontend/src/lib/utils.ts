@@ -54,14 +54,23 @@ export const statusLabel: Record<AssessmentStatus, string> = {
   CLOSED: 'Закрыто',
 };
 
-export function assessmentDisplayStatus(item: Pick<Assessment, 'status' | 'publicationStatus' | 'policy' | 'availabilityRules'>): AssessmentStatus | 'DRAFT' {
-  // Revoking all Moodle groups keeps the published revision and past work,
-  // but no longer makes the assessment available. Missing rules in a student
-  // response are not the same thing as a teacher's explicitly empty rules.
-  if (item.publicationStatus === 'DRAFT' || (item.publicationStatus === 'PUBLISHED'
-    && item.policy?.moodle_metadata_read_only === true
-    && item.availabilityRules !== undefined
-    && !item.availabilityRules.some((rule) => rule.targetType === 'GROUP' && rule.allowed))) return 'DRAFT';
+type PublicationStateInput = Pick<Assessment, 'publicationStatus' | 'policy' | 'availabilityRules' | 'requiresLiveLmsPreparation'>;
+
+export function assessmentPublicationState(item: PublicationStateInput): Assessment['publicationStatus'] {
+  if (item.publicationStatus !== 'PUBLISHED' || item.availabilityRules === undefined) return item.publicationStatus;
+  // Mirror server access rules: Moodle requires selected groups and ignores
+  // obsolete individual/course rules. Native work with no rules is open to
+  // the course; explicit native rules can also grant access to individuals.
+  const managed = item.policy?.moodle_metadata_read_only === true || item.requiresLiveLmsPreparation === true;
+  const rules = managed ? item.availabilityRules.filter((rule) => rule.targetType === 'GROUP') : item.availabilityRules;
+  if ((managed || rules.length > 0) && !rules.some((rule) => rule.allowed)) return 'DRAFT';
+  return item.publicationStatus;
+}
+
+export function assessmentDisplayStatus(item: PublicationStateInput & Pick<Assessment, 'status'>): AssessmentStatus | 'DRAFT' {
+  // A published revision preserves historical submissions, not current access.
+  // Omitted rules in student responses are not an explicitly empty audience.
+  if (assessmentPublicationState(item) === 'DRAFT') return 'DRAFT';
   return item.status;
 }
 

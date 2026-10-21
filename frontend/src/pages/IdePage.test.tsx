@@ -84,6 +84,28 @@ beforeEach(() => {
 afterEach(() => { cleanup(); window.sessionStorage.clear(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe('student interactive console', () => {
+  it.each([false, true])('does not expose or request file-writing history with mobile=%s', async (mobile) => {
+    vi.stubGlobal('matchMedia', () => ({ matches: mobile, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    mocks.getHistory.mockResolvedValue([{ id: 'private-edit', type: 'edit', label: 'История изменения файла', at: '2026-08-26T10:00:00Z' }]);
+    renderPage();
+    await screen.findByTestId('code-workspace');
+    expect(mocks.getHistory).not.toHaveBeenCalled();
+    expect(screen.queryByRole('tab', { name: /История/ })).not.toBeInTheDocument();
+    expect(screen.queryByText('История изменения файла')).not.toBeInTheDocument();
+    if (mobile) fireEvent.click(screen.getByRole('button', { name: 'Консоль' }));
+    expect(screen.getByRole('tab', { name: 'Консоль' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: /Проблемы/ })).toBeInTheDocument();
+  });
+
+  it('renders student task images through the attempt-scoped proxy', async () => {
+    const url = 'https://edu.mmcs.sfedu.ru/filter/tex/pix.php/formula.png';
+    mocks.getAttempt.mockResolvedValue({ ...attempt, statement: `Вычислите сумму ![Формула суммы](<${url}>) для разных N.` });
+    renderPage();
+    expect(await screen.findByRole('img', { name: 'Формула суммы' })).toHaveAttribute('src', `/api/v1/statement-images/attempt/${attempt.id}?url=${encodeURIComponent(url)}`);
+    expect(screen.getByText('Вычислите сумму')).toBeInTheDocument();
+    expect(screen.getByText('для разных N.')).toBeInTheDocument();
+  });
+
   it('keeps mobile source read-only and does not start, save or submit a program', async () => {
     vi.stubGlobal('matchMedia', () => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
     renderPage();
@@ -141,8 +163,7 @@ describe('student interactive console', () => {
     expect(screen.getByText('30:00')).toBeInTheDocument();
   });
 
-  it('opens code without waiting for ancillary history or course lookups', async () => {
-    mocks.getHistory.mockImplementation(() => new Promise(() => undefined));
+  it('opens code without waiting for the ancillary course lookup', async () => {
     mocks.resolveCourseId.mockImplementation(() => new Promise(() => undefined));
     renderPage();
     expect(await screen.findByTestId('code-workspace')).toHaveAttribute('data-read-only', 'false');
@@ -152,12 +173,12 @@ describe('student interactive console', () => {
   });
 
   it('keeps the current code when reloading failed ancillary metadata', async () => {
-    mocks.getHistory.mockRejectedValueOnce(new Error('history unavailable')).mockResolvedValueOnce([]);
+    mocks.resolveCourseId.mockRejectedValueOnce(new Error('course unavailable')).mockResolvedValueOnce('course-1');
     renderPage();
     await screen.findByTestId('code-workspace');
     fireEvent.click(screen.getByRole('button', { name: 'Изменить файл' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Повторить загрузку дополнительных данных' }));
-    await waitFor(() => expect(mocks.getHistory).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(mocks.resolveCourseId).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(mocks.saveFile).toHaveBeenCalledOnce());
     expect(mocks.getAttempt).toHaveBeenCalledOnce();
     expect(mocks.saveFile).toHaveBeenCalledWith('attempt-1', expect.objectContaining({ content: 'int main() { return 1; }' }), 0, 'typing', undefined, undefined);
@@ -437,12 +458,86 @@ describe('student interactive console', () => {
     fireEvent.change(input, { target: { value: '42' } });
     fireEvent.submit(input.closest('form')!);
     await waitFor(() => expect(mocks.sendInteractiveAttemptInput).toHaveBeenCalledWith('attempt-1', 'a'.repeat(32), '42'));
-    expect(screen.queryByText('› 42')).not.toBeInTheDocument();
+    expect(await screen.findByText('› 42')).toBeVisible();
     expect(screen.getByRole('button', { name: 'Передать строку программе' })).toHaveTextContent('Отправить');
     expect(screen.queryByRole('button', { name: /EOF/ })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getAllByRole('button', { name: 'Остановить' })[0]);
     await waitFor(() => expect(mocks.stopInteractiveAttempt).toHaveBeenCalledWith('attempt-1', 'a'.repeat(32)));
+  });
+
+  it('keeps acknowledged stdin between prompts and output after the student program finishes', async () => {
+    let run: InteractiveRun = { ...runningSession(), stdout: 'Введите размер массива\n' };
+    mocks.startInteractiveAttempt.mockResolvedValue(run);
+    mocks.getInteractiveAttempt.mockImplementation(async () => run);
+    mocks.sendInteractiveAttemptInput.mockImplementation(async () => {
+      run = mocks.sendInteractiveAttemptInput.mock.calls.length === 1
+        ? { ...run, stdout: run.stdout + 'Введите элементы массива\n' }
+        : { ...run, status: 'SUCCESS', terminal: true, stdout: run.stdout + 'Итоговый массив: 1 2 3\n' };
+      return run;
+    });
+    const { container } = renderPage();
+    await screen.findByTestId('code-workspace');
+    fireEvent.click(screen.getByRole('button', { name: 'Запустить' }));
+    await screen.findByText('Введите размер массива');
+    const input = screen.getByLabelText('Ввод программы');
+    fireEvent.change(input, { target: { value: '3' } });
+    fireEvent.submit(input.closest('form')!);
+    await screen.findByText('Введите элементы массива');
+    fireEvent.change(input, { target: { value: '1 2 3' } });
+    fireEvent.submit(input.closest('form')!);
+    await screen.findByText('Итоговый массив: 1 2 3');
+    expect([...container.querySelectorAll('.student-console__output pre')].map((entry) => entry.textContent)).toEqual([
+      'Введите размер массива', '› 3', 'Введите элементы массива', '› 1 2 3', 'Итоговый массив: 1 2 3',
+    ]);
+    expect(input).toBeDisabled();
+    mocks.startInteractiveAttempt.mockResolvedValue(runningSession('new-session'));
+    fireEvent.click(screen.getByRole('button', { name: 'Запустить' }));
+    await waitFor(() => expect(mocks.startInteractiveAttempt).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText('› 1 2 3')).not.toBeInTheDocument();
+  });
+
+  it('echoes only acknowledged stdin, prevents double sends and preserves the next typed line', async () => {
+    mocks.sendInteractiveAttemptInput.mockRejectedValueOnce(new Error('Не удалось отправить строку'));
+    renderPage();
+    await screen.findByTestId('code-workspace');
+    fireEvent.click(screen.getByRole('button', { name: 'Запустить' }));
+    await screen.findByText('Введите число:');
+    const input = screen.getByLabelText('Ввод программы');
+    fireEvent.change(input, { target: { value: '3' } });
+    fireEvent.submit(input.closest('form')!);
+    await screen.findByText('Ввод не передан программе');
+    expect(screen.queryByText('› 3')).not.toBeInTheDocument();
+    expect(input).toHaveValue('3');
+    let resolveInput!: (value: InteractiveRun) => void;
+    mocks.sendInteractiveAttemptInput.mockImplementation(() => new Promise((resolve) => { resolveInput = resolve; }));
+    fireEvent.submit(input.closest('form')!);
+    fireEvent.submit(input.closest('form')!);
+    expect(mocks.sendInteractiveAttemptInput).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('button', { name: 'Передать строку программе' })).toBeDisabled();
+    fireEvent.change(input, { target: { value: '9' } });
+    await act(async () => resolveInput(runningSession()));
+    expect(screen.getAllByText('› 3')).toHaveLength(1);
+    expect(input).toHaveValue('9');
+  });
+
+  it('does not roll console output backwards when an older poll completes after stdin', async () => {
+    let resolvePoll!: (run: InteractiveRun) => void;
+    mocks.getInteractiveAttempt.mockReturnValueOnce(new Promise((resolve) => { resolvePoll = resolve; }));
+    const updated = { ...runningSession(), stdout: 'Введите число: Следующее число: ' };
+    mocks.sendInteractiveAttemptInput.mockResolvedValue(updated);
+    renderPage();
+    await screen.findByTestId('code-workspace');
+    fireEvent.click(screen.getByRole('button', { name: 'Запустить' }));
+    await screen.findByText('Введите число:');
+    await waitFor(() => expect(mocks.getInteractiveAttempt).toHaveBeenCalledOnce());
+    const input = screen.getByLabelText('Ввод программы');
+    fireEvent.change(input, { target: { value: '3' } });
+    fireEvent.submit(input.closest('form')!);
+    await screen.findByText('Следующее число:');
+    await act(async () => resolvePoll(runningSession()));
+    expect(screen.getByText('Следующее число:')).toBeVisible();
+    expect(screen.getByText('› 3')).toBeVisible();
   });
 
   it('reconnects to the same live session after a page reload', async () => {

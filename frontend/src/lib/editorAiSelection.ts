@@ -7,11 +7,11 @@ export interface AiCodeSelection {
   text: string;
 }
 interface SelectionConfig {
-  scopeId: string; path?: string; readOnly: boolean; experiment: boolean;
+  scopeId: string; path?: string; readOnly: boolean; experiment: boolean; allowEditable?: boolean;
   onAsk?(selection: AiCodeSelection): void;
 }
 
-/** Opt-in teacher-only action; selecting text never sends a model request. */
+/** Explicit opt-in for review or student workspaces; selection never sends a model request. */
 export function installAiSelectionAction(
   editor: Monaco.editor.IStandaloneCodeEditor,
   monaco: Pick<typeof Monaco, 'Uri'>,
@@ -35,7 +35,7 @@ export function installAiSelectionAction(
     const config = getConfig();
     const selection = editor.getSelection();
     const model = editor.getModel();
-    if (!config.readOnly || config.experiment || !config.onAsk || !config.path || !selection || selection.isEmpty() || !model) return null;
+    if ((!config.readOnly && !config.allowEditable) || config.experiment || !config.onAsk || !config.path || !selection || selection.isEmpty() || !model) return null;
     // Monaco canonicalizes custom URIs (inmemory:/// -> inmemory:/) and encodes paths.
     const expectedUri = monaco.Uri.parse(`inmemory:///${config.scopeId}/${config.path}`);
     if (model.uri.toString() !== expectedUri.toString()) return null;

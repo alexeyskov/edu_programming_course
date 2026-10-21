@@ -51,6 +51,7 @@ from app.services.moodle_attempt_reconciliation import (
     known_quiz_attempt_ids,
 )
 from app.services.moodle_attempt_selection import observe_moodle_attempt
+from app.services.moodle_statement_upgrade import is_statement_image_upgrade
 from app.services.submission_origin import historical_response_observations
 from app.services.teacher_tokens import teacher_membership_is_authorized
 from app.services.workspace import (
@@ -1731,6 +1732,102 @@ async def _mark_managed_quiz_as_split_container(
             task_item.archived_at = None
 
 
+async def _restore_imported_statement_images(
+    db: AsyncSession,
+    *,
+    course: Course,
+    assessment: Assessment,
+    submission: Submission,
+    attempt: Attempt,
+    attached_version: TaskVersion,
+    item: dict[str, Any],
+) -> None:
+    """Repair only the old image-loss format, without rematerializing answers.
+
+    Assignment intro images do not change Moodle's answer revision. A metadata
+    refresh creates a successor task version, but an unchanged historical
+    import normally retains its pinned predecessor. Rebind just that local
+    import when the new version differs *only* by formerly omitted images;
+    neither immutable versions nor code snapshots/reviews are modified.
+    """
+
+    if (
+        submission.source != "MOODLE_IMPORT"
+        or attempt.submission_source != "MOODLE_IMPORT"
+        or attempt.assessment_id != assessment.id
+        or attempt.assigned_task_version_id is None
+        or attempt.assigned_task_version_id == attached_version.id
+    ):
+        return
+    # Production applies already serialize the owning assessment. Also lock
+    # this imported attempt before changing its pinned version so a concurrent
+    # repair cannot act on a stale assignment; never refresh a live native
+    # attempt or its timer state here.
+    locked = await db.scalar(
+        select(Attempt).where(Attempt.id == attempt.id).with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if (
+        locked is None
+        or locked.submission_source != "MOODLE_IMPORT"
+        or locked.assessment_id != assessment.id
+        or locked.assigned_task_version_id is None
+        or locked.assigned_task_version_id == attached_version.id
+    ):
+        return
+    attempt = locked
+    previous = await db.get(TaskVersion, attempt.assigned_task_version_id)
+    if previous is None or previous.item_id != attached_version.item_id:
+        return
+    previous_policy = dict(previous.ai_policy or {})
+    current_policy = dict(attached_version.ai_policy or {})
+    if (
+        previous_policy.get("source") != "MOODLE_ACTIVITY"
+        or current_policy.get("source") != "MOODLE_ACTIVITY"
+        or previous_policy.get("moodle_metadata_read_only") is not True
+        or current_policy.get("moodle_metadata_read_only") is not True
+        or previous_policy.get("statement_format") is not None
+        or not is_statement_image_upgrade(previous.statement, attached_version.statement)
+    ):
+        return
+    previous_policy.pop("statement_format", None)
+    current_policy.pop("statement_format", None)
+    if previous_policy != current_policy or any(
+        getattr(previous, field) != getattr(attached_version, field)
+        for field in (
+            "title", "language", "language_standard", "multi_file", "starter_files",
+            "build_profile", "public_examples", "hidden_test_manifest", "max_score", "difficulty",
+            "authored_by_id",
+        )
+    ):
+        return
+    task = await db.get(TaskBankItem, previous.item_id)
+    if task is None or task.course_id != course.id:
+        return
+    module = str(item.get("module", "")).removeprefix("mod_").lower()
+    cmid = str(item.get("cmid", ""))
+    if module not in {"assign", "quiz"} or not cmid.isdigit():
+        return
+    external_types = (
+        {"mod_assign", "assign", "moodle_assignment", "moodle_mod_assign"}
+        if module == "assign"
+        else {"mod_quiz", "quiz", "moodle_quiz", "moodle_mod_quiz"}
+    )
+    activity = await db.scalar(select(ExternalMapping).where(
+        ExternalMapping.connection_id == course.connection_id,
+        ExternalMapping.local_id == assessment.id,
+        ExternalMapping.local_type.in_({"Assessment", "core.assessment"}),
+        ExternalMapping.external_type.in_(external_types),
+        ExternalMapping.external_id == cmid,
+    ))
+    if (
+        activity is None
+        or (activity.metadata_json or {}).get("managed_by") != "MOODLE_ACTIVITY_IMPORT"
+    ):
+        return
+    attempt.assigned_task_version_id = attached_version.id
+
+
 async def _materialize_flat_historical_submissions(
     db: AsyncSession,
     *,
@@ -1804,6 +1901,10 @@ async def _materialize_flat_historical_submissions(
             if submission is not None:
                 mapped_attempt = await db.get(Attempt, submission.attempt_id)
                 if mapped_attempt is not None:
+                    await _restore_imported_statement_images(
+                        db, course=course, assessment=assessment, submission=submission,
+                        attempt=mapped_attempt, attached_version=attached_version, item=item,
+                    )
                     _reactivate_retired_quiz_response(
                         mapping=mapping,
                         submission=submission,
@@ -2560,6 +2661,77 @@ async def enqueue_historical_submission_imports(
     return queued
 
 
+async def _reduce_inventory_confirmed_probes(
+    db: AsyncSession,
+    *,
+    course: Course,
+    assessment: Assessment,
+    actor_external_subject: str,
+    cmid: int,
+    manual_run_id: str,
+    scan_id: uuid.UUID,
+    confirmed_ids: set[str],
+) -> None:
+    """Do not re-probe identities proven present by this run's verified report.
+
+    A report may contain only the latest attempt for a student. Its presence
+    is evidence of existence, but absence is never evidence of deletion: keep
+    every unseen identity for the independent exact-ID checks. Lock only idle
+    probe jobs, skipping rows already claimed by a worker rather than changing
+    a request's payload while it is running.
+    """
+    if not confirmed_ids:
+        return
+    probes = await db.scalars(
+        select(SyncOutbox)
+        .where(
+            SyncOutbox.connection_id == course.connection_id,
+            SyncOutbox.course_id == course.id,
+            SyncOutbox.aggregate_type == "Assessment",
+            SyncOutbox.aggregate_id == assessment.id,
+            SyncOutbox.event_type == "moodle.history.import",
+            SyncOutbox.state.in_(["PENDING", "RETRY"]),
+            SyncOutbox.payload["course_id"].as_string() == course.external_id,
+            SyncOutbox.payload["actor_external_subject"].as_string()
+            == actor_external_subject,
+            SyncOutbox.payload["manual_run_id"].as_string() == manual_run_id,
+            SyncOutbox.payload["module"].as_string() == "quiz",
+            SyncOutbox.payload["cmid"].as_integer() == cmid,
+            SyncOutbox.payload["probe_only"].as_boolean().is_(True),
+        )
+        .with_for_update(skip_locked=True)
+        .execution_options(populate_existing=True)
+    )
+    now = utcnow()
+    for probe in probes:
+        payload = probe.payload or {}
+        known_ids = payload.get("known_attempt_ids")
+        if not isinstance(known_ids, list) or not all(
+            isinstance(value, str) for value in known_ids
+        ):
+            continue
+        remaining = [value for value in known_ids if value not in confirmed_ids]
+        if remaining == known_ids:
+            continue
+        probe.payload = {**payload, "known_attempt_ids": remaining}
+        probe.updated_at = now
+        if remaining:
+            continue
+        # Keep the audit row: no browser call or deletion inference occurred.
+        # This transition and the inventory's new detail jobs commit together.
+        probe.state = "DELIVERED"
+        probe.delivered_at = now
+        probe.last_error = ""
+        probe.locked_at = None
+        probe.receipt = {
+            "status": "DELIVERED",
+            "complete": True,
+            "warning_count": 0,
+            "existence_confirmed_by_inventory": len(known_ids),
+            "inventory_scan_id": str(scan_id),
+        }
+
+
 async def enqueue_historical_answer_reads(
     db: AsyncSession,
     *,
@@ -2581,6 +2753,17 @@ async def enqueue_historical_answer_reads(
     from app.integrations.moodle_browser import normalize_history_attempt_refs
 
     candidates = normalize_history_attempt_refs(candidates, module, maximum=500)
+    if module == "quiz" and manual_run_id:
+        await _reduce_inventory_confirmed_probes(
+            db,
+            course=course,
+            assessment=assessment,
+            actor_external_subject=actor_external_subject,
+            cmid=cmid,
+            manual_run_id=manual_run_id,
+            scan_id=scan_id,
+            confirmed_ids={ref["attempt_id"] for ref in candidates},
+        )
     now = utcnow()
     recent = list(
         (

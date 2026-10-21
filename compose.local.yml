@@ -18,6 +18,7 @@ services:
       SECURE_SSL_REDIRECT: "false"
       SECURE_HSTS_SECONDS: "0"
       ADMIN_TOKEN: ${ADMIN_TOKEN:-local-admin-token}
+      CODE_INTELLIGENCE_SHARED_SECRET: ${CODE_INTELLIGENCE_SHARED_SECRET:-local-only-code-intelligence-secret}
     depends_on:
       runner:
         condition: service_healthy
@@ -26,6 +27,11 @@ services:
   deadline-worker:
     environment:
       APP_DEBUG: "true"
+
+  code-intelligence:
+    environment:
+      # Disposable local profile only; production launcher generates a random key.
+      CODE_INTELLIGENCE_SHARED_SECRET: ${CODE_INTELLIGENCE_SHARED_SECRET:-local-only-code-intelligence-secret}
 
   sync-worker:
     environment:

@@ -9,6 +9,7 @@ import httpx
 from fastapi import APIRouter, Depends, Header, Query, Request, Response, status
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.api.attempts import (
     _edit_event_payload,
@@ -492,6 +493,19 @@ async def _submission_list_items(
 
 
 ReviewQueueGroupKey = tuple[uuid.UUID, str, uuid.UUID, uuid.UUID]
+ReviewGroupIdentity = tuple[ReviewQueueGroupKey, int]
+
+
+def _normalized_moodle_attempt_id(value: object) -> str | None:
+    # Only the documented numeric legacy spelling is an alias. Arbitrary
+    # opaque identifiers remain exact and are never merged by similarity.
+    raw = str(value or "").strip()
+    if not raw or len(raw) > 160:
+        return None
+    numeric = raw.removeprefix("attempt:")
+    if numeric.isascii() and numeric.isdecimal():
+        return str(int(numeric)) if int(numeric) > 0 else None
+    return raw
 
 
 def _review_queue_group_key(
@@ -508,23 +522,32 @@ def _review_queue_group_key(
     """
 
     receipt = dict(submission.external_receipt or {})
-    native_session = bool(dict(attempt.integrity_policy or {}).get("moodle_quiz_root_attempt_id"))
+    integrity = dict(attempt.integrity_policy or {})
+    native_session = bool(integrity.get("moodle_quiz_root_attempt_id"))
     if (
-        submission.source != "MOODLE_IMPORT" and not native_session
+        submission.source not in {"MOODLE_IMPORT", "MANUAL", "DEADLINE"}
+        or (submission.source != "MOODLE_IMPORT" and not native_session)
     ) or attempt.state == AttemptState.VOID.value:
         return None
-    parent_attempt_id = str(receipt.get("moodle_parent_attempt_id", "")).strip()
-    raw_parent_id = (
-        receipt.get("moodle_parent_assessment_id")
-        if native_session
-        else dict(assessment.policy or {}).get("moodle_parent_assessment_id")
-    )
+    parent_attempt_id = _normalized_moodle_attempt_id(receipt.get("moodle_parent_attempt_id"))
+    # A native Quiz's first question lives on the parent assessment itself.
+    # Its immutable receipt is therefore the only parent-assessment binding
+    # when a subsequent import reuses that submission. Queue and detail must
+    # use the same binding rather than require child-only assessment policy.
+    parent_bindings = [
+        value for value in (
+            receipt.get("moodle_parent_assessment_id"),
+            dict(assessment.policy or {}).get("moodle_parent_assessment_id"),
+            integrity.get("moodle_parent_assessment_id") if native_session else None,
+        ) if value not in (None, "")
+    ]
     try:
-        parent_assessment_id = uuid.UUID(str(raw_parent_id))
+        parent_ids = {uuid.UUID(str(value)) for value in parent_bindings}
     except (TypeError, ValueError, AttributeError):
         return None
-    if not parent_attempt_id:
+    if not parent_attempt_id or len(parent_ids) != 1:
         return None
+    parent_assessment_id = next(iter(parent_ids))
     return (
         parent_assessment_id,
         parent_attempt_id,
@@ -534,11 +557,104 @@ def _review_queue_group_key(
 
 
 def _review_queue_group_position(submission: Submission) -> int | None:
+    raw_position = dict(submission.external_receipt or {}).get("moodle_response_position")
+    if isinstance(raw_position, bool) or not isinstance(raw_position, str | int):
+        return None
     try:
-        position = int(dict(submission.external_receipt or {}).get("moodle_response_position"))
+        position = int(raw_position)
     except (TypeError, ValueError, OverflowError):
         return None
     return position if 1 <= position <= 1_000 else None
+
+
+async def _review_group_identities(
+    db: AsyncSession,
+    rows: list[tuple[Submission, Attempt, Assessment]],
+) -> dict[uuid.UUID, ReviewGroupIdentity]:
+    """Resolve exact Quiz identities even while LMS delivery is still pending.
+
+    A delivery receipt is not the source of truth for a locally pinned Quiz
+    session. Older submissions can have empty receipts until synchronization;
+    MoodleQuizQuestion plus both members' pinned integrity bindings already
+    prove their parent, remote attempt and question position. Read-only
+    projection repairs grouping without inventing receipts or changing data.
+    """
+
+    identities: dict[uuid.UUID, ReviewGroupIdentity] = {}
+    pending: list[tuple[Submission, Attempt, Assessment]] = []
+    for submission, attempt, assessment in rows:
+        key = _review_queue_group_key(submission, attempt, assessment)
+        position = _review_queue_group_position(submission)
+        if key is not None and position is not None:
+            identities[submission.id] = key, position
+        elif (
+            submission.source in {"MANUAL", "DEADLINE", "MOODLE_IMPORT"}
+            and attempt.state in {"SUBMITTED", "AUTO_SUBMITTED", "LOCKED"}
+            and dict(attempt.integrity_policy or {}).get("moodle_quiz_root_attempt_id")
+        ):
+            pending.append((submission, attempt, assessment))
+    if not pending:
+        return identities
+
+    root_attempt = aliased(Attempt)
+    root_assessment = aliased(Assessment)
+    bindings = {
+        question.attempt_id: (question, root, parent)
+        for question, root, parent in (
+            await db.execute(
+                select(MoodleQuizQuestion, root_attempt, root_assessment)
+                .join(root_attempt, root_attempt.id == MoodleQuizQuestion.root_attempt_id)
+                .join(root_assessment, root_assessment.id == root_attempt.assessment_id)
+                .where(MoodleQuizQuestion.attempt_id.in_([row[1].id for row in pending]))
+            )
+        ).all()
+    }
+    for submission, attempt, assessment in pending:
+        binding = bindings.get(attempt.id)
+        if binding is None:
+            continue
+        question, root, parent = binding
+        integrity = dict(attempt.integrity_policy or {})
+        root_integrity = dict(root.integrity_policy or {})
+        remote_id = _normalized_moodle_attempt_id(integrity.get("moodle_attempt_id"))
+        if (
+            root.state not in {"SUBMITTED", "AUTO_SUBMITTED", "LOCKED"}
+            or root.principal_id != attempt.principal_id
+            or parent.course_id != assessment.course_id
+            or str(integrity.get("moodle_quiz_root_attempt_id")) != str(root.id)
+            or str(root_integrity.get("moodle_quiz_root_attempt_id")) != str(root.id)
+            or str(integrity.get("moodle_parent_assessment_id")) != str(parent.id)
+            or str(root_integrity.get("moodle_parent_assessment_id")) != str(parent.id)
+            or not remote_id
+            or not remote_id.isascii()
+            or not remote_id.isdecimal()
+            or remote_id != _normalized_moodle_attempt_id(root_integrity.get("moodle_attempt_id"))
+        ):
+            continue
+        receipt = dict(submission.external_receipt or {})
+        defaults = {
+            "moodle_parent_assessment_id": str(parent.id),
+            "moodle_parent_attempt_id": remote_id,
+            "moodle_response_position": question.position,
+            "moodle_response_id": question.question_slot,
+        }
+        projected = Submission(
+            source=submission.source,
+            external_receipt={
+                **receipt,
+                **{key: value for key, value in defaults.items() if receipt.get(key) in (None, "")},
+            },
+        )
+        key = _review_queue_group_key(projected, attempt, assessment)
+        position = _review_queue_group_position(projected)
+        expected_key = (parent.id, remote_id, attempt.principal_id, assessment.course_id)
+        if (
+            key == expected_key
+            and position == question.position
+            and str(projected.external_receipt.get("moodle_response_id")) == question.question_slot
+        ):
+            identities[submission.id] = key, position
+    return identities
 
 
 def _quiz_response_duplicate_rank(
@@ -582,6 +698,7 @@ def _quiz_response_duplicate_rank(
 async def _review_queue_row_units(
     db: AsyncSession,
     rows: list[tuple[Submission, Attempt, Assessment, ExternalPrincipal]],
+    identities: dict[uuid.UUID, ReviewGroupIdentity],
 ) -> list[list[tuple[Submission, Attempt, Assessment, ExternalPrincipal]]]:
     """Build ordered queue units without loading claims, decisions or evidence.
 
@@ -592,8 +709,8 @@ async def _review_queue_row_units(
     """
 
     raw_keys = [
-        _review_queue_group_key(submission, attempt, assessment)
-        for submission, attempt, assessment, _student in rows
+        identities[submission.id][0] if submission.id in identities else None
+        for submission, _attempt, _assessment, _student in rows
     ]
     parent_ids = {key[0] for key in raw_keys if key is not None}
     parents = (
@@ -604,13 +721,12 @@ async def _review_queue_row_units(
     parents_by_id = {parent.id: parent for parent in parents}
     keyed_indexes: dict[ReviewQueueGroupKey, list[int]] = {}
     normalized_keys: list[ReviewQueueGroupKey | None] = []
-    for index, ((submission, _attempt, assessment, _student), key) in enumerate(
+    for index, ((_submission, _attempt, assessment, _student), key) in enumerate(
         zip(rows, raw_keys, strict=True)
     ):
         parent = parents_by_id.get(key[0]) if key is not None else None
         if (
             key is None
-            or _review_queue_group_position(submission) is None
             or parent is None
             or parent.course_id != assessment.course_id
         ):
@@ -622,7 +738,7 @@ async def _review_queue_row_units(
     valid_keys = {
         key
         for key, indexes in keyed_indexes.items()
-        if len({_review_queue_group_position(rows[index][0]) for index in indexes}) >= 2
+        if len({identities[rows[index][0].id][1] for index in indexes}) >= 2
     }
     emitted: set[ReviewQueueGroupKey] = set()
     units: list[list[tuple[Submission, Attempt, Assessment, ExternalPrincipal]]] = []
@@ -643,6 +759,7 @@ async def _collapse_submission_review_groups(
     *,
     rows: list[tuple[Submission, Attempt, Assessment, ExternalPrincipal]],
     items: list[SubmissionListItemRead],
+    identities: dict[uuid.UUID, ReviewGroupIdentity],
 ) -> list[SubmissionListItemRead]:
     """Collapse Quiz Essay children into queue units before API pagination."""
 
@@ -650,9 +767,9 @@ async def _collapse_submission_review_groups(
         raise DomainError(500, "SUBMISSION_QUEUE_INVALID", "Submission queue is inconsistent")
 
     parent_ids = {
-        key[0]
-        for submission, attempt, assessment, _student in rows
-        if (key := _review_queue_group_key(submission, attempt, assessment)) is not None
+        identities[submission.id][0][0]
+        for submission, _attempt, _assessment, _student in rows
+        if submission.id in identities
     }
     parents = (
         list((await db.scalars(select(Assessment).where(Assessment.id.in_(parent_ids)))).all())
@@ -666,9 +783,9 @@ async def _collapse_submission_review_groups(
         list[tuple[int, Submission, SubmissionListItemRead]],
     ] = {}
     row_keys: list[ReviewQueueGroupKey | None] = []
-    for (submission, attempt, assessment, _student), item in zip(rows, items, strict=True):
-        key = _review_queue_group_key(submission, attempt, assessment)
-        position = _review_queue_group_position(submission)
+    for (submission, _attempt, assessment, _student), item in zip(rows, items, strict=True):
+        identity = identities.get(submission.id)
+        key, position = identity if identity is not None else (None, None)
         parent = parents_by_id.get(key[0]) if key is not None else None
         if (
             key is None
@@ -862,7 +979,8 @@ async def list_submissions(
         if not is_completed_moodle_submission(row[0], row[1], row[2])
         or row[0].id in latest_moodle_ids
     ]
-    queue_units = await _review_queue_row_units(db, rows)
+    identities = await _review_group_identities(db, [(row[0], row[1], row[2]) for row in rows])
+    queue_units = await _review_queue_row_units(db, rows, identities)
     page_units = queue_units[offset : offset + limit]
     page_rows = [row for unit in page_units for row in unit]
     items = await _submission_list_items(
@@ -875,7 +993,9 @@ async def list_submissions(
     # Offset and limit are queue-unit coordinates.  Applying SQL pagination
     # before this collapse would split one Quiz attempt across pages and make
     # counters depend on page boundaries.
-    return await _collapse_submission_review_groups(db, rows=page_rows, items=items)
+    return await _collapse_submission_review_groups(
+        db, rows=page_rows, items=items, identities=identities,
+    )
 
 
 def _snapshot_file(snapshot: Snapshot, item: dict[str, Any]) -> WorkspaceFileRead:
@@ -1107,21 +1227,10 @@ async def _submission_review_group(
     similarly numbered quizzes and other students can never be mixed.
     """
 
-    receipt = dict(submission.external_receipt or {})
-    parent_attempt_id = str(receipt.get("moodle_parent_attempt_id", "")).strip()
-    policy = dict(assessment.policy or {})
-    raw_parent_id = receipt.get("moodle_parent_assessment_id") or policy.get(
-        "moodle_parent_assessment_id"
-    )
-    try:
-        parent_assessment_id = uuid.UUID(str(raw_parent_id))
-    except (TypeError, ValueError, AttributeError):
-        return None
-    if not parent_attempt_id:
-        return None
-
-    parent = await db.get(Assessment, parent_assessment_id)
-    if parent is None or parent.course_id != assessment.course_id:
+    if (
+        _review_queue_group_key(submission, attempt, assessment) is None
+        and not dict(attempt.integrity_policy or {}).get("moodle_quiz_root_attempt_id")
+    ):
         return None
     rows = list(
         (
@@ -1138,27 +1247,21 @@ async def _submission_review_group(
             )
         ).all()
     )
+    identities = await _review_group_identities(db, rows)
+    identity = identities.get(submission.id)
+    if identity is None:
+        return None
+    group_key, _position = identity
+    parent_assessment_id, parent_attempt_id, _principal_id, _course_id = group_key
+    parent = await db.get(Assessment, parent_assessment_id)
+    if parent is None or parent.course_id != assessment.course_id:
+        return None
     grouped: list[tuple[int, Submission, Assessment]] = []
-    for sibling, sibling_attempt, sibling_assessment in rows:
-        sibling_receipt = dict(sibling.external_receipt or {})
-        sibling_policy = dict(sibling_assessment.policy or {})
-        if (
-            sibling_attempt.principal_id != attempt.principal_id
-            or str(sibling_receipt.get("moodle_parent_attempt_id", "")).strip() != parent_attempt_id
-            or str(
-                sibling_receipt.get("moodle_parent_assessment_id")
-                or sibling_policy.get("moodle_parent_assessment_id", "")
-            )
-            != str(parent_assessment_id)
-        ):
+    for sibling, _sibling_attempt, sibling_assessment in rows:
+        sibling_identity = identities.get(sibling.id)
+        if sibling_identity is None or sibling_identity[0] != group_key:
             continue
-        raw_position = sibling_receipt.get("moodle_response_position")
-        try:
-            position = int(raw_position)
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if not 1 <= position <= 1_000:
-            continue
+        position = sibling_identity[1]
         grouped.append((position, sibling, sibling_assessment))
     if len(grouped) < 2:
         return None
@@ -1217,6 +1320,8 @@ async def _submission_review_group(
         ):
             by_position[position] = row
     grouped = list(by_position.values())
+    if len(grouped) < 2:
+        return None
 
     question_marks = dict(
         (

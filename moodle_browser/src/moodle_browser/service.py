@@ -87,12 +87,15 @@ from .models import (
     QuizEssayPrepareResponse,
     QuizEssaySyncRequest,
     QuizEssaySyncResponse,
+    SessionKeepaliveRequest,
+    SessionKeepaliveResponse,
 )
 from .parsers import (
     MoodleMarkupError,
     _plain_rich_text,
     canonical_hash,
     has_authenticated_markup,
+    has_login_markup,
     merge_course_sections,
     parse_activity_settings,
     parse_activity_user_override_edit,
@@ -941,6 +944,40 @@ class MoodleBrowserService:
             html, self.settings.base_url
         ), state
 
+    async def keepalive(self, request: SessionKeepaliveRequest) -> SessionKeepaliveResponse:
+        """Refresh only the current profile; never start attempts or scan courses."""
+        self._require_origin(request.base_url)
+        try:
+            state = sanitize_storage_state(
+                request.storage_state,
+                base_url=self.settings.base_url,
+                maximum_bytes=self.settings.storage_state_max_bytes,
+                reject_foreign=True,
+            )
+        except InvalidStorageState as exc:
+            raise MoodleContractError(str(exc)) from exc
+        if not has_moodle_session(state):
+            raise MoodleSessionExpired("Moodle browser session is missing")
+        # Use the bounded read pool, not the lanes reserved for student saves.
+        async with self._course_discovery_operation(foreground=False) as browser:
+            context = await self._new_context(browser, storage_state=state, html_only=True)
+            try:
+                page = await context.new_page()
+                markup = await self._goto(page, f"{self.settings.base_url}/user/profile.php")
+                await self._require_authenticated_page(context, markup)
+                try:
+                    identity = parse_identity(markup, self.settings.base_url)
+                except MoodleMarkupError as exc:
+                    raise MoodleProtocolError("Moodle keepalive identity is unavailable") from exc
+                if identity["external_subject"] != request.actor_external_subject:
+                    raise MoodleProtocolError("Moodle keepalive returned another user")
+                return SessionKeepaliveResponse(
+                    external_subject=request.actor_external_subject,
+                    storage_state=await self._state(context),
+                )
+            finally:
+                await context.close()
+
     async def login(self, request: LoginRequest) -> LoginResponse:
         self._require_origin(request.base_url)
         async with self._operation(interactive=True) as browser:
@@ -969,9 +1006,7 @@ class MoodleBrowserService:
                     raise MoodleProtocolError("Moodle login response has no authenticated session")
 
                 dashboard_html = await self._goto(page, f"{self.settings.base_url}/my/")
-                authenticated, _ = await self._authenticated(context, dashboard_html)
-                if not authenticated:
-                    raise MoodleSessionExpired("Moodle browser session expired")
+                await self._require_authenticated_page(context, dashboard_html)
                 # A configured course id is only an application allow-list,
                 # not evidence that this account is enrolled.  Intersect it
                 # with Moodle's own dashboard before opening course pages, so
@@ -991,9 +1026,7 @@ class MoodleBrowserService:
                     page,
                     f"{self.settings.base_url}/user/profile.php",
                 )
-                authenticated, state = await self._authenticated(context, profile_html)
-                if not authenticated:
-                    raise MoodleSessionExpired("Moodle browser session expired")
+                await self._require_authenticated_page(context, profile_html)
 
                 identity: dict[str, str] | None = None
                 last_identity_error: MoodleMarkupError | None = None
@@ -1016,9 +1049,7 @@ class MoodleBrowserService:
                     f"{self.settings.base_url}/user/profile.php?"
                     + urlencode({"id": identity["external_subject"]}),
                 )
-                authenticated, state = await self._authenticated(context, canonical_profile_html)
-                if not authenticated:
-                    raise MoodleSessionExpired("Moodle browser session expired")
+                await self._require_authenticated_page(context, canonical_profile_html)
                 try:
                     profile = parse_identity(canonical_profile_html, self.settings.base_url)
                 except MoodleMarkupError:
@@ -1130,9 +1161,7 @@ class MoodleBrowserService:
                     {"id": request.external_id}
                 )
                 course_html = await self._goto(page, course_url)
-                authenticated, _ = await self._authenticated(context, course_html)
-                if not authenticated:
-                    raise MoodleSessionExpired("Moodle browser session expired")
+                await self._require_authenticated_page(context, course_html)
                 try:
                     identity = parse_identity(course_html, self.settings.base_url)
                     course = parse_course_page(
@@ -1740,11 +1769,17 @@ class MoodleBrowserService:
                             error = payload[0].get("exception", {})
                             code = error.get("errorcode") if isinstance(error, dict) else None
                             if code in {
-                                "invalidsesskey",
                                 "servicerequireslogin",
                                 "requireloginerror",
                             }:
                                 raise MoodleSessionExpired("Moodle browser session expired")
+                            # A stale CSRF key does not prove the Moodle login
+                            # has expired. This optional read must neither
+                            # retire local attempts nor invalidate the user's
+                            # reusable session just because its key rotated.
+                            if code == "invalidsesskey":
+                                incomplete = True
+                                break  # Every remaining read would reuse the same stale key.
                             if (
                                 payload[0].get("error") is not False
                                 and code != "reopenattemptwrongstate"
@@ -1844,7 +1879,19 @@ class MoodleBrowserService:
 
         # An expired session must invalidate the operation rather than turn every
         # response into an apparently harmless omission.
-        await self._require_authenticated_page(context, detail_html)
+        try:
+            await self._require_authenticated_page(context, detail_html)
+        except BrowserUnavailable:
+            # Standalone Assignment/Quiz detail pages may omit the global
+            # logout menu. A live cookie alone is NOT authentication proof:
+            # confirm it on an ordinary Moodle page in the SAME context.
+            # Exact course/activity/student/attempt parsing below still applies.
+            probe = await context.new_page()
+            try:
+                markup = await self._goto(probe, f"{self.settings.base_url}/my/")
+                await self._require_authenticated_page(context, markup)
+            finally:
+                await probe.close()
         try:
             if module == "quiz":
                 detail = await self._historical_quiz_review_detail(
@@ -2446,6 +2493,7 @@ class MoodleBrowserService:
                                         course_id=course_id,
                                         cmid=cmid,
                                         module=module,
+                                        base_url=self.settings.base_url,
                                     )
                                 )
                         if module == "quiz" and detail_count < _ACTIVITY_DETAIL_MAX_PAGES:
@@ -2505,6 +2553,7 @@ class MoodleBrowserService:
                                                 course_id=course_id,
                                                 cmid=cmid,
                                                 question_id=question_id,
+                                                base_url=self.settings.base_url,
                                             )
                                             if statement["description"]:
                                                 activity.update(statement)
@@ -2600,6 +2649,7 @@ class MoodleBrowserService:
                                                         question_id=str(
                                                             question["_essay_question_id"]
                                                         ),
+                                                        base_url=self.settings.base_url,
                                                     )
                                                     confirmed = answer.get("answer_transport") in {
                                                         "ESSAY_ONLINE_TEXT",
@@ -2778,9 +2828,7 @@ class MoodleBrowserService:
                 page,
                 f"{self.settings.base_url}/user/index.php?{query}",
             )
-            authenticated, _ = await self._authenticated(context, html)
-            if not authenticated:
-                raise MoodleSessionExpired("Moodle browser session expired")
+            await self._require_authenticated_page(context, html)
             parsed = parse_participants_page(html, self.settings.base_url, course_id)
             if not parsed.table_present:
                 return list(members_by_id.values()), False
@@ -2893,25 +2941,110 @@ class MoodleBrowserService:
         html_value = "".join(
             f"<p>{html.escape(line) if line else '<br>'}</p>" for line in paragraphs
         )
-        await textarea.evaluate(
-            """(element, value) => {
-                element.value = value;
-                for (const eventName of ['input', 'keyup', 'change', 'blur']) {
-                    element.dispatchEvent(new Event(eventName, {bubbles: true}));
-                }
-            }""",
-            html_value,
-        )
-        editor = page.locator("div.editor_atto_content[contenteditable='true']")
-        if await editor.count() == 1:
-            await editor.evaluate(
-                """(element, value) => {
-                    element.innerText = value;
-                    for (const eventName of ['input', 'keyup', 'change', 'blur']) {
-                        element.dispatchEvent(new Event(eventName, {bubbles: true}));
+        try:
+            await textarea.evaluate(
+                """async (element, value) => {
+                    // A textarea is only TinyMCE's backing store: on Submit,
+                    // TinyMCE saves its own (possibly old) document over it.
+                    // Address only this textarea's editor, never activeEditor
+                    // or another comment editor on the same grading page.
+                    const tinyEditor = () => {
+                        const manager = window.tinymce || window.tinyMCE;
+                        return element.id && manager && typeof manager.get === 'function'
+                            ? manager.get(element.id) : null;
+                    };
+                    const tiny = tinyEditor();
+                    if (tiny && tiny.initialized === false) {
+                        await new Promise((resolve, reject) => {
+                            const onInit = () => {
+                                window.clearTimeout(timer);
+                                tiny.off('init', onInit);
+                                resolve();
+                            };
+                            const timer = window.setTimeout(() => {
+                                tiny.off('init', onInit);
+                                reject(new Error('Moodle comment editor init timed out'));
+                            }, 5000);
+                            tiny.on('init', onInit);
+                        });
+                    }
+                    const dispatch = node => {
+                        for (const name of ['input', 'keyup', 'change', 'blur']) {
+                            node.dispatchEvent(new Event(name, {bubbles: true}));
+                        }
+                    };
+                    const synchronize = () => {
+                        const editor = tinyEditor();
+                        if (editor) {
+                            if (editor.initialized === false ||
+                                (typeof editor.getElement === 'function' &&
+                                 editor.getElement() !== element)) {
+                                throw new Error('Moodle comment editor is not ready');
+                            }
+                            editor.setContent(value, {format: 'html'});
+                            editor.save();
+                        }
+                        const attoRoot = element.closest('.editor_atto');
+                        const candidates = attoRoot
+                            ? attoRoot.querySelectorAll(
+                                '.editor_atto_content[contenteditable="true"]') : [];
+                        const byId = element.id
+                            ? document.getElementById(element.id + 'editable') : null;
+                        if (candidates.length > 1) {
+                            throw new Error('Moodle comment editor is ambiguous');
+                        }
+                        const atto = byId && byId.matches(
+                            '.editor_atto_content[contenteditable="true"]')
+                            ? byId : candidates[0];
+                        if (atto) {
+                            atto.innerHTML = value;
+                            dispatch(atto);
+                        }
+                        element.value = value;
+                        dispatch(element);
+                    };
+                    synchronize();
+                    // Moodle can finish initializing an editor after this
+                    // method returns. Synchronize again before its submit
+                    // handler serializes the form, or cancel rather than
+                    // silently submitting a grade with the previous comment.
+                    if (element.form) {
+                        if (element.__eduprogGradeEditorSubmit) {
+                            element.form.removeEventListener(
+                                'submit', element.__eduprogGradeEditorSubmit, true);
+                        }
+                        element.__eduprogGradeEditorSubmit = event => {
+                            element.removeAttribute('data-eduprog-comment-submit-error');
+                            try { synchronize(); }
+                            catch (_) {
+                                element.setAttribute('data-eduprog-comment-submit-error', 'true');
+                                event.preventDefault();
+                            }
+                        };
+                        element.form.addEventListener(
+                            'submit', element.__eduprogGradeEditorSubmit, true);
                     }
                 }""",
-                value,
+                html_value,
+            )
+        except PlaywrightError as exc:
+            # Playwright's evaluation details can include the grading page.
+            # Keep errors and logs free of comment text and authentication data.
+            raise MoodleProtocolError(
+                "Moodle grading comment editor could not be synchronized"
+            ) from exc
+
+    async def _raise_if_editor_submit_failed(self, page: Page, textarea_selector: str) -> None:
+        # A late editor can cancel the native Submit without navigating away.
+        # Remaining on an authenticated grading URL is not a successful save.
+        # Inspect only the exact comment editor's constant error flag; neither
+        # comment text nor editor exceptions should reach diagnostic output.
+        failed = page.locator(
+            textarea_selector + "[data-eduprog-comment-submit-error='true']"
+        )
+        if await failed.count():
+            raise MoodleProtocolError(
+                "Moodle grading comment editor could not be synchronized before save"
             )
 
     async def _set_grade(self, control: Locator, grade: float | Decimal) -> None:
@@ -3006,6 +3139,9 @@ class MoodleBrowserService:
             "assignment save",
         )
         await submit.click()
+        await self._raise_if_editor_submit_failed(
+            page, "textarea[name='assignfeedbackcomments_editor[text]']"
+        )
         saved_markup = await page.content()
         await self._require_authenticated_page(context, saved_markup)
         if urlsplit(page.url).path.rstrip("/") != "/mod/assign/view.php":
@@ -3147,6 +3283,7 @@ class MoodleBrowserService:
             "quiz save",
         )
         await submit.click()
+        await self._raise_if_editor_submit_failed(page, "textarea[name$='-comment']")
         saved_markup = await page.content()
         await self._require_session_without_global_navigation(context, saved_markup, page.url)
         saved = urlsplit(page.url)
@@ -3206,8 +3343,13 @@ class MoodleBrowserService:
         feedback = page.locator("textarea[name$='-comment']")
         if await grade.count() != 1 or await feedback.count() != 1:
             return False
-        raw_mark = await grade.input_value()
-        raw_comment = await feedback.input_value()
+        # Read the fresh form's server defaults, not live editor values:
+        # TinyMCE/Atto may restore a local draft even when that comment was
+        # never persisted in Moodle. A draft is not a delivery receipt.
+        raw_mark = await grade.get_attribute("value") or ""
+        raw_comment = await feedback.evaluate("element => element.defaultValue")
+        if not isinstance(raw_comment, str):
+            return False
         if len(raw_mark) > 128 or len(raw_comment) > 200_000:
             return False
         try:
@@ -3335,6 +3477,7 @@ class MoodleBrowserService:
                 course_id=request.payload.course_id,
                 cmid=request.payload.cmid,
                 module="quiz",
+                base_url=self.settings.base_url,
             )
         except MoodleMarkupError as exc:
             raise MoodleProtocolError(str(exc)) from exc
@@ -4416,6 +4559,7 @@ class MoodleBrowserService:
                         "attempt_id": attempt.attempt_id,
                         "question_slot": attempt.question_slot,
                         "question_text": attempt.question_text,
+                        "question_text_legacy_hashes": list(attempt.question_text_legacy_hashes),
                         "answer_transport": selected,
                         "available_answer_transports": available,
                         "remaining_seconds": attempt.remaining_seconds,
@@ -4423,6 +4567,9 @@ class MoodleBrowserService:
                             {
                                 "question_slot": question.question_slot,
                                 "question_text": question.question_text,
+                                "question_text_legacy_hashes": list(
+                                    question.question_text_legacy_hashes
+                                ),
                                 "answer_transport": (
                                     "ESSAY_ATTACHMENT"
                                     if "ESSAY_ATTACHMENT" in question.available_transports
@@ -5369,9 +5516,14 @@ class MoodleBrowserService:
         context: BrowserContext,
         html: str,
     ) -> None:
-        authenticated, _ = await self._authenticated(context, html)
+        authenticated, state = await self._authenticated(context, html)
         if not authenticated:
-            raise MoodleSessionExpired("Moodle browser session expired")
+            if not has_moodle_session(state) or has_login_markup(html, self.settings.base_url):
+                raise MoodleSessionExpired("Moodle browser session expired")
+            # A temporary error/standalone page may omit the user menu even
+            # with a live cookie. Still fail closed, but retry the read rather
+            # than expiring the credential and blocking every queued answer.
+            raise BrowserUnavailable("Moodle page did not confirm authenticated session")
 
     async def _require_session_without_global_navigation(
         self,

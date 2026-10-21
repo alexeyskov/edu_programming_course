@@ -47,6 +47,7 @@ interface Props {
   aiFindings?: AiCodeFinding[];
   onAskAi?(finding: AiCodeFinding): void;
   onAskAiSelection?(selection: AiCodeSelection): void;
+  allowEditableAiSelection?: boolean;
   highlights?: CodeHighlight[];
   theme?: 'light' | 'dark';
   experiment?: boolean;
@@ -64,7 +65,7 @@ const severityMap: Record<Diagnostic['severity'], Monaco.MarkerSeverity> = {
 export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function CodeWorkspace({
   files, activeFileId, onActiveFile, onChange, onCreateFile, onDeleteFile, canDeleteFile,
   readOnly: requestedReadOnly = false, strictPaste = false,
-  scopeId, diagnostics = [], aiFindings = [], onAskAi, onAskAiSelection, highlights = [], theme: requestedTheme, experiment = false, explorerVisible = true, explorerId,
+  scopeId, diagnostics = [], aiFindings = [], onAskAi, onAskAiSelection, allowEditableAiSelection = false, highlights = [], theme: requestedTheme, experiment = false, explorerVisible = true, explorerId,
   onExplorerCollapse, onPasteBlocked, onInternalCopy, clipboardScopeId, clipboardSession, intelligenceScope,
 }, ref) {
   const mobile = useMediaQuery('(max-width: 767px)');
@@ -81,8 +82,8 @@ export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function Cod
   const aiConfigRef = useRef({ aiFindings, onAskAi, scopeId, readOnly, experiment });
   aiConfigRef.current = { aiFindings, onAskAi, scopeId, readOnly, experiment };
   const aiSelectionRef = useRef<ReturnType<typeof installAiSelectionAction>>();
-  const selectionConfigRef = useRef({ scopeId, readOnly, experiment, onAsk: onAskAiSelection });
-  selectionConfigRef.current = { scopeId, readOnly, experiment, onAsk: onAskAiSelection };
+  const selectionConfigRef = useRef({ scopeId, readOnly, experiment, allowEditable: allowEditableAiSelection, onAsk: onAskAiSelection });
+  selectionConfigRef.current = { scopeId, readOnly, experiment, allowEditable: allowEditableAiSelection, onAsk: onAskAiSelection };
   const aiModelRef = useRef<Monaco.editor.ITextModel | null>(null);
   const aiDecorationsRef = useRef<Monaco.editor.IEditorDecorationsCollection | null>(null);
   const clipboardRootRef = useRef<HTMLDivElement | null>(null);
@@ -233,7 +234,7 @@ export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, Props>(function Cod
   const refreshAiAnnotationsRef = useRef(setAiAnnotations);
   refreshAiAnnotationsRef.current = setAiAnnotations;
   useEffect(() => { setAiAnnotations(); return clearAiAnnotations; }, [setAiAnnotations, clearAiAnnotations]);
-  useEffect(() => { aiSelectionRef.current?.refresh(); }, [scopeId, readOnly, experiment, onAskAiSelection, active?.path]);
+  useEffect(() => { aiSelectionRef.current?.refresh(); }, [scopeId, readOnly, experiment, allowEditableAiSelection, onAskAiSelection, active?.path]);
 
   useImperativeHandle(ref, () => ({
     openDiagnostic(diagnostic) {

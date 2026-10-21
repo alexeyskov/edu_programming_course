@@ -17,8 +17,8 @@ describe('backend DTO normalization', () => {
     expect(apiNormalizers.mapAiCodeReview({ enabled: true, state: 'COMPLETED', recommended_grade: '0.00', recommended_comment: 'Не решено' })).toMatchObject({ recommendedGrade: 0, recommendedComment: 'Не решено' });
     expect(apiNormalizers.mapSubmission({ id: 's', moodle_feedback_comment: 'Комментарий без балла' })).toMatchObject({ moodleFeedbackComment: 'Комментарий без балла', score: undefined });
   });
-  it('keeps automatic review separate from student AI and treats missing server policy as off', () => {
-    expect(apiNormalizers.mapAssessment({ id: 'assessment', student_ai_enabled: true }, '')).toMatchObject({ aiEnabled: true, aiReviewEnabled: false });
+  it('defaults missing automatic review to on while preserving explicit opt-outs independently of student AI', () => {
+    expect(apiNormalizers.mapAssessment({ id: 'assessment', student_ai_enabled: true }, '')).toMatchObject({ aiEnabled: true, aiReviewEnabled: true });
     expect(apiNormalizers.mapAssessment({ id: 'assessment', ai_review_enabled: true, student_ai_enabled: false }, '')).toMatchObject({ aiEnabled: false, aiReviewEnabled: true });
     expect(apiNormalizers.mapAssessment({ id: 'assessment', ai_review_enabled: false, student_ai_enabled: true }, '')).toMatchObject({ aiEnabled: true, aiReviewEnabled: false });
   });

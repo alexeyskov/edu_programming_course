@@ -4,11 +4,18 @@ import uuid
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
-from app.api.reviews import get_submission, list_submissions
+from app.api.reviews import (
+    _review_group_identities,
+    _review_queue_group_key,
+    _review_queue_group_position,
+    _submission_review_group,
+    get_submission,
+    list_submissions,
+)
 from app.auth.context import AuthContext
-from app.models.attempts import Attempt, Snapshot, Submission, Workspace
+from app.models.attempts import Attempt, MoodleQuizQuestion, Snapshot, Submission, Workspace
 from app.models.courses import Course, CourseMembership
 from app.models.identity import ExternalPrincipal
 from app.models.review import ReviewDecision
@@ -65,6 +72,191 @@ async def test_parent_review_queue_includes_every_native_solution(db):
     assert child_rows[0].parent_assessment_id == parent.id
     assert child_rows[0].parent_assessment_title == parent.title
     assert await assessment_review_scope_ids(db, child.assessment_id) == {child.assessment_id}
+
+
+@pytest.mark.parametrize("root_source", ["MOODLE_IMPORT", "MANUAL", "DEADLINE"])
+async def test_queue_and_detail_share_receipt_parent_binding_after_native_import(db, root_source):
+    """Importing a native root must not strand it outside its child group."""
+
+    _, teacher, parent, root, _ = await _submitted_quiz(db)
+    submissions = list((await db.scalars(select(Submission))).all())
+    native_root = next(item for item in submissions if item.attempt_id == root.id)
+    native_root.source = root_source
+    if root_source == "MOODLE_IMPORT":
+        # Imported rows need not retain native-only integrity flags. The
+        # receipt still binds the exact parent and remote attempt, so the root
+        # belongs with its independently imported child.
+        root.integrity_policy = {}
+    # Root assessments are deliberately not question-split children. The
+    # receipt still pins their exact parent, unlike child-only policy metadata.
+    assert not dict(parent.policy or {}).get("moodle_parent_assessment_id")
+    await db.flush()
+
+    queue = await list_submissions("all", _teacher_auth(teacher), db, offset=0, limit=1)
+    assert len(queue) == 1
+    assert await list_submissions("all", _teacher_auth(teacher), db, offset=1, limit=1) == []
+    assert queue[0].assessment_title == parent.title
+    assert queue[0].parent_assessment_id == parent.id
+    assert queue[0].max_score == Decimal(8)
+    assert queue[0].review_group is not None
+    expected_ids = {item.id for item in submissions}
+    assert {item.submission_id for item in queue[0].review_group.items} == expected_ids
+    for item in submissions:
+        detail = await get_submission(item.id, _teacher_auth(teacher), db)
+        assert detail.review_group == queue[0].review_group
+
+
+async def test_queue_and_detail_group_legacy_numeric_attempt_aliases(db):
+    _, teacher, _, root, _ = await _submitted_quiz(db)
+    submissions = list((await db.scalars(select(Submission))).all())
+    native_root = next(item for item in submissions if item.attempt_id == root.id)
+    remote_id = str(native_root.external_receipt["moodle_parent_attempt_id"])
+    assert remote_id.isdecimal()
+    native_root.external_receipt = {
+        **native_root.external_receipt,
+        "moodle_parent_attempt_id": f"attempt:{remote_id}",
+    }
+    await db.flush()
+
+    queue = await list_submissions("all", _teacher_auth(teacher), db, offset=0, limit=1)
+    assert len(queue) == 1 and queue[0].review_group is not None
+    assert await list_submissions("all", _teacher_auth(teacher), db, offset=1, limit=1) == []
+    for item in submissions:
+        detail = await get_submission(item.id, _teacher_auth(teacher), db)
+        assert detail.review_group == queue[0].review_group
+
+
+@pytest.mark.parametrize("export_state", ["PENDING", "FAILED", "DELIVERED"])
+@pytest.mark.parametrize("empty_receipts", ["both", "child"])
+@pytest.mark.parametrize("missing_receipt", [None, {}])
+async def test_native_grouping_does_not_wait_for_delivery_receipts(
+    db, export_state, empty_receipts, missing_receipt,
+):
+    """Regression for MANUAL NUC submissions with no external receipt yet."""
+
+    _, teacher, parent, root, _ = await _submitted_quiz(db)
+    submissions = list((await db.scalars(select(Submission))).all())
+    for item in submissions:
+        item.lms_export_state = export_state
+        if empty_receipts == "both" or item.attempt_id != root.id:
+            item.external_receipt = missing_receipt
+    original_receipts = {
+        item.id: dict(item.external_receipt) if item.external_receipt is not None else None
+        for item in submissions
+    }
+    await db.flush()
+
+    queue = await list_submissions("all", _teacher_auth(teacher), db, offset=0, limit=1)
+    assert len(queue) == 1
+    assert queue[0].parent_assessment_id == parent.id
+    assert queue[0].assessment_title == parent.title
+    assert queue[0].max_score == Decimal(8)
+    assert queue[0].review_group is not None
+    assert [item.position for item in queue[0].review_group.items] == [1, 2]
+    assert {item.submission_id for item in queue[0].review_group.items} == {
+        item.id for item in submissions
+    }
+    assert await list_submissions("all", _teacher_auth(teacher), db, offset=1, limit=1) == []
+    for item in submissions:
+        detail = await get_submission(item.id, _teacher_auth(teacher), db)
+        assert detail.review_group == queue[0].review_group
+        assert item.external_receipt == original_receipts[item.id]
+        assert item.lms_export_state == export_state
+
+
+@pytest.mark.parametrize(
+    "broken_binding", ["root", "parent", "remote", "student", "relation", "receipt"],
+)
+async def test_native_receipt_fallback_requires_durable_matching_identity(db, broken_binding):
+    student, _, parent, root, questions = await _submitted_quiz(db)
+    submissions = list((await db.scalars(select(Submission))).all())
+    child = await db.get(Attempt, questions[1].attempt_id)
+    child_assessment = await db.get(Assessment, child.assessment_id)
+    child_submission = next(item for item in submissions if item.attempt_id == child.id)
+    for item in submissions:
+        item.external_receipt = {}
+    if broken_binding in {"root", "parent", "remote"}:
+        child.integrity_policy = {
+            **child.integrity_policy,
+            {
+                "root": "moodle_quiz_root_attempt_id",
+                "parent": "moodle_parent_assessment_id",
+                "remote": "moodle_attempt_id",
+            }[broken_binding]: "99999" if broken_binding == "remote" else str(uuid.uuid4()),
+        }
+    elif broken_binding == "student":
+        # Keep the mismatched owner transient: no unrelated principal or
+        # timestamp can compensate for the actual root ownership binding.
+        child.principal_id = uuid.uuid4()
+    elif broken_binding == "relation":
+        await db.execute(
+            delete(MoodleQuizQuestion).where(MoodleQuizQuestion.attempt_id == child.id)
+        )
+    else:
+        child_submission.external_receipt = {"moodle_parent_attempt_id": "99999"}
+    with db.no_autoflush:
+        identities = await _review_group_identities(db, [
+            (item, root if item.attempt_id == root.id else child,
+             parent if item.attempt_id == root.id else child_assessment)
+            for item in submissions
+        ])
+    assert child_submission.id not in identities
+    assert all(identity[0][2] == student.id for identity in identities.values())
+
+
+@pytest.mark.parametrize("identity", ["parent", "remote", "source", "student", "course"])
+async def test_receipt_grouping_never_merges_conflicting_ownership(db, identity):
+    _, teacher, parent, root, questions = await _submitted_quiz(db)
+    submissions = list((await db.scalars(select(Submission))).all())
+    child = await db.get(Attempt, questions[1].attempt_id)
+    child_assessment = await db.get(Assessment, child.assessment_id)
+    child_submission = next(item for item in submissions if item.attempt_id == child.id)
+    root_submission = next(item for item in submissions if item.attempt_id == root.id)
+    root_key = _review_queue_group_key(root_submission, root, parent)
+    assert root_key is not None
+    if identity == "parent":
+        child_submission.external_receipt = {
+            **child_submission.external_receipt,
+            "moodle_parent_assessment_id": str(uuid.uuid4()),
+        }
+    elif identity == "remote":
+        child_submission.external_receipt = {
+            **child_submission.external_receipt,
+            "moodle_parent_attempt_id": "unrelated-opaque-attempt",
+        }
+    elif identity == "source":
+        child.integrity_policy = {}
+        child_submission.source = "UNVERIFIED"
+    elif identity == "student":
+        child.principal_id = teacher.id
+    else:
+        child_assessment.course_id = uuid.uuid4()
+    assert _review_queue_group_key(child_submission, child, child_assessment) != root_key
+    # This unit must not infer grouping from matching timestamps, question
+    # names, a shared work id or a partially conflicting parent binding.
+
+
+@pytest.mark.parametrize("position", [True, False, 1.5, None, 0, -1, 1001, "1.5"])
+def test_review_group_requires_an_exact_bounded_question_position(position):
+    submission = Submission(external_receipt={"moodle_response_position": position})
+    assert _review_queue_group_position(submission) is None
+
+
+async def test_detail_does_not_show_one_question_as_a_group_after_deduplication(db):
+    _, _, parent, root, questions = await _submitted_quiz(db)
+    submissions = list((await db.scalars(select(Submission))).all())
+    child_submission = next(
+        item for item in submissions if item.attempt_id == questions[1].attempt_id
+    )
+    child_submission.external_receipt = {
+        **child_submission.external_receipt,
+        "moodle_response_position": 1,
+    }
+    native_root = next(item for item in submissions if item.attempt_id == root.id)
+    await db.flush()
+    assert await _submission_review_group(
+        db, submission=native_root, attempt=root, assessment=parent,
+    ) is None
 
 
 async def test_review_shows_the_pinned_statement_of_each_question(db):

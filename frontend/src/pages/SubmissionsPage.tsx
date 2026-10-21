@@ -136,7 +136,10 @@ export function SubmissionsPage() {
   )), [scopedItems, view]);
   const filtered = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
-    const result = viewItems.filter((item) => !normalizedQuery || `${item.studentName} ${item.studentGroup} ${item.courseTitle ?? ''} ${item.assessmentTitle}`.toLowerCase().includes(normalizedQuery));
+    const result = viewItems.filter((item) => !normalizedQuery || [
+      item.studentName, item.studentGroup, item.courseTitle ?? '', item.assessmentTitle,
+      ...(item.reviewGroup?.items.map((question) => question.title) ?? []),
+    ].join(' ').toLowerCase().includes(normalizedQuery));
     return result.sort((a, b) => sort === 'student' ? a.studentName.localeCompare(b.studentName, 'ru')
       : ((Date.parse(a.submittedAt) || 0) - (Date.parse(b.submittedAt) || 0)) * (sort === 'oldest' ? 1 : -1));
   }, [viewItems, query, sort]);

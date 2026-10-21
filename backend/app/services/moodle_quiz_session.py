@@ -69,7 +69,14 @@ async def ensure_quiz_session(
                 409, "MOODLE_ATTEMPT_BINDING_CONFLICT", "Moodle question list changed"
             )
         for binding, question in zip(existing, prepared.questions, strict=True):
-            attempt = await db.get(Attempt, binding.attempt_id)
+            # The caller already locked and updated the root, including its
+            # confirmed timer. Only refresh the other question attempts here.
+            attempt = root if binding.attempt_id == root.id else await db.scalar(
+                select(Attempt)
+                .where(Attempt.id == binding.attempt_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
             version = (
                 await db.get(TaskVersion, attempt.assigned_task_version_id)
                 if attempt is not None and attempt.assigned_task_version_id is not None
@@ -80,12 +87,16 @@ async def ensure_quiz_session(
                 or attempt.principal_id != root.principal_id
                 or not prepared_binding_matches_attempt(attempt.integrity_policy, question)
                 or version is None
-                or version.statement != question.question_text
                 or binding.question_max_mark != question.question_max_mark
             ):
                 raise DomainError(
                     409, "MOODLE_ATTEMPT_BINDING_CONFLICT", "Moodle question binding changed"
                 )
+            if version.statement != question.question_text:
+                version = await materialize_prepared_task_version(
+                    db, base_version=version, prepared=question,
+                )
+                attempt.assigned_task_version_id = version.id
             attempt.expected_end_at = root.expected_end_at
             attempt.deadline_at = root.deadline_at
             if "moodle_sync_timeout_seconds" in (root.integrity_policy or {}):

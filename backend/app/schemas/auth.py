@@ -17,6 +17,11 @@ class CSRFTokenRead(ReadModel):
     csrf_token: Annotated[str, StringConstraints(min_length=32, max_length=512)]
 
 
+class MoodleKeepaliveRead(ReadModel):
+    status: Literal["ACTIVE", "BUSY", "SKIPPED", "UNAVAILABLE", "REAUTH_REQUIRED"]
+    retry_after_seconds: int = 300
+
+
 class AuthConnectionRead(ReadModel):
     id: UUID
     name: Annotated[str, StringConstraints(min_length=1, max_length=120)]
@@ -100,6 +105,7 @@ __all__ = [
     "LMSLoginStartRead",
     "LMSLoginStartRequest",
     "MoodleCredentialLoginRequest",
+    "MoodleKeepaliveRead",
     "PrincipalRead",
     "SessionProviderRead",
     "SessionRead",

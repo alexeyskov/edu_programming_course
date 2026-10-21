@@ -2049,7 +2049,8 @@ async def test_playwright_checkpoint_syncs_full_code_to_quiz_essay_and_refreshes
     assert refreshed["cookies"][0]["value"] == "after"
 
 
-async def test_playwright_checkpoint_expires_rejected_browser_session(app_bundle) -> None:
+@pytest.mark.parametrize("expired", [True, False])
+async def test_playwright_checkpoint_only_expires_rejected_browser_session(app_bundle, expired):
     _, session_factory, settings = app_bundle
     now = datetime.now(UTC)
     attempt_id, course_id = await _seed_attempt(
@@ -2109,7 +2110,9 @@ async def test_playwright_checkpoint_expires_rejected_browser_session(app_bundle
 
     class ExpiredBrowser:
         async def store_checkpoint(self, *_args, **_kwargs) -> dict[str, Any]:
-            raise MoodleAuthenticationError("Moodle browser session expired")
+            if expired:
+                raise MoodleAuthenticationError("Moodle browser session expired")
+            raise IntegrationUnavailable("Moodle page did not confirm authenticated session")
 
     async with httpx.AsyncClient() as client:
         assert await process_outbox_once(
@@ -2122,10 +2125,13 @@ async def test_playwright_checkpoint_expires_rejected_browser_session(app_bundle
     async with session_factory() as db:
         event = await db.get(SyncOutbox, event_id)
         credential = await db.get(MoodleCredential, credential_id)
-    assert event is not None and event.state == SyncOutboxState.FAILED.value
-    assert event.last_error.startswith("MOODLE_AUTHENTICATION_FAILED:")
-    assert credential is not None and credential.status == "EXPIRED"
-    assert credential.expires_at is not None
+    assert event is not None
+    assert event.state == (SyncOutboxState.FAILED.value if expired else SyncOutboxState.RETRY.value)
+    assert event.last_error.startswith(
+        "MOODLE_AUTHENTICATION_FAILED:" if expired else "UNAVAILABLE:"
+    )
+    assert credential is not None and credential.status == ("EXPIRED" if expired else "ACTIVE")
+    assert (credential.expires_at is not None) is expired
     assert credential.lease_owner is None and credential.lease_expires_at is None
 
 

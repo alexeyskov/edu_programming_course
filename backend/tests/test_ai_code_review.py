@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import timedelta
 from decimal import Decimal
 from unittest.mock import AsyncMock
@@ -282,19 +283,37 @@ async def test_teacher_feedback_prevents_automatic_analysis(review_bundle, human
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("different", [None, "student", "course", "attempt", "slot", "retired"])
-async def test_native_answer_uses_only_its_own_moodle_feedback(review_bundle, different):
+@pytest.mark.parametrize(
+    "different", [None, "student", "course", "parent", "attempt", "slot", "retired"],
+)
+@pytest.mark.parametrize("binding", ["receipt", "root", "child"])
+@pytest.mark.parametrize("imported_remote", ["142664", "attempt:142664"])
+async def test_native_answer_uses_only_its_own_moodle_feedback(
+    review_bundle, different, binding, imported_remote,
+):
     _app, sessions, _settings, seed, _ = review_bundle
     async with sessions() as db, db.begin():
         await db.execute(update(ReviewDecision).values(status="SUPERSEDED"))
         native = await db.get(Submission, seed.submission_id)
         native.external_receipt = {
+            "moodle_parent_assessment_id": str(seed.assessment_id),
             "moodle_parent_attempt_id": "142664", "moodle_response_id": "1",
         }
+        if binding != "receipt":
+            await _bind_receiptless_native_question(db, seed, native, child=binding == "child")
+        parent_id = seed.assessment_id
+        if different == "parent":
+            other_parent = Assessment(
+                course_id=seed.course_id, title="Another Quiz", created_by_id=seed.teacher_id,
+            )
+            db.add(other_parent)
+            await db.flush()
+            parent_id = other_parent.id
         assessment = Assessment(
             course_id=seed.other_course_id if different == "course" else seed.course_id,
             type="LAB", title="Imported question", created_by_id=seed.teacher_id,
             max_score=Decimal("10"),
+            policy={"moodle_parent_assessment_id": str(parent_id)},
         )
         db.add(assessment)
         await db.flush()
@@ -308,13 +327,128 @@ async def test_native_answer_uses_only_its_own_moodle_feedback(review_bundle, di
         db.add(Submission(
             attempt_id=imported_attempt.id, snapshot_id=native.snapshot_id,
             revision=1, source="MOODLE_IMPORT", external_receipt={
-                "moodle_parent_attempt_id": "999" if different == "attempt" else "142664",
+                "moodle_parent_attempt_id": "999" if different == "attempt" else imported_remote,
                 "moodle_response_id": "2" if different == "slot" else "1",
                 "moodle_review": {"grade": None, "comment": "Алгоритм неверный"},
             },
         ))
         await db.flush()
         assert await has_teacher_review(db, native) is (different is None)
+
+
+async def _bind_receiptless_native_question(db, seed, native, *, child=False):
+    attempt = await db.get(Attempt, native.attempt_id)
+    attempt.state = "SUBMITTED"
+    root = attempt
+    if child:
+        root = Attempt(
+            assessment_id=seed.assessment_id, principal_id=seed.student_id,
+            sequence=attempt.sequence + 1, state="SUBMITTED",
+        )
+        assessment = Assessment(
+            course_id=seed.course_id, title="Native child", created_by_id=seed.teacher_id,
+            policy={"moodle_parent_assessment_id": str(seed.assessment_id)},
+        )
+        db.add_all([root, assessment])
+        await db.flush()
+        attempt.assessment_id = assessment.id
+    integrity = {
+        "moodle_quiz_root_attempt_id": str(root.id),
+        "moodle_parent_assessment_id": str(seed.assessment_id),
+        "moodle_attempt_id": "142664",
+        "moodle_question_slot": "1",
+    }
+    root.integrity_policy = dict(integrity)
+    attempt.integrity_policy = dict(integrity)
+    native.external_receipt = None
+    db.add(MoodleQuizQuestion(
+        root_attempt_id=root.id, attempt_id=attempt.id, question_slot="1",
+        position=2 if child else 1, title="Question", question_max_mark=10,
+    ))
+    await db.flush()
+    return attempt, root
+
+
+@pytest.mark.parametrize("conflict", ["remote", "slot", "parent", "root", "student"])
+async def test_receiptless_feedback_fallback_never_overrides_conflicting_bindings(
+    review_bundle, conflict,
+):
+    _app, sessions, _settings, seed, _ = review_bundle
+    async with sessions() as db, db.begin():
+        await db.execute(update(ReviewDecision).values(status="SUPERSEDED"))
+        native = await db.get(Submission, seed.submission_id)
+        _attempt, root = await _bind_receiptless_native_question(db, seed, native, child=True)
+        if conflict == "root":
+            root.integrity_policy = {**root.integrity_policy, "moodle_attempt_id": "999"}
+        elif conflict == "student":
+            root.principal_id = seed.admin_id
+        else:
+            native.external_receipt = {
+                {"remote": "moodle_parent_attempt_id", "slot": "moodle_response_id",
+                 "parent": "moodle_parent_assessment_id"}[conflict]:
+                str(uuid.uuid4()) if conflict == "parent" else "999",
+            }
+        imported_attempt = Attempt(
+            assessment_id=seed.assessment_id, principal_id=seed.student_id,
+            sequence=3, state="SUBMITTED",
+        )
+        db.add(imported_attempt)
+        await db.flush()
+        db.add(Submission(
+            attempt_id=imported_attempt.id, snapshot_id=native.snapshot_id,
+            revision=1, source="MOODLE_IMPORT", external_receipt={
+                "moodle_parent_attempt_id": "142664", "moodle_response_id": "1",
+                "moodle_review": {"grade": "0", "comment": "Проверено"},
+            },
+        ))
+        await db.flush()
+        assert not await has_teacher_review(db, native)
+        if conflict in {"root", "student"}:
+            assert native.external_receipt is None
+
+
+@pytest.mark.parametrize("stage", ["backfill", "queued", "retry"])
+async def test_native_null_receipt_skips_paid_auto_review_after_moodle_feedback(
+    review_bundle, stage,
+):
+    _app, sessions, settings, seed, _ = review_bundle
+    if stage != "backfill":
+        await _enable(sessions, seed)
+    async with sessions() as db, db.begin():
+        await db.execute(update(ReviewDecision).values(status="SUPERSEDED"))
+        native = await db.get(Submission, seed.submission_id)
+        await _bind_receiptless_native_question(db, seed, native, child=True)
+        (await db.get(Assessment, seed.assessment_id)).ai_review_enabled = True
+        imported_attempt = Attempt(
+            assessment_id=seed.assessment_id, principal_id=seed.student_id,
+            sequence=3, state="SUBMITTED",
+        )
+        db.add(imported_attempt)
+        await db.flush()
+        db.add(Submission(
+            attempt_id=imported_attempt.id, snapshot_id=native.snapshot_id,
+            revision=1, source="MOODLE_IMPORT", external_receipt={
+                "moodle_parent_attempt_id": "attempt:142664", "moodle_response_id": "1",
+                "moodle_review": {"grade": "0", "comment": "Проверено в Moodle"},
+            },
+        ))
+        await db.flush()
+        if stage == "backfill":
+            assert await enqueue_ai_code_review(db, native) is None
+        elif stage == "retry":
+            report = await db.scalar(select(AICodeReview))
+            report.attempt_count = 1
+            report.next_attempt_at = utcnow() - timedelta(seconds=1)
+    provider = ReviewProvider()
+    assert await process_next_ai_code_review(sessions, settings, provider) is (stage != "backfill")
+    assert provider.calls == 0
+    async with sessions() as db:
+        report = await db.scalar(select(AICodeReview))
+        if stage == "backfill":
+            assert report is None
+        else:
+            assert report.state == "SKIPPED" and report.approved_decision_id is None
+        assert (await db.get(Submission, seed.submission_id)).external_receipt is None
 
 
 @pytest.mark.asyncio
@@ -593,7 +727,8 @@ async def test_report_access_stays_scoped_to_student_group_and_admin(review_bund
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("runtime", [True, False])
-async def test_child_question_uses_current_parent_policy(review_bundle, runtime):
+@pytest.mark.parametrize("enabled", [None, True, False])
+async def test_child_question_uses_current_parent_policy(review_bundle, runtime, enabled):
     _app, sessions, _settings, seed, _ = review_bundle
     async with sessions() as db, db.begin():
         await db.execute(update(ReviewDecision).values(status="SUPERSEDED"))
@@ -602,11 +737,15 @@ async def test_child_question_uses_current_parent_policy(review_bundle, runtime)
             course_id=seed.course_id,
             title="Parent Quiz",
             created_by_id=seed.teacher_id,
-            ai_review_enabled=True,
         )
+        if enabled is not None:
+            parent.ai_review_enabled = enabled
         db.add(parent)
         await db.flush()
-        child.ai_review_enabled = False
+        assert parent.ai_review_enabled is (enabled is not False)
+        # Child-local flags can be stale after import or parent policy changes.
+        # Only the currently visible parent activity controls automatic jobs.
+        child.ai_review_enabled = not parent.ai_review_enabled
         child.policy = {
             "moodle_quiz_question_split": True,
             "moodle_parent_assessment_id": str(parent.id),
@@ -636,7 +775,11 @@ async def test_child_question_uses_current_parent_policy(review_bundle, runtime)
         policy = await ai_review_policy_assessment(db, child, attempt)
         assert policy.id == parent.id
         submission = await db.get(Submission, seed.submission_id)
-        assert await enqueue_ai_code_review(db, submission) is not None
+        report = await enqueue_ai_code_review(db, submission)
+        assert (report is not None) is (enabled is not False)
+        if report is not None:
+            assert report.manual_requested is False
+            assert report.approved_decision_id is None
 
 
 @pytest.mark.asyncio

@@ -504,6 +504,8 @@ async def test_task_and_assessment_state_machine_and_course_immutability(app_bun
         )
         assert assessment_published.status_code == 200
         assert assessment_published.json()["status"] == "PUBLISHED"
+        assert assessment_published.json()["ai_review_enabled"] is True
+        assert assessment_published.json()["student_ai_enabled"] is False
         archive_in_use = await client.post(
             f"/api/v1/task-versions/{version_id}/archive", headers=headers, json={}
         )
@@ -518,7 +520,10 @@ async def test_task_and_assessment_state_machine_and_course_immutability(app_bun
         assert edit_after_publish.json()["code"] == "ASSESSMENT_IMMUTABLE"
 
 
-async def test_assessment_publication_atomically_publishes_valid_attached_draft(app_bundle):
+@pytest.mark.parametrize("ai_review_enabled", [None, True, False])
+async def test_assessment_publication_atomically_publishes_valid_attached_draft(
+    app_bundle, ai_review_enabled,
+):
     app, session_factory, settings = app_bundle
     settings.dev_auth_enabled = True
     async with AsyncClient(
@@ -572,6 +577,7 @@ async def test_assessment_publication_atomically_publishes_valid_attached_draft(
             json={"type": "LAB", "title": "Imported lab", "max_score": "10.00"},
         )
         assert assessment.status_code == 201, assessment.text
+        assert assessment.json()["ai_review_enabled"] is True
         assessment_id = assessment.json()["id"]
         attached = await client.post(
             f"/api/v1/assessments/{assessment_id}/items",
@@ -587,6 +593,9 @@ async def test_assessment_publication_atomically_publishes_valid_attached_draft(
             assert stored_version is not None
             stored_version.status = TaskVersionStatus.DRAFT.value
             stored_version.published_at = None
+            if ai_review_enabled is not None:
+                stored_assessment = await db.get(Assessment, uuid.UUID(assessment_id))
+                stored_assessment.ai_review_enabled = ai_review_enabled
             await db.commit()
 
         validation = await client.post(
@@ -601,6 +610,7 @@ async def test_assessment_publication_atomically_publishes_valid_attached_draft(
         )
         assert published.status_code == 200, published.text
         assert published.json()["status"] == AssessmentStatus.PUBLISHED.value
+        assert published.json()["ai_review_enabled"] is (ai_review_enabled is not False)
         async with session_factory() as db:
             stored_version = await db.get(TaskVersion, uuid.UUID(version_id))
             stored_assessment = await db.get(Assessment, uuid.UUID(assessment_id))
@@ -610,6 +620,7 @@ async def test_assessment_publication_atomically_publishes_valid_attached_draft(
             assert stored_version.published_at is not None
             assert stored_assessment.status == AssessmentStatus.PUBLISHED.value
             assert stored_assessment.published_at is not None
+            assert stored_assessment.ai_review_enabled is (ai_review_enabled is not False)
 
 
 async def test_legacy_import_configuration_marker_does_not_block_local_publication(app_bundle):

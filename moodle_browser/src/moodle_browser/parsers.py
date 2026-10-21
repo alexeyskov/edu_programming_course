@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from bs4 import BeautifulSoup, Tag
 
 from .config import exact_https_origin
+from .statements import preserve_statement_images, preserve_statement_math, truncate_statement
 
 _WHITESPACE = re.compile(r"\s+")
 _MODULE = re.compile(r"^modtype_([a-z0-9_]{1,32})$")
@@ -139,6 +140,20 @@ def has_authenticated_markup(html: str, base_url: str) -> bool:
     for anchor in soup.select("a[href]"):
         url = _same_origin_url(anchor.get("href"), base_url)
         if url and urlsplit(url).path.rstrip("/") == "/login/logout.php":
+            return True
+    return False
+
+
+def has_login_markup(html: str, base_url: str) -> bool:
+    """Recognize an actual same-origin login form, not a missing user menu."""
+    soup = BeautifulSoup(html, "html.parser")
+    for form in soup.select("form[action]"):
+        action = _same_origin_url(form.get("action"), base_url)
+        if (
+            action
+            and urlsplit(action).path.rstrip("/") == "/login/index.php"
+            and form.select_one("input[name='username'], input[name='password']") is not None
+        ):
             return True
     return False
 
@@ -938,16 +953,19 @@ def parse_activity_user_override_edit(
     return result
 
 
-def _plain_rich_text(raw: str, *, maximum: int) -> str:
+def _plain_rich_text(raw: str, *, maximum: int, base_url: str | None = None) -> str:
     """Render a bounded Moodle HTML editor value as readable plain text.
 
     Moodle stores editor content as HTML inside a textarea.  A whitespace-wide
     regex loses paragraph boundaries and list items, which made imported task
     statements unreadable.  Converting structural separators to newlines first
     keeps those boundaries without exposing HTML in the connector contract.
+    Task images become bounded Markdown image tokens, never arbitrary HTML.
     """
 
     fragment = BeautifulSoup(raw.replace("\xa0", " "), "html.parser")
+    preserve_statement_math(fragment)
+    preserve_statement_images(fragment, base_url=base_url)
     for line_break in fragment.find_all("br"):
         line_break.replace_with("\n")
     for block in fragment.find_all(
@@ -986,13 +1004,14 @@ def _plain_rich_text(raw: str, *, maximum: int) -> str:
             result.append("")
     while result and result[-1] == "":
         result.pop()
-    return "\n".join(result).strip()[:maximum]
+    return truncate_statement("\n".join(result).strip(), maximum=maximum)
 
 
 def _plain_editor_text(
     form: Tag,
     *names: str,
     maximum: int = 50_000,
+    base_url: str | None = None,
 ) -> str:
     selectors: list[str] = []
     for name in names:
@@ -1000,7 +1019,9 @@ def _plain_editor_text(
     control = form.select_one(", ".join(selectors)) if selectors else None
     if not isinstance(control, Tag):
         return ""
-    return _plain_rich_text(control.get_text("", strip=False), maximum=maximum)
+    return _plain_rich_text(
+        control.get_text("", strip=False), maximum=maximum, base_url=base_url
+    )
 
 
 def _positive_float(value: str) -> float | None:
@@ -1034,6 +1055,7 @@ def parse_activity_settings(
     course_id: str,
     cmid: int,
     module: str,
+    base_url: str | None = None,
 ) -> dict[str, Any]:
     """Parse the read-only part of a canonical Moodle activity edit form.
 
@@ -1074,7 +1096,7 @@ def parse_activity_settings(
     cutoff_at, cutoff_confirmed = (
         _date_time_evidence(form, "cutoffdate") if module == "assign" else (0, True)
     )
-    description = _plain_editor_text(form, "introeditor", "intro")
+    description = _plain_editor_text(form, "introeditor", "intro", base_url=base_url)
     result: dict[str, Any] = {
         "description": description,
         "instance_id": int(instance) if _POSITIVE_ID.fullmatch(instance) else 0,
@@ -1508,6 +1530,7 @@ def parse_quiz_essay_question_edit(
     course_id: str,
     cmid: int,
     question_id: str,
+    base_url: str | None = None,
 ) -> dict[str, str]:
     """Read the statement of one origin-checked Essay question edit form.
 
@@ -1562,6 +1585,7 @@ def parse_quiz_essay_question_edit(
             form,
             "questiontexteditor",
             "questiontext",
+            base_url=base_url,
         ),
     }
     result["statement_confirmed"] = bool(result["description"])

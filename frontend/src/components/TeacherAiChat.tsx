@@ -15,7 +15,7 @@ interface Message {
   incomplete?: boolean;
 }
 
-function safeLink(url: string): string {
+export function safeAiLink(url: string): string {
   try {
     const parsed = new URL(url);
     return ['https:', 'http:'].includes(parsed.protocol) && !parsed.username && !parsed.password ? url : '';
@@ -23,7 +23,7 @@ function safeLink(url: string): string {
 }
 
 export function AiMarkdown({ content }: { content: string }) {
-  return <div className="ai-markdown"><Markdown remarkPlugins={[remarkGfm]} skipHtml urlTransform={safeLink}
+  return <div className="ai-markdown"><Markdown remarkPlugins={[remarkGfm]} skipHtml urlTransform={safeAiLink}
     components={{
       a: ({ href, children }) => href ? <a href={href} target="_blank" rel="noopener noreferrer">{children}</a> : <span>{children}</span>,
       // Model-controlled images must not silently contact external tracking URLs.
@@ -42,7 +42,7 @@ export function ThinkingIndicator({ summary }: { summary?: string }) {
   </div>;
 }
 
-function CodeAttachment({ attachment, onRemove }: { attachment: AiCodeAttachment; onRemove?(): void }) {
+export function CodeAttachment({ attachment, onRemove }: { attachment: AiCodeAttachment; onRemove?(): void }) {
   const lines = attachment.startLine === attachment.endLine ? `строка ${attachment.startLine}` : `строки ${attachment.startLine}–${attachment.endLine}`;
   return <aside className="teacher-chat-attachment" aria-label={onRemove ? 'Прикреплённый код' : 'Фрагмент кода в сообщении'}>
     <div className="teacher-chat-attachment-heading"><span title={`${attachment.path} · ${lines}`}>{attachment.path} · {lines}</span>
@@ -53,7 +53,7 @@ function CodeAttachment({ attachment, onRemove }: { attachment: AiCodeAttachment
   </aside>;
 }
 
-function UserMessage({ content }: { content: string }) {
+export function UserMessage({ content }: { content: string }) {
   const { question, attachment } = parseTeacherAiMessage(content);
   return <>{attachment && <CodeAttachment attachment={attachment} />}<div className="teacher-chat-user-text">{question}</div></>;
 }
@@ -213,7 +213,7 @@ export function TeacherAiChat({ submissionId, courseId, canSend, teacherComment,
       {messages.map((item, index) => item.text && <article className={cn('teacher-chat-message', item.from === 'user' && 'is-user')} key={index}>
         {item.from === 'user' ? <UserMessage content={item.text} /> : <AiMarkdown content={item.text} />}
         {item.incomplete && <small className="teacher-chat-incomplete">Неполный ответ · не сохранён</small>}
-        {item.citations?.filter((citation) => safeLink(citation.url)).map((citation) => <a className="teacher-chat-citation" key={citation.url} href={citation.url} target="_blank" rel="noopener noreferrer">{citation.title}</a>)}
+        {item.citations?.filter((citation) => safeAiLink(citation.url)).map((citation) => <a className="teacher-chat-citation" key={citation.url} href={citation.url} target="_blank" rel="noopener noreferrer">{citation.title}</a>)}
       </article>)}
       {sending && thinking && <ThinkingIndicator summary={thinkingSummary} />}
       {error && <div className="teacher-chat-error" role="alert">{error}</div>}

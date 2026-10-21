@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import AliasChoices, AnyHttpUrl, Field, StringConstraints
+from pydantic import AliasChoices, AnyHttpUrl, Field, StringConstraints, field_validator
 
 from app.models.enums import CourseImportState, CourseRole
 from app.schemas.common import EmptyMutation, JsonObject, MutationModel, ReadModel
@@ -15,6 +15,7 @@ class CourseRead(ReadModel):
 
     id: UUID
     title: Annotated[str, StringConstraints(min_length=1, max_length=255)]
+    comment: Annotated[str, StringConstraints(max_length=255)] = ""
     short_name: Annotated[str, StringConstraints(max_length=120)] = ""
     description: str = ""
     timezone: Annotated[str, StringConstraints(min_length=1, max_length=64)]
@@ -68,6 +69,7 @@ class CourseCatalogRead(ReadModel):
     connection_name: Annotated[str, StringConstraints(min_length=1, max_length=120)]
     external_id: Annotated[str, StringConstraints(min_length=1, max_length=255)]
     title: Annotated[str, StringConstraints(min_length=1, max_length=255)]
+    comment: Annotated[str, StringConstraints(max_length=255)] = ""
     short_name: Annotated[str, StringConstraints(max_length=120)] = ""
     external_url: AnyHttpUrl
     sync_status: Annotated[str, StringConstraints(min_length=1, max_length=32)]
@@ -76,6 +78,17 @@ class CourseCatalogRead(ReadModel):
     sync_error_at: datetime | None = None
     sync_error_retryable: bool = False
     added_at: datetime | None = None
+
+
+class CourseCatalogCommentRequest(MutationModel):
+    comment: Annotated[str, StringConstraints(strip_whitespace=True, max_length=255)]
+
+    @field_validator("comment")
+    @classmethod
+    def normalize_comment(cls, value: str) -> str:
+        if any((ord(char) < 32 and char not in "\t\r\n") or ord(char) == 127 for char in value):
+            raise ValueError("Course comment must not contain control characters")
+        return " ".join(value.split())
 
 
 class CourseSyncRequest(EmptyMutation):
@@ -149,6 +162,7 @@ __all__ = [
     "HistoryWarningsDismissRead",
     "HistoryWarningsDismissRequest",
     "CourseCatalogRead",
+    "CourseCatalogCommentRequest",
     "CourseGroupRead",
     "CourseImportConfirmRequest",
     "CourseImportCreateRequest",

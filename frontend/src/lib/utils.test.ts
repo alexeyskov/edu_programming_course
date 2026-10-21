@@ -1,7 +1,20 @@
 import { describe, expect, it } from 'vitest';
-import { assessmentDisplayStatus, findWorkspacePasteSource, formatGreetingName, formatRemaining, formatSessionElapsed, languageForPath, unwrapList, validateWorkspacePath, workspaceIdentifiers } from './utils';
+import { assessmentDisplayStatus, assessmentPublicationState, findWorkspacePasteSource, formatGreetingName, formatRemaining, formatSessionElapsed, languageForPath, unwrapList, validateWorkspacePath, workspaceIdentifiers } from './utils';
 
 describe('workspace utilities', () => {
+  it('keeps publication badges aligned with server audience rules without changing stored publication', () => {
+    const native = { publicationStatus: 'PUBLISHED' as const, availabilityRules: [], policy: {} };
+    expect(assessmentPublicationState(native)).toBe('PUBLISHED'); // Native default: whole course.
+    expect(assessmentPublicationState({ ...native, requiresLiveLmsPreparation: true })).toBe('DRAFT');
+    const individual = { id: 'p1', targetType: 'PRINCIPAL' as const, targetExternalId: '77', allowed: true };
+    expect(assessmentPublicationState({ ...native, availabilityRules: [individual] })).toBe('PUBLISHED');
+    expect(assessmentPublicationState({ ...native, availabilityRules: [{ ...individual, allowed: false }] })).toBe('DRAFT');
+    // Obsolete individual Moodle rules do not open work to any student today.
+    expect(assessmentPublicationState({ ...native, policy: { moodle_metadata_read_only: true }, availabilityRules: [individual] })).toBe('DRAFT');
+    expect(assessmentPublicationState({ ...native, publicationStatus: 'CLOSED' })).toBe('CLOSED');
+    expect(assessmentPublicationState({ ...native, availabilityRules: undefined, requiresLiveLmsPreparation: true })).toBe('PUBLISHED');
+    expect(native.publicationStatus).toBe('PUBLISHED');
+  });
   it('distinguishes revoked Moodle groups from publication history and omitted student rules', () => {
     const assessment = { status: 'AVAILABLE' as const, publicationStatus: 'PUBLISHED' as const, policy: { moodle_metadata_read_only: true }, availabilityRules: [] };
     expect(assessmentDisplayStatus(assessment)).toBe('DRAFT');

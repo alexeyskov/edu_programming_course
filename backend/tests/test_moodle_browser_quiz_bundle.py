@@ -74,6 +74,9 @@ def preparation_payload(count: int = 2) -> dict[str, Any]:
         ("answer_transport", []),
         ("available_answer_transports", [{}]),
         ("question_max_mark", 1_000_000),
+        ("question_text_legacy_hashes", "not-a-list"),
+        ("question_text_legacy_hashes", ["x" * 64]),
+        ("question_text_legacy_hashes", ["0" * 64] * 3),
     ],
 )
 async def test_prepared_question_invalid_shapes_raise_protocol_error(field, value):
@@ -83,6 +86,21 @@ async def test_prepared_question_invalid_shapes_raise_protocol_error(field, valu
         questions[1][field] = value
         with pytest.raises(IntegrationProtocolError):
             browser._normalise_prepared_quiz_questions(questions)
+
+
+async def test_prepare_preserves_bounded_math_upgrade_proof_for_each_question():
+    payload = preparation_payload()
+    payload["preparation"]["question_text_legacy_hashes"] = ["1" * 64]
+    for index, question in enumerate(payload["preparation"]["questions"]):
+        question["question_text_legacy_hashes"] = [str(index + 1) * 64]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda _request: httpx.Response(200, json=payload),
+    )) as client:
+        prepared = (await browser_client(client).prepare_quiz_essay(COURSE_ID, CMID)).preparation
+    assert prepared.question_text_legacy_hashes == ("1" * 64,)
+    assert [question.question_text_legacy_hashes for question in prepared.questions] == [
+        ("1" * 64,), ("2" * 64,),
+    ]
 
 
 @pytest.mark.parametrize(

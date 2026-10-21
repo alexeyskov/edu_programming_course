@@ -344,11 +344,24 @@ async def test_network_failure_or_missing_key_cannot_delete_local_attempts() -> 
 
 
 @pytest.mark.asyncio
-async def test_expired_session_propagates_and_response_is_closed() -> None:
+@pytest.mark.parametrize("code", ["requireloginerror", "servicerequireslogin"])
+async def test_expired_session_propagates_and_response_is_closed(code) -> None:
     service = MoodleBrowserService(Settings(shared_secret=b"x" * 32))
-    requests = FakeRequests([failure("invalidsesskey", "Expired")])
+    requests = FakeRequests([failure(code, "Expired")])
     with pytest.raises(MoodleSessionExpired):
         await service._probe_deleted_attempts(SimpleNamespace(request=requests), REPORT, ["9001"])
+    assert requests.responses[0].disposed
+
+
+@pytest.mark.asyncio
+async def test_stale_csrf_key_is_inconclusive_not_a_logged_out_session() -> None:
+    service = MoodleBrowserService(Settings(shared_secret=b"x" * 32))
+    requests = FakeRequests([failure("invalidsesskey", "Stale key")])
+    result = await service._probe_deleted_attempts(
+        SimpleNamespace(request=requests), REPORT, ["9001", "9002", "9003"]
+    )
+    assert result == ([], True)
+    assert len(requests.calls) == 1  # Do not hammer Moodle with the same rejected CSRF key.
     assert requests.responses[0].disposed
 
 

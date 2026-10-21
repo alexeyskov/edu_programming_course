@@ -98,10 +98,11 @@ describe('per-assessment student AI access', () => {
 });
 
 describe('per-assessment automatic AI review', () => {
-  it('is disabled by default for an administrator and explains the separate recommendation policy', async () => {
+  it('is enabled by default for an administrator and explains the separate recommendation policy', async () => {
     auth.capabilities = ['SYSTEM_SETTINGS'];
     renderAssessment();
-    expect(await screen.findByRole('checkbox', { name: 'Автоматическая ИИ-проверка' })).not.toBeChecked();
+    expect(await screen.findByRole('checkbox', { name: 'Автоматическая ИИ-проверка' })).toBeChecked();
+    expect(screen.getByText(/Для новых работ включено по умолчанию. Сохранённое отключение не меняется/)).toBeInTheDocument();
     expect(screen.getByText(/но не выставляет оценку/)).toBeInTheDocument();
     expect(screen.getByText(/сразу после сдачи студентом, а для ответов из Moodle — после синхронизации/)).toBeInTheDocument();
     expect(screen.getByText(/уже сданные работы без итоговой оценки/)).toBeInTheDocument();
@@ -139,9 +140,9 @@ describe('per-assessment automatic AI review', () => {
     expect(screen.getByText('Сохраняем настройку…')).toBeInTheDocument();
     fireEvent.click(checkbox);
     expect(mocks.setAssessmentAiReviewPolicy).toHaveBeenCalledTimes(1);
-    resolveSave({ ...assessment, aiReviewEnabled: true });
+    resolveSave({ ...assessment, aiReviewEnabled: false });
     await waitFor(() => expect(checkbox).toBeEnabled());
-    expect(checkbox).toBeChecked();
+    expect(checkbox).not.toBeChecked();
   });
 
   it.each([false, true])('restores the saved %s policy and shows an error if saving fails', async (initial) => {
@@ -168,7 +169,7 @@ describe('per-assessment automatic AI review', () => {
 
   it('allows an administrator to enable review for a closed assignment without reopening it', async () => {
     auth.capabilities = ['SYSTEM_SETTINGS'];
-    const closedAssessment = { ...assessment, status: 'CLOSED', publicationStatus: 'CLOSED' } as Assessment;
+    const closedAssessment = { ...assessment, status: 'CLOSED', publicationStatus: 'CLOSED', aiReviewEnabled: false } as Assessment;
     mocks.getAssessment.mockResolvedValue(closedAssessment);
     mocks.setAssessmentAiReviewPolicy.mockResolvedValue({ ...closedAssessment, aiReviewEnabled: true });
     renderAssessment();

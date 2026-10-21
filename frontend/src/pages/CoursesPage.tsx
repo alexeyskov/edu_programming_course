@@ -1,5 +1,6 @@
 import { ArrowRight, BookOpen, CalendarDays, ChevronDown, ChevronUp, ExternalLink, RefreshCw, Search } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { CourseTitle } from '../components/CourseTitle';
 import { Link } from 'react-router-dom';
 import { Badge, Button, Card, EmptyState, InlineError, PageLoader, useToast } from '../components/ui';
 import { LmsSyncErrorDialog } from '../components/LmsSyncErrorDialog';
@@ -223,16 +224,17 @@ export function CoursesPage() {
         const canSync = teacher && course.role === 'TEACHER';
         const collapsed = !expandedCourseIds.has(course.id);
         const worksId = `course-works-${course.id}`;
-        const toggleLabel = `${collapsed ? 'Развернуть' : 'Свернуть'} список работ курса ${course.title}`;
+        const courseLabel = [course.title, course.comment].filter(Boolean).join(' ');
+        const toggleLabel = `${collapsed ? 'Развернуть' : 'Свернуть'} список работ курса ${courseLabel}`;
         return <Card className={`course-detail${collapsed ? ' course-detail--collapsed' : ''}`} key={course.id}>
           <header>
             <span className="course-detail__icon"><BookOpen /></span>
-            <div><h2>{course.title}</h2><p>{course.shortName}{course.group && ` · группа ${course.group}`}</p>{course.syncedAt && <small className="course-detail__updated">Список обновлён: {formatDate(course.syncedAt)}</small>}</div>
+            <div><h2><CourseTitle title={course.title} comment={course.comment} /></h2><p>{course.shortName}{course.group && ` · группа ${course.group}`}</p>{course.syncedAt && <small className="course-detail__updated">Список обновлён: {formatDate(course.syncedAt)}</small>}</div>
             {course.syncStatus === 'ERROR'
-              ? <button type="button" className="sync-error-trigger" onClick={() => setSyncErrorCourse(course)} aria-label={`Показать ошибку синхронизации курса ${course.title}`}><Badge tone="danger"><RefreshCw size={12} /> Ошибка LMS</Badge></button>
+              ? <button type="button" className="sync-error-trigger" onClick={() => setSyncErrorCourse(course)} aria-label={`Показать ошибку синхронизации курса ${courseLabel}`}><Badge tone="danger"><RefreshCw size={12} /> Ошибка LMS</Badge></button>
               : <Badge tone={course.syncStatus === 'SYNCED' ? 'success' : syncingCourse ? 'info' : 'warning'}><RefreshCw size={12} className={syncingCourse ? 'spin' : ''} /> {syncingCourse ? 'Синхронизируется' : course.syncStatus === 'SYNCED' ? 'Список курса загружен' : 'Курс не синхронизирован'}</Badge>}
             {canSync && <Button size="sm" variant="secondary" disabled={syncingCourse || syncingAnswers || Boolean(statusError)}
-              aria-label={`Обновить список курса ${course.title}`}
+              aria-label={`Обновить список курса ${courseLabel}`}
               title={syncingAnswers ? 'Дождитесь синхронизации ответов в этом курсе' : 'Обновить список работ, студентов и преподавателей; ответы не загружаются'}
               onClick={() => void startSync(course)}><RefreshCw size={15} className={syncingCourse ? 'spin' : ''} /> Обновить список</Button>}
             {course.externalUrl && <a href={course.externalUrl} target="_blank" rel="noreferrer" aria-label="Открыть в LMS"><ExternalLink size={17} /></a>}

@@ -19,7 +19,22 @@ function setup(overrides = {}, modelPath = 'main.cpp') {
   return { config, editor, handle, change, models, clear: () => { selected = false; change.forEach((fn) => fn()); } };
 }
 
-describe('teacher code selection action', () => {
+describe('opt-in code selection action', () => {
+  it('allows editable student code only with explicit opt-in and never starts a request on selection', () => {
+    const { editor, config, handle } = setup({ readOnly: false, allowEditable: true });
+    expect(editor.addContentWidget).toHaveBeenCalledTimes(1);
+    expect(config.onAsk).not.toHaveBeenCalled();
+    const button = editor.addContentWidget.mock.calls[0][0].getDomNode() as HTMLButtonElement;
+    button.click();
+    expect(config.onAsk).toHaveBeenCalledWith(expect.objectContaining({ path: 'main.cpp' }));
+    config.experiment = true;
+    handle.refresh();
+    expect(editor.removeContentWidget).toHaveBeenCalledTimes(1);
+    button.click();
+    expect(config.onAsk).toHaveBeenCalledTimes(1);
+    handle.dispose();
+  });
+
   it('only prepares a draft after explicitly clicking the floating action', () => {
     const { editor, config, handle, clear, change, models } = setup();
     expect(editor.addContentWidget).toHaveBeenCalledTimes(1);
@@ -36,7 +51,7 @@ describe('teacher code selection action', () => {
     expect(change.size + models.size).toBe(0);
   });
 
-  it.each([{ readOnly: false }, { experiment: true }, { onAsk: undefined }, { scopeId: 'other-submission' }])('is absent for editing, sandbox, student callers or another model: %j', (config) => {
+  it.each([{ readOnly: false }, { experiment: true }, { onAsk: undefined }, { scopeId: 'other-submission' }])('is absent without editable opt-in, in a sandbox, without a callback or for another model: %j', (config) => {
     const { editor, handle } = setup(config);
     expect(editor.addContentWidget).not.toHaveBeenCalled();
     handle.dispose();

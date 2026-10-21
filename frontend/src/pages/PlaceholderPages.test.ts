@@ -4,13 +4,15 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Assessment, HiddenTestCase } from '../types';
 import { AssessmentIntroPage, buildHiddenTestManifest } from './PlaceholderPages';
+import { ToastProvider } from '../components/ui';
 
-const mocks = vi.hoisted(() => ({ getAssessment: vi.fn(), startAttempt: vi.fn() }));
+const mocks = vi.hoisted(() => ({ getAssessment: vi.fn(), startAttempt: vi.fn(), getAssessmentPublicationTargets: vi.fn(), publishAssessment: vi.fn(), setAssessmentAiReviewPolicy: vi.fn() }));
+const authRole = vi.hoisted(() => ({ primaryRole: 'STUDENT' as 'STUDENT' | 'TEACHER', capabilities: [] as string[] }));
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...await importOriginal<typeof import('../lib/api')>(), api: mocks,
 }));
-vi.mock('../context/AuthContext', () => ({ useAuth: () => ({ primaryRole: 'STUDENT' }) }));
+vi.mock('../context/AuthContext', () => ({ useAuth: () => ({ primaryRole: authRole.primaryRole, session: { capabilities: authRole.capabilities } }) }));
 
 afterEach(cleanup);
 
@@ -32,8 +34,114 @@ describe('student assessment start', () => {
   }
 
   beforeEach(() => {
+    authRole.primaryRole = 'STUDENT';
+    authRole.capabilities = [];
     mocks.getAssessment.mockReset();
     mocks.startAttempt.mockReset().mockResolvedValue({ id: 'attempt-1' });
+    mocks.setAssessmentAiReviewPolicy.mockReset();
+  });
+
+  it('shows automatic review as enabled by default to an administrator', async () => {
+    authRole.primaryRole = 'TEACHER';
+    authRole.capabilities = ['SYSTEM_SETTINGS'];
+    renderAssessment();
+    expect(await screen.findByRole('checkbox', { name: 'Автоматическая ИИ-проверка' })).toBeChecked();
+    expect(screen.getByText(/Для новых работ включено по умолчанию/)).toBeInTheDocument();
+    expect(screen.queryByText(/По умолчанию выключено/)).not.toBeInTheDocument();
+    expect(mocks.setAssessmentAiReviewPolicy).not.toHaveBeenCalled();
+  });
+
+  it('keeps an administrator opt-out disabled instead of resetting it on display', async () => {
+    authRole.primaryRole = 'TEACHER';
+    authRole.capabilities = ['SYSTEM_SETTINGS'];
+    renderAssessment({ aiReviewEnabled: false });
+    expect(await screen.findByRole('checkbox', { name: 'Автоматическая ИИ-проверка' })).not.toBeChecked();
+    expect(mocks.setAssessmentAiReviewPolicy).not.toHaveBeenCalled();
+  });
+
+  it('saves an explicit opt-out once without changing student AI help', async () => {
+    authRole.primaryRole = 'TEACHER';
+    authRole.capabilities = ['SYSTEM_SETTINGS'];
+    mocks.setAssessmentAiReviewPolicy.mockResolvedValue({ ...assessment, aiReviewEnabled: false });
+    renderAssessment({ aiReviewEnabled: true });
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Автоматическая ИИ-проверка' }));
+    await waitFor(() => expect(screen.getByRole('checkbox', { name: 'Автоматическая ИИ-проверка' })).not.toBeChecked());
+    expect(await screen.findByText('Настройка сохранена')).toBeInTheDocument();
+    expect(mocks.setAssessmentAiReviewPolicy).toHaveBeenCalledExactlyOnceWith(assessment.id, false);
+  });
+
+  it('restores default-on display after a policy save failure instead of pretending it was saved', async () => {
+    authRole.primaryRole = 'TEACHER';
+    authRole.capabilities = ['SYSTEM_SETTINGS'];
+    mocks.setAssessmentAiReviewPolicy.mockRejectedValue(new Error('Сервис временно недоступен'));
+    renderAssessment();
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Автоматическая ИИ-проверка' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Сервис временно недоступен');
+    expect(screen.getByRole('checkbox', { name: 'Автоматическая ИИ-проверка' })).toBeChecked();
+    expect(screen.queryByText('Настройка сохранена')).not.toBeInTheDocument();
+  });
+
+  it.each([
+    { rules: [] },
+    { rules: [{ id: 'g1', targetType: 'GROUP' as const, targetExternalId: 'group-1', allowed: false }] },
+  ])('does not call a Moodle work published when no group has access: %j', async ({ rules }) => {
+    authRole.primaryRole = 'TEACHER';
+    renderAssessment({ publicationStatus: 'PUBLISHED', policy: { moodle_metadata_read_only: true }, availabilityRules: rules });
+    expect(await screen.findByText('Не включена')).toBeInTheDocument();
+    expect(screen.queryByText('Опубликована')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Настроить доступ' })).toBeInTheDocument();
+  });
+
+  it('still shows publication for an explicitly allowed group', async () => {
+    authRole.primaryRole = 'TEACHER';
+    renderAssessment({ publicationStatus: 'PUBLISHED', policy: { moodle_metadata_read_only: true }, availabilityRules: [
+      { id: 'g1', targetType: 'GROUP', targetExternalId: 'group-1', allowed: true },
+    ] });
+    expect(await screen.findByText('Опубликована')).toBeInTheDocument();
+    expect(screen.queryByText('Не включена')).not.toBeInTheDocument();
+  });
+
+  it('updates the publication badge immediately after the last selected group is revoked', async () => {
+    authRole.primaryRole = 'TEACHER';
+    const open = { ...assessment, publicationStatus: 'PUBLISHED' as const,
+      policy: { moodle_metadata_read_only: true }, availabilityRules: [
+        { id: 'g1', targetType: 'GROUP' as const, targetExternalId: 'group-1', allowed: true },
+      ] };
+    mocks.getAssessment.mockResolvedValue(open);
+    mocks.getAssessmentPublicationTargets.mockResolvedValue({ groups: [{ id: 'group-id', externalId: 'group-1', name: '2 — Тестовая группа' }], principals: [], overridesConfirmed: true });
+    mocks.publishAssessment.mockResolvedValue({ ...open, availabilityRules: [] });
+    render(createElement(MemoryRouter, { initialEntries: ['/assessments/assessment-1'] },
+      createElement(ToastProvider, null, createElement(Routes, null,
+        createElement(Route, { path: '/assessments/:assessmentId', element: createElement(AssessmentIntroPage) }),
+      )),
+    ));
+    fireEvent.click(await screen.findByRole('button', { name: 'Изменить доступ' }));
+    const group = await screen.findByRole('checkbox', { name: /2 — Тестовая группа/ });
+    expect(group).toBeChecked(); fireEvent.click(group);
+    fireEvent.click(screen.getByRole('button', { name: 'Сохранить доступ' }));
+    expect(await screen.findByText('Не включена')).toBeInTheDocument();
+    expect(mocks.publishAssessment).toHaveBeenCalledWith(assessment.id, [], false);
+    expect(screen.queryByText('Опубликована')).not.toBeInTheDocument();
+  });
+
+  it.each([
+    { maxScore: 0, expected: 'Без балльного оценивания · попыток: 1' },
+    { maxScore: 5, expected: 'до 5 баллов · попыток: 1' },
+  ])('describes Moodle grading without treating a zero maximum as points ($maxScore)', async ({ maxScore, expected }) => {
+    authRole.primaryRole = 'TEACHER';
+    mocks.publishAssessment.mockReset();
+    mocks.getAssessment.mockResolvedValue({ ...assessment, maxScore, attemptLimit: 1,
+      publicationStatus: 'PUBLISHED', policy: { moodle_metadata_read_only: true }, availabilityRules: [] });
+    mocks.getAssessmentPublicationTargets.mockResolvedValue({ groups: [], principals: [], overridesConfirmed: true });
+    render(createElement(MemoryRouter, { initialEntries: ['/assessments/assessment-1'] },
+      createElement(ToastProvider, null, createElement(Routes, null,
+        createElement(Route, { path: '/assessments/:assessmentId', element: createElement(AssessmentIntroPage) }),
+      )),
+    ));
+    fireEvent.click(await screen.findByRole('button', { name: 'Настроить доступ' }));
+    expect(await screen.findByText(expected)).toBeVisible();
+    expect(screen.queryByText('до 0 баллов · попыток: 1')).not.toBeInTheDocument();
+    expect(mocks.publishAssessment).not.toHaveBeenCalled();
   });
 
   it('starts an available attempt directly without an acknowledgement checkbox', async () => {
@@ -44,6 +152,13 @@ describe('student assessment start', () => {
     fireEvent.click(start);
     await screen.findByText('Попытка открыта');
     expect(mocks.startAttempt).toHaveBeenCalledWith('assessment-1', expect.any(AbortSignal));
+  });
+
+  it('shows imported task images before starting an assessment', async () => {
+    const url = 'https://edu.mmcs.sfedu.ru/filter/tex/pix.php/formula.png';
+    renderAssessment({ summary: `Вычислите ![Формула суммы](<${url}>).` });
+    expect(await screen.findByRole('img', { name: 'Формула суммы' })).toHaveAttribute('src', `/api/v1/statement-images/assessment/${assessment.id}?url=${encodeURIComponent(url)}`);
+    expect(mocks.startAttempt).not.toHaveBeenCalled();
   });
 
   it.each([

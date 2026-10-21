@@ -123,6 +123,36 @@ async def test_login_is_hmac_signed_and_returns_identity_with_refreshed_state() 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("returned_user", ["42", "43"])
+async def test_keepalive_signs_request_and_only_accepts_the_expected_user(returned_user):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/internal/v1/moodle/session/keepalive"
+        assert request.method == "POST"
+        payload = json.loads(request.content)
+        assert payload["actor_external_subject"] == "42"
+        assert payload["storage_state"] == storage_state()
+        assert request.headers["X-Moodle-Signature"].startswith("v1=")
+        assert "password" not in payload
+        return httpx.Response(200, json={
+            "external_subject": returned_user,
+            "storage_state": storage_state(marker="refreshed"),
+        })
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        browser = MoodleBrowserClient(
+            settings(), client, service_url="http://moodle-browser:8082",
+            shared_secret="b" * 32, storage_state=storage_state(),
+        )
+        if returned_user != "42":
+            with pytest.raises(IntegrationProtocolError, match="another user"):
+                await browser.keepalive("42")
+            assert browser.storage_state == storage_state()
+        else:
+            result = await browser.keepalive("42")
+            assert result == storage_state(marker="refreshed")
+
+
+@pytest.mark.asyncio
 async def test_login_rejects_duplicate_or_invalid_allowed_course_ids_before_http() -> None:
     calls = 0
 

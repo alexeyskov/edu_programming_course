@@ -5,6 +5,7 @@ import {
 import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { Badge, Button, Card, Field, InlineError, Modal, PageLoader, Toggle, useToast } from '../components/ui';
 import { LmsSyncErrorDialog } from '../components/LmsSyncErrorDialog';
+import { CourseTitle } from '../components/CourseTitle';
 import { AiChatCleanupSettings } from '../components/AiChatCleanupSettings';
 import { StorageCleanupSettings } from '../components/StorageCleanupSettings';
 import { useAuth } from '../context/AuthContext';
@@ -214,6 +215,11 @@ export function SettingsPage() {
   const courseAddingRef = useRef(false);
   const [courseToRemove, setCourseToRemove] = useState<CourseCatalogEntry | null>(null);
   const [removingCourseId, setRemovingCourseId] = useState<string | null>(null);
+  const [courseToEdit, setCourseToEdit] = useState<CourseCatalogEntry | null>(null);
+  const [courseCommentDraft, setCourseCommentDraft] = useState('');
+  const [courseCommentError, setCourseCommentError] = useState<string | null>(null);
+  const [savingCourseComment, setSavingCourseComment] = useState(false);
+  const savingCourseCommentRef = useRef(false);
   const [syncErrorCourse, setSyncErrorCourse] = useState<CourseCatalogEntry | null>(null);
   const [syncRetrying, setSyncRetrying] = useState(false);
   const [teacherTokens, setTeacherTokens] = useState<TeacherAccessToken[]>([]);
@@ -256,6 +262,9 @@ export function SettingsPage() {
     setElevationError(null);
     setError(null);
     setCatalogError(null);
+    setCourseToEdit(null);
+    setCourseCommentDraft('');
+    setCourseCommentError(null);
     setTeacherTokensError(null);
     setRevealedTeacherTokens({});
     setTeacherTokenToEdit(null);
@@ -498,6 +507,46 @@ export function SettingsPage() {
     } finally {
       courseAddingRef.current = false;
       setCourseAdding(false);
+    }
+  }
+
+  function editCourseComment(course: CourseCatalogEntry) {
+    setCourseToEdit(course);
+    setCourseCommentDraft(course.comment ?? '');
+    setCourseCommentError(null);
+  }
+
+  function closeCourseComment() {
+    if (savingCourseCommentRef.current) return;
+    setCourseToEdit(null);
+    setCourseCommentError(null);
+    setCourseCommentDraft('');
+  }
+
+  async function saveCourseComment(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!courseToEdit || savingCourseCommentRef.current) return;
+    const requestEpoch = accessEpochRef.current;
+    const course = courseToEdit;
+    savingCourseCommentRef.current = true;
+    setSavingCourseComment(true);
+    setCourseCommentError(null);
+    try {
+      const updated = await api.updateCourseComment(course.id, courseCommentDraft);
+      if (requestEpoch !== accessEpochRef.current) return;
+      // Retire catalogue reads begun before the successful edit: a slow
+      // background sync refresh must not restore the previous comment.
+      catalogRequestRef.current += 1;
+      setCatalog((items) => items.map((item) => item.id === course.id ? updated : item));
+      setCourseToEdit(null);
+      setCourseCommentDraft('');
+    } catch (caught) {
+      if (!requireElevation(caught, requestEpoch) && requestEpoch === accessEpochRef.current) {
+        setCourseCommentError(caught instanceof Error ? caught.message : 'Не удалось сохранить комментарий');
+      }
+    } finally {
+      savingCourseCommentRef.current = false;
+      setSavingCourseComment(false);
     }
   }
 
@@ -763,7 +812,7 @@ export function SettingsPage() {
                   {catalog.map((course) => <div className="system-course-row" key={course.id}>
                     <div className="system-course-copy">
                       <div className="system-course-title">
-                        <strong>{course.title}</strong>
+                        <strong><CourseTitle title={course.title} comment={course.comment} /></strong>
                         {course.shortName && <small>{course.shortName}</small>}
                       </div>
                       <div className="system-course-meta">
@@ -775,6 +824,14 @@ export function SettingsPage() {
                       </div>
                     </div>
                     <div className="system-course-actions">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        aria-label={`Изменить комментарий к курсу ${course.title} (${course.externalId})`}
+                        title="Комментарий к курсу"
+                        disabled={removingCourseId === course.id}
+                        onClick={() => editCourseComment(course)}
+                      ><Pencil size={16} /></Button>
                       <a href={course.externalUrl} target="_blank" rel="noreferrer" aria-label={`Открыть курс ${course.title} в Moodle`}>
                         <ExternalLink size={16} />
                       </a>
@@ -978,6 +1035,26 @@ export function SettingsPage() {
       onClose={() => setSyncErrorCourse(null)}
       onRetry={() => void retryCourseSync()}
     />
+
+    <Modal
+      open={Boolean(courseToEdit)}
+      title="Комментарий к курсу"
+      onClose={closeCourseComment}
+      footer={<>
+        <Button variant="ghost" disabled={savingCourseComment} onClick={closeCourseComment}>Отмена</Button>
+        <Button type="submit" form="course-comment-editor" loading={savingCourseComment}
+          disabled={courseCommentDraft.trim().replace(/\s+/g, ' ') === (courseToEdit?.comment ?? '')}
+        ><Save size={16} /> Сохранить</Button>
+      </>}
+    >
+      <form id="course-comment-editor" onSubmit={(event) => void saveCourseComment(event)}>
+        <p className="modal-copy">{courseToEdit?.title}</p>
+        <Field label="Комментарий к курсу" hint="Будет виден рядом с названием всем пользователям. Название в Moodle не изменится. Чтобы убрать комментарий, очистите поле." error={courseCommentError ?? undefined}>
+          <input autoFocus value={courseCommentDraft} maxLength={255} disabled={savingCourseComment}
+            placeholder="Например, осень 2026" onChange={(event) => { setCourseCommentDraft(event.target.value); setCourseCommentError(null); }} />
+        </Field>
+      </form>
+    </Modal>
 
     <Modal
       open={Boolean(courseToRemove)}

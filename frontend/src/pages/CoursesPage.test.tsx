@@ -53,6 +53,21 @@ describe('teacher courses page', () => {
   const course = { id: 'course-1', title: 'C++', shortName: 'C++', syncStatus: 'SYNCED', role: 'TEACHER' };
   const assessment = { id: 'assessment-1', courseId: 'course-1', title: 'Работа 1', kind: 'LAB', status: 'AVAILABLE', standard: 'C++20', fileMode: 'SINGLE' };
 
+  it.each(['TEACHER', 'STUDENT'] as const)('distinguishes identical course titles by their local comments for %s', async (role) => {
+    auth.primaryRole = role;
+    mocks.getCourses.mockResolvedValue([
+      { ...course, role, comment: 'Осень 2026' },
+      { ...course, role, id: 'course-2', comment: 'Весна 2026' },
+    ]);
+    render(<MemoryRouter><ToastProvider><CoursesPage /></ToastProvider></MemoryRouter>);
+    const autumn = await screen.findByRole('heading', { name: 'C++ Осень 2026' });
+    expect(screen.getByRole('heading', { name: 'C++ Весна 2026' })).toBeInTheDocument();
+    expect(autumn.querySelector('.course-title__comment')).toHaveTextContent('Осень 2026');
+    fireEvent.click(screen.getByRole('button', { name: 'Развернуть список работ курса C++ Осень 2026' }));
+    expect(screen.getByRole('button', { name: 'Свернуть список работ курса C++ Осень 2026' })).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByRole('button', { name: 'Развернуть список работ курса C++ Весна 2026' })).toHaveAttribute('aria-expanded', 'false');
+  });
+
   it('keeps both inset-arrow selectors accessible and combines their filters', async () => {
     mocks.getCourses.mockResolvedValue([course]);
     mocks.getAssessments.mockResolvedValue([

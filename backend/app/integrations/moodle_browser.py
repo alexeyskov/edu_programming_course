@@ -31,6 +31,7 @@ from .moodle_standard import MoodleAuthenticationError, MoodleCourseMembership, 
 
 _ENDPOINTS = {
     "login": "/internal/v1/moodle/login",
+    "keepalive": "/internal/v1/moodle/session/keepalive",
     "discover_course": "/internal/v1/moodle/course/discover",
     "push_grade": "/internal/v1/moodle/assignment/grade",
     "sync_assignment_submission": "/internal/v1/moodle/assignment/submission/sync",
@@ -52,6 +53,16 @@ _IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{8,200}$")
 _NONCE_RE = re.compile(r"^[A-Za-z0-9._-]{16,128}$")
 _ARTIFACT_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
+
+
+def _statement_legacy_hashes(raw: Any) -> tuple[str, ...]:
+    if raw is None:
+        return ()  # An older connector has no presentation-repair proof.
+    if not isinstance(raw, list) or len(raw) > 2 or any(
+        not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None for value in raw
+    ):
+        raise IntegrationProtocolError("Moodle statement repair proof is invalid")
+    return tuple(dict.fromkeys(raw))
 _MAX_QUIZ_ARTIFACT_BYTES = 4 * 1024 * 1024
 _MAX_QUIZ_RECEIPT_BYTES = 4 * 1024
 _MANAGED_SUBMISSION_FILENAMES = frozenset(
@@ -138,6 +149,7 @@ class MoodleBrowserQuizQuestionPreparation:
     available_answer_transports: tuple[Literal["ESSAY_ATTACHMENT", "ESSAY_ONLINE_TEXT"], ...]
     page: int = 0
     question_max_mark: float | None = None
+    question_text_legacy_hashes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +163,7 @@ class MoodleBrowserQuizEssayPreparation:
     available_answer_transports: tuple[Literal["ESSAY_ATTACHMENT", "ESSAY_ONLINE_TEXT"], ...]
     remaining_seconds: int | None = None
     questions: tuple[MoodleBrowserQuizQuestionPreparation, ...] = ()
+    question_text_legacy_hashes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -392,6 +405,19 @@ class MoodleBrowserClient:
         state = self._response_storage_state(result)
         self._storage_state = state
         return MoodleBrowserLoginResult(identity=identity, storage_state=self.storage_state or {})
+
+    async def keepalive(self, actor_external_subject: str) -> dict[str, Any]:
+        actor_id = self._positive_id(actor_external_subject, "Moodle actor external subject")
+        result = await self._call("keepalive", {
+            "schema_version": "1.0",
+            "base_url": self.base_url,
+            "actor_external_subject": actor_id,
+            "storage_state": self._required_storage_state(),
+        })
+        if result.get("external_subject") != actor_id:
+            raise IntegrationProtocolError("Moodle keepalive returned another user")
+        self._storage_state = self._response_storage_state(result)
+        return self.storage_state or {}
 
     async def discover_course(
         self,
@@ -736,6 +762,9 @@ class MoodleBrowserClient:
                 MoodleBrowserQuizQuestionPreparation(
                     question_slot=slot,
                     question_text=statement,
+                    question_text_legacy_hashes=_statement_legacy_hashes(
+                        value.get("question_text_legacy_hashes")
+                    ),
                     answer_transport=cast(
                         Literal["ESSAY_ATTACHMENT", "ESSAY_ONLINE_TEXT"], transport
                     ),
@@ -806,6 +835,7 @@ class MoodleBrowserClient:
         question_text = self._required_text(
             raw.get("question_text"), 50_000, "Prepared Moodle quiz question text"
         )
+        legacy_hashes = _statement_legacy_hashes(raw.get("question_text_legacy_hashes"))
         answer_transport = self._required_text(
             raw.get("answer_transport"), 32, "Prepared Moodle quiz answer transport"
         ).upper()
@@ -842,6 +872,7 @@ class MoodleBrowserClient:
         if questions and (
             questions[0].question_slot != question_slot
             or questions[0].question_text != question_text
+            or questions[0].question_text_legacy_hashes != legacy_hashes
             or questions[0].answer_transport != answer_transport
             or questions[0].available_answer_transports != available
         ):
@@ -855,6 +886,7 @@ class MoodleBrowserClient:
                 attempt_id=attempt_id,
                 question_slot=question_slot,
                 question_text=question_text,
+                question_text_legacy_hashes=legacy_hashes,
                 answer_transport=cast(
                     Literal["ESSAY_ATTACHMENT", "ESSAY_ONLINE_TEXT"],
                     answer_transport,

@@ -24,6 +24,7 @@ from moodle_browser.models import (
     QuizEssayPrepareResponse,
     QuizEssaySyncRequest,
     QuizEssaySyncResponse,
+    SessionKeepaliveResponse,
 )
 from moodle_browser.security import signed_headers
 
@@ -52,6 +53,12 @@ def storage_state() -> dict[str, Any]:
 class FakeService:
     def readiness(self) -> dict[str, object]:
         return {"browser": "connected", "ready": True}
+
+    async def keepalive(self, payload: Any) -> SessionKeepaliveResponse:
+        return SessionKeepaliveResponse.model_validate({
+            "external_subject": payload.actor_external_subject,
+            "storage_state": storage_state(),
+        })
 
     async def login(self, _payload: object) -> LoginResponse:
         return LoginResponse.model_validate(

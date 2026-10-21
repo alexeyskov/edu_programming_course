@@ -268,6 +268,7 @@ async def _prepare_moodle_quiz_attempt(
             external_attempt_id=preparation.attempt_id,
             question_slot=preparation.question_slot,
             question_text=preparation.question_text,
+            question_text_legacy_hashes=getattr(preparation, "question_text_legacy_hashes", ()),
             answer_transport=preparation.answer_transport,
             available_answer_transports=preparation.available_answer_transports,
             remaining_seconds=preparation.remaining_seconds,
@@ -276,6 +277,9 @@ async def _prepare_moodle_quiz_attempt(
                 {
                     "question_slot": question.question_slot,
                     "question_text": question.question_text,
+                    "question_text_legacy_hashes": getattr(
+                        question, "question_text_legacy_hashes", ()
+                    ),
                     "answer_transport": question.answer_transport,
                     "available_answer_transports": question.available_answer_transports,
                     "question_max_mark": question.question_max_mark,

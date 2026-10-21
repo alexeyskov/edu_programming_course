@@ -119,16 +119,17 @@ export function AiReviewRecommendation({ report, maxScore, canApprove, onApprove
 }) {
   if (!report?.enabled || report.state !== 'COMPLETED' || report.recommendationStatus === 'DISCARDED') return null;
   const grade = report.recommendedGrade;
+  const pointsDisabled = maxScore === 0;
   const validGrade = grade != null && Number.isFinite(grade) && grade >= 0 && grade <= maxScore;
   return <section className="ai-review-recommendation" aria-label="Ответ ИИ">
-    <header><strong><Bot size={15} /> Ответ ИИ:</strong><span>{validGrade ? `${grade}/${maxScore}` : 'Без балла'}</span></header>
+    <header><strong><Bot size={15} /> Ответ ИИ:</strong><span>{!pointsDisabled && validGrade ? `${grade}/${maxScore}` : 'Без балла'}</span></header>
     <p>{report.recommendedComment || report.summary}</p>
     <small>{report.recommendationStatus === 'APPROVED'
       ? 'На основе рекомендации утверждено решение преподавателя. Статус отправки указан у основного решения.'
-      : `Кнопка подставит балл и комментарий в поля формы. Отправка в Moodle — только через «Утвердить». ${report.automatic
+      : `Кнопка подставит ${pointsDisabled ? 'комментарий в форму. Баллы за эту работу не выставляются.' : 'балл и комментарий в поля формы.'} Отправка в Moodle — только через «Утвердить». ${report.automatic
         ? 'При выходе отменяется только неутверждённый ИИ-черновик в форме. Ответ автоматической проверки и подсветка замечаний сохраняются.'
         : 'При выходе без утверждения ИИ-черновик и рекомендация ручной проверки отменяются.'}`}</small>
-    {report.id && report.recommendationStatus === 'PENDING' && validGrade && report.recommendedComment?.trim() && <Button size="sm" variant="secondary" disabled={!canApprove} loading={applying} onClick={onApprove}>Поставить оценку и комментарий от ИИ</Button>}
+    {report.id && report.recommendationStatus === 'PENDING' && validGrade && report.recommendedComment?.trim() && <Button size="sm" variant="secondary" disabled={!canApprove} loading={applying} onClick={onApprove}>{pointsDisabled ? 'Поставить комментарий от ИИ' : 'Поставить оценку и комментарий от ИИ'}</Button>}
   </section>;
 }
 

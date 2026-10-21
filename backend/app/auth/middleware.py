@@ -148,11 +148,14 @@ class SessionAuthenticationMiddleware(BaseHTTPMiddleware):
                     elevation.revoked_at = now
                 else:
                     capabilities = ("SYSTEM_SETTINGS",)
-                    elevation.last_used_at = now
-                    elevation.expires_at = min(
-                        now + timedelta(seconds=self.settings.admin_elevation_idle_seconds),
-                        _aware(elevation.absolute_expires_at),
-                    )
+                    # Automatic Moodle heartbeats renew ordinary sessions,
+                    # not privileged admin access while the operator is idle.
+                    if request.url.path != f"{self.settings.api_prefix}/auth/moodle/keepalive":
+                        elevation.last_used_at = now
+                        elevation.expires_at = min(
+                            now + timedelta(seconds=self.settings.admin_elevation_idle_seconds),
+                            _aware(elevation.absolute_expires_at),
+                        )
                     elevation_expires_at = elevation.expires_at
             if _aware(session_row.last_seen_at) < now - timedelta(
                 seconds=self.settings.session_touch_interval_seconds

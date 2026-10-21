@@ -10,6 +10,7 @@ from app.api.evidence import router as evidence_router
 from app.api.foundation import router as foundation_router
 from app.api.integrity import router as integrity_router
 from app.api.reviews import router as reviews_router
+from app.api.statement_images import router as statement_images_router
 from app.api.system import router as system_router
 
 api_router = APIRouter()
@@ -21,6 +22,7 @@ api_router.include_router(attempts_router)
 api_router.include_router(code_intelligence_router)
 api_router.include_router(evidence_router)
 api_router.include_router(reviews_router)
+api_router.include_router(statement_images_router)
 api_router.include_router(integrity_router)
 api_router.include_router(ai_router)
 api_router.include_router(system_router)

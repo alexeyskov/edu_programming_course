@@ -13,11 +13,13 @@ import type {
 import type { AiChatCleanupCounts, AiChatCleanupPreview, StorageCategory, StorageCleanupResult, StorageCleanupTarget, StorageUsage } from '../types';
 import { readAiStream, type AiStreamEvent } from './aiStream';
 import type { CodeIntelligenceQuery, CodeIntelligenceResponse } from './codeIntelligence';
+import { apiBase } from './apiConfig';
+
+export { apiBase } from './apiConfig';
 
 type DemoMode = 'always' | 'auto' | 'never';
 const envMode = import.meta.env.VITE_DEMO_MODE;
 export const demoMode: DemoMode = envMode ?? (import.meta.env.DEV ? 'auto' : 'never');
-export const apiBase = (import.meta.env.VITE_API_BASE ?? '/api/v1').replace(/\/$/, '');
 const demoDelay = (ms = 180) => new Promise((resolve) => setTimeout(resolve, ms));
 const READ_TIMEOUT_MS = 30_000;
 const EXTERNAL_OPERATION_TIMEOUT_MS = 330_000;
@@ -310,6 +312,7 @@ function mapCourse(raw: any, session?: Session | null): Course {
       : sourceStatus === 'FAILED' || sourceStatus === 'ERROR' ? 'ERROR' : 'STALE';
   return {
     id: String(raw.id), title: String(raw.title ?? raw.name ?? 'Курс'),
+    comment: String(raw.comment ?? ''),
     shortName: String(raw.code ?? raw.short_name ?? raw.title ?? 'Курс'),
     role: mapRole(raw.role ?? membership?.role ?? session?.memberships[0]?.role ?? 'STUDENT'),
     group: raw.group_name ?? membership?.group, term: String(raw.term ?? ''),
@@ -388,6 +391,7 @@ function mapCourseCatalogEntry(raw: any): CourseCatalogEntry {
     connectionName: String(raw.connection_name ?? raw.connection?.name ?? 'Внешняя LMS'),
     externalId: String(raw.external_id ?? ''),
     title: String(raw.title ?? raw.name ?? 'Курс'),
+    comment: String(raw.comment ?? ''),
     shortName: String(raw.short_name ?? ''),
     externalUrl: String(raw.external_url ?? ''),
     syncStatus,
@@ -444,7 +448,9 @@ function mapAssessment(raw: any, courseId: string): Assessment {
     standard: String(raw.standard ?? raw.language_standard ?? task?.language_standard ?? 'C/C++'),
     pastePolicy: ['ALLOW', 'UNRESTRICTED'].includes(String(raw.paste_policy).toUpperCase()) ? 'ALLOW' : 'STRICT',
     aiEnabled: Boolean(raw.ai_enabled ?? raw.student_ai_enabled), submissionsCount: raw.submissions_count, uncheckedCount: raw.unchecked_count,
-    aiReviewEnabled: raw.ai_review_enabled === true,
+    // Absence means the server's default-on policy, not an implicit opt-out.
+    // A saved administrator choice of false must still win.
+    aiReviewEnabled: raw.ai_review_enabled !== false,
     reviewRequired: raw.review_required === undefined ? undefined : Boolean(raw.review_required),
     decisionSupportEnabled: raw.decision_support_enabled === undefined ? undefined : Boolean(raw.decision_support_enabled),
     availabilityRules: raw.availability_rules === undefined ? undefined : unwrapList<any>(raw.availability_rules).map(mapAvailabilityRule),
@@ -904,6 +910,13 @@ export const api = {
     () => cloneDemo(demoConnections),
   ),
   getSession: () => withDemo(async () => mapSession(await request('/auth/session')), () => cloneDemo(demoSession)),
+  keepMoodleSessionAlive: async (signal: AbortSignal) => {
+    // Heartbeat outages must retry, never silently switch to demo behavior.
+    if (demoMode === 'always') return { status: 'SKIPPED' as const, retry_after_seconds: 300 };
+    return request<{ status: 'ACTIVE' | 'BUSY' | 'SKIPPED' | 'UNAVAILABLE' | 'REAUTH_REQUIRED'; retry_after_seconds: number }>(
+      '/auth/moodle/keepalive', { method: 'POST', body: '{}', signal, timeoutMs: 35_000 },
+    );
+  },
   startLogin: async (connectionId: string, adminToken?: string, courseId?: string, teacherToken?: string) => request<{ redirect_url: string }>(`/auth/lms/${connectionId}/start`, { method: 'POST', body: JSON.stringify({ admin_token: adminToken || undefined, teacher_token: teacherToken || undefined, course_id: courseId || undefined }) }),
   moodleCredentialLogin: async (connectionId: string, username: string, password: string, adminToken?: string, teacherToken?: string) => mapSession(await request(`/auth/lms/${connectionId}/credentials`, { method: 'POST', body: JSON.stringify({ username, password, admin_token: adminToken || undefined, teacher_token: teacherToken || undefined }) })),
   devLogin: (role: Role, adminToken?: string) => withDemo(
@@ -932,7 +945,9 @@ export const api = {
   }),
   getCourses: (session?: Session | null) => withDemo(
     async () => unwrapList<any>(await request('/courses')).map((item) => mapCourse(item, session)),
-    () => session?.memberships.some((item) => item.role === 'TEACHER') ? [cloneDemo(teacherCourse), cloneDemo(demoCourses[1])] : [cloneDemo(studentCourse)],
+    () => (session?.memberships.some((item) => item.role === 'TEACHER')
+      ? [cloneDemo(teacherCourse), cloneDemo(demoCourses[1])] : [cloneDemo(studentCourse)])
+      .map((course) => ({ ...course, comment: courseCatalogState.find((entry) => entry.id === course.id)?.comment ?? course.comment })),
   ),
   getCourseSyncStatus: (courseId: string) => withDemo(
     async () => mapCourseSyncStatus(await request(`/courses/${courseId}/sync-status`)),
@@ -942,6 +957,17 @@ export const api = {
     async () => unwrapList<any>(await request('/system/course-catalog')).map(mapCourseCatalogEntry),
     () => cloneDemo(courseCatalogState),
   ),
+  updateCourseComment: async (courseId: string, comment: string): Promise<CourseCatalogEntry> => {
+    if (demoMode !== 'always') return mapCourseCatalogEntry(await request(`/system/course-catalog/${courseId}`, {
+      method: 'PATCH', body: JSON.stringify({ comment }),
+    }));
+    await demoDelay();
+    const course = courseCatalogState.find((item) => item.id === courseId);
+    if (!course) throw new ApiError(404, 'COURSE_NOT_FOUND', 'Курс не найден');
+    const updated = { ...course, comment: comment.trim().replace(/\s+/g, ' ') };
+    courseCatalogState = courseCatalogState.map((item) => item.id === courseId ? updated : item);
+    return cloneDemo(updated);
+  },
   deleteCourseCatalogEntry: (courseId: string) => withDemo(
     () => request<void>(`/system/course-catalog/${courseId}`, { method: 'DELETE' }),
     () => { courseCatalogState = courseCatalogState.filter((item) => item.id !== courseId); },
@@ -1077,15 +1103,16 @@ export const api = {
       return cloneDemo(assessmentState.find((item) => item.id === assessmentId)!);
     },
   ),
-  setAssessmentAiReviewPolicy: (assessmentId: string, enabled: boolean) => withDemo(
-    async () => mapAssessment(await request(`/assessments/${assessmentId}/ai-review-policy`, {
+  setAssessmentAiReviewPolicy: async (assessmentId: string, enabled: boolean) => {
+    // An automatic-review policy is a real saved administrator choice. Never
+    // disguise a failed write as a successful update of demo state.
+    if (demoMode !== 'always') return mapAssessment(await request(`/assessments/${assessmentId}/ai-review-policy`, {
       method: 'PATCH', body: JSON.stringify({ enabled }),
-    }), ''),
-    () => {
-      assessmentState = assessmentState.map((item) => item.id === assessmentId ? { ...item, aiReviewEnabled: enabled } : item);
-      return cloneDemo(assessmentState.find((item) => item.id === assessmentId)!);
-    },
-  ),
+    }), '');
+    await demoDelay();
+    assessmentState = assessmentState.map((item) => item.id === assessmentId ? { ...item, aiReviewEnabled: enabled } : item);
+    return cloneDemo(assessmentState.find((item) => item.id === assessmentId)!);
+  },
   validateAssessment: (assessmentId: string) => withDemo(
     () => request<{ valid: boolean; errors: Array<{ field?: string; code?: string; message: string }> }>(`/assessments/${assessmentId}/validate`, { method: 'POST', body: '{}' }),
     () => ({ valid: true, errors: [] }),
@@ -1520,7 +1547,7 @@ export const api = {
     citations: [{ title: 'cppreference · Statements', url: 'https://en.cppreference.com/w/cpp/language/statements' }],
   })),
   sendAiMessageStream: async (
-    threadId: string, content: string, context: { teacherComment?: string },
+    threadId: string, content: string, context: { revision?: number; teacherComment?: string },
     options: { signal?: AbortSignal; onEvent(event: AiStreamEvent): void },
   ) => {
     if (demoMode === 'always') {
@@ -1531,7 +1558,7 @@ export const api = {
       options.onEvent({ type: 'delta', text: answer.content });
       return answer;
     }
-    return requestAiStream(`/ai/threads/${threadId}/messages?stream=true`, JSON.stringify({ content, teacher_comment: context.teacherComment }), options);
+    return requestAiStream(`/ai/threads/${threadId}/messages?stream=true`, JSON.stringify({ content, revision: context.revision, teacher_comment: context.teacherComment }), options);
   },
   getSettings: () => withDemo(async () => mapSettings(await request('/system/settings')), () => cloneDemo(settingsState)),
   // Destructive maintenance must never fall back to simulated success on errors.

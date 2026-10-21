@@ -386,6 +386,37 @@ describe('student submissions views', () => {
     expect(screen.getByTestId('location')).toHaveTextContent('/review/question-2?view=pending');
   });
 
+  it('finds a grouped work by a question title without splitting its row or counters', async () => {
+    mocks.getSubmissions.mockResolvedValue([{
+      ...items[0],
+      id: 'question-2',
+      assessmentId: 'quiz-question-2',
+      parentAssessmentId: 'quiz-parent',
+      parentAssessmentTitle: 'Контрольная работа №1',
+      assessmentTitle: 'Контрольная работа №1',
+      courseId: 'course-a',
+      courseTitle: 'Программирование на C++',
+      reviewGroup: {
+        id: 'quiz-attempt-123', title: 'Контрольная работа №1', items: [
+          { submissionId: 'question-1', position: 1, title: 'Вычисление суммы', score: 4, maxScore: 5, status: 'GRADED' },
+          { submissionId: 'question-2', position: 2, title: 'Работа с массивами', maxScore: 5, status: 'UNGRADED' },
+        ],
+      },
+    }]);
+    renderPage('/submissions?view=pending&course=course-a&assessment=quiz-parent');
+    await screen.findByText('Мария Воронова');
+    fireEvent.change(screen.getByLabelText('Поиск по работам'), { target: { value: 'массивами' } });
+    expect(screen.getByText('Мария Воронова')).toBeInTheDocument();
+    expect(document.querySelectorAll('.submission-row')).toHaveLength(1);
+    expect(screen.getByRole('tab', { name: /Все сданные\s*1/ })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: /Ожидают проверки\s*1/ })).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Работа' })).toHaveValue('quiz-parent');
+    expect(screen.getByText('Показано 1 из 1')).toBeInTheDocument();
+    fireEvent.click(within(rowFor('Мария Воронова')).getByRole('button', { name: /^Открыть$/ }));
+    await waitFor(() => expect(mocks.claimSubmission).toHaveBeenCalledWith('question-2'));
+    expect(screen.getByTestId('location')).toHaveTextContent('/review/question-2?view=pending');
+  });
+
   it('claims a checked result only through the explicit recheck action', async () => {
     renderPage('/submissions?view=reviewed&q=%D0%A1%D0%BE%D1%84%D1%8C%D1%8F');
     await screen.findByText('Софья Лебедева');

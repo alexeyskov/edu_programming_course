@@ -366,6 +366,7 @@ def test_quiz_essay_prepare_uses_hmac_and_returns_bound_question(client: TestCli
             "attempt_id": "141716",
             "question_slot": "1",
             "question_text": "Реализовать класс Vector3D.",
+            "question_text_legacy_hashes": [],
             "answer_transport": "ESSAY_ATTACHMENT",
             "available_answer_transports": ["ESSAY_ATTACHMENT"],
             "remaining_seconds": None,

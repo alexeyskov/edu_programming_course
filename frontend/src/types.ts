@@ -36,6 +36,7 @@ export interface LmsSyncDiagnostic {
 export interface Course {
   id: string;
   title: string;
+  comment?: string;
   shortName: string;
   role: Role;
   group?: string;
@@ -73,6 +74,7 @@ export interface CourseCatalogEntry {
   connectionName: string;
   externalId: string;
   title: string;
+  comment?: string;
   shortName: string;
   externalUrl: string;
   syncStatus: 'SYNCED' | 'SYNCING' | 'STALE' | 'ERROR';

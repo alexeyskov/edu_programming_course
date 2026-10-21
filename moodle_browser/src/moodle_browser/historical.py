@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 
 from .config import exact_https_origin
 from .parsers import MoodleMarkupError, canonical_hash
+from .statements import statement_node_text
 
 _POSITIVE_ID = re.compile(r"^[1-9][0-9]{0,19}$")
 _WHITESPACE = re.compile(r"\s+")
@@ -802,7 +803,9 @@ def parse_quiz_review_page(
         responses.append(
             {
                 "response_id": response_id[:255],
-                "question_text": _text(question.select_one(".qtext"), maximum=50_000),
+                "question_text": statement_node_text(
+                    question.select_one(".qtext"), base_url=base_url
+                ),
                 "answer_text": answer,
                 "answer_complete": True,
                 "answer_omission_reason": "",

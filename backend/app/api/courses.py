@@ -60,6 +60,7 @@ from app.models.integration import AuditEntry, ExternalMapping, SystemSetting
 from app.models.tasks import Assessment
 from app.schemas.courses import (
     AssessmentSyncRead,
+    CourseCatalogCommentRequest,
     CourseCatalogRead,
     CourseGroupRead,
     CourseImportCreateRequest,
@@ -273,6 +274,7 @@ async def _course_payload(
     payload: dict[str, Any] = {
         "id": course.id,
         "title": course.title,
+        "comment": course.comment or "",
         "short_name": course.short_name,
         "description": course.description,
         "timezone": course.timezone,
@@ -383,6 +385,7 @@ def _catalog_payload(course: Course, connection: LMSConnection) -> CourseCatalog
         connection_name=connection.name,
         external_id=course.external_id,
         title=course.title,
+        comment=course.comment or "",
         short_name=course.short_name,
         external_url=external_url,
         sync_status=course.sync_status,
@@ -414,6 +417,36 @@ async def list_course_catalog(
         ).all()
     )
     return [_catalog_payload(course, connection) for course, connection in rows]
+
+
+@router.patch("/system/course-catalog/{course_id}", response_model=CourseCatalogRead)
+async def update_catalog_course_comment(
+    course_id: uuid.UUID,
+    body: CourseCatalogCommentRequest,
+    admin: SystemAdmin,
+    request: Request,
+    db: DBSession,
+) -> CourseCatalogRead:
+    course = await db.scalar(select(Course).where(Course.id == course_id).with_for_update())
+    if course is None or not course.catalog_enabled or course.archived_at is not None:
+        raise _error(404, "COURSE_NOT_FOUND", "Course was not found")
+    connection = await db.get(LMSConnection, course.connection_id)
+    if connection is None or not connection.enabled:
+        raise _error(409, "CONNECTION_DISABLED", "Course LMS connection is disabled")
+    if course.comment != body.comment:
+        course.comment = body.comment
+        db.add(AuditEntry(
+            actor_id=admin.principal_id,
+            action="course_catalog.comment_updated",
+            object_type="Course",
+            object_id=course.id,
+            course_id=course.id,
+            request_id=getattr(request.state, "request_id", "")[:100],
+            metadata_json={"has_comment": bool(body.comment)},
+        ))
+        await db.commit()
+        await db.refresh(course)
+    return _catalog_payload(course, connection)
 
 
 @router.put("/system/course-catalog/{course_id}", response_model=CourseCatalogRead)

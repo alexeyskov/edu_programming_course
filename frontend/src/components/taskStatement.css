@@ -1,0 +1,12 @@
+.task-statement { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.assessment-intro > .task-statement { margin: 1em 0; color: var(--muted); line-height: 1.55; }
+.moodle-source-summary > .task-statement { margin: 8px 0 14px; max-height: 180px; overflow: auto; color: var(--muted); }
+.task-statement__image { display: inline-block; max-inline-size: 100%; block-size: auto; box-sizing: border-box; vertical-align: middle; padding: 4px; border-radius: 4px; background: #fff; }
+.task-statement__image-fallback { display: inline-block; max-inline-size: 100%; padding: 4px 6px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); font-family: var(--font-mono, monospace); font-size: .9em; white-space: pre-wrap; overflow-wrap: anywhere; }
+.task-statement__image--formula { display: block; margin-block: .65em; }
+.task-statement__math { display: inline-block; max-inline-size: 100%; overflow-x: auto; overflow-y: hidden; padding-block: .25em; vertical-align: middle; color: inherit; white-space: normal; }
+.task-statement__math--display { display: block; margin-block: .55em; padding-block: .5em; }
+.task-statement__math .katex { font-size: 1.12em; line-height: normal; text-align: start; }
+.task-statement__math .katex-display { margin: 0; text-align: start; }
+.task-statement__math-source { display: block; max-inline-size: 100%; margin-block: .65em; font-family: var(--font-mono, monospace); font-size: .9em; white-space: pre-wrap; overflow-wrap: anywhere; }
+.task-statement__math-loading { display: block; min-block-size: 1.6em; margin-block: .65em; }

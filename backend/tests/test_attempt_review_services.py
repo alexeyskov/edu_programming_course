@@ -13,6 +13,7 @@ from app.api import attempts as attempts_api
 from app.api.attempts import get_attempt_history
 from app.api.reviews import _submission_history, list_submissions
 from app.auth.context import AuthContext
+from app.models.analysis import AICodeReview
 from app.models.attempts import (
     Attempt,
     EditEvent,
@@ -420,6 +421,168 @@ async def test_comment_only_review_draft_keeps_grade_unset(db):
     assert draft.grade is None
     assert draft.comment == "Check boundary handling before assigning a grade"
     assert await db.scalar(select(func.count()).select_from(ReviewDecision)) == 0
+
+
+@pytest.mark.parametrize("max_score, grade", [("0", "0"), ("10", "7.5")])
+async def test_review_preserves_comment_and_queues_only_explicit_approval_at_zero_or_positive_scale(
+    db, max_score, grade,
+):
+    _student, teacher, _other_teacher, attempt, submission, _main_file = await _create_submission(
+        db
+    )
+    assessment = await db.get(Assessment, attempt.assessment_id)
+    assessment.max_score = Decimal(max_score)
+    await db.flush()
+    await claim_submission(db, submission_id=submission.id, teacher_id=teacher.id)
+
+    # An ungraded lab can still retain feedback before its explicit approval.
+    draft = await save_review_draft(
+        db,
+        submission_id=submission.id,
+        teacher_id=teacher.id,
+        grade=None,
+        comment="Проверьте обработку пустого ввода.",
+    )
+    assert draft.grade is None
+    assert draft.comment == "Проверьте обработку пустого ввода."
+    assert await db.scalar(select(func.count()).select_from(ReviewDecision)) == 0
+    assert await db.scalar(select(func.count()).select_from(SyncOutbox).where(
+        SyncOutbox.event_type == "review.decision",
+    )) == 0
+
+    comment = "Работа принята.\nДобавьте тест пустого ввода в следующий раз."
+    decision = await finalize_review(
+        db,
+        submission_id=submission.id,
+        teacher_id=teacher.id,
+        grade=Decimal(grade),
+        comment=comment,
+    )
+    await db.refresh(decision)
+    assert decision.status == "APPLIED"
+    assert decision.grade == Decimal(grade)
+    assert decision.comment == comment
+    event = await db.scalar(select(SyncOutbox).where(
+        SyncOutbox.event_type == "review.decision",
+        SyncOutbox.aggregate_id == decision.id,
+    ))
+    assert event is not None
+    assert event.state == "PENDING"
+    assert event.payload["grade"] == grade
+    assert event.payload["comment"] == comment
+    assert submission.lms_export_state == "PENDING"
+
+
+@pytest.mark.parametrize(
+    "max_score, invalid_grade",
+    [("0", "-0.01"), ("0", "0.01"), ("10", "-0.01"), ("10", "10.01")],
+)
+async def test_zero_score_feedback_does_not_relax_review_grade_bounds(
+    db, max_score, invalid_grade,
+):
+    _student, teacher, _other_teacher, attempt, submission, _main_file = await _create_submission(
+        db
+    )
+    assessment = await db.get(Assessment, attempt.assessment_id)
+    assessment.max_score = Decimal(max_score)
+    await db.flush()
+    await claim_submission(db, submission_id=submission.id, teacher_id=teacher.id)
+    for save in (save_review_draft, finalize_review):
+        with pytest.raises(DomainError) as error:
+            await save(
+                db,
+                submission_id=submission.id,
+                teacher_id=teacher.id,
+                grade=Decimal(invalid_grade),
+                comment="Не должно сохраниться с неверным баллом.",
+            )
+        assert error.value.code == "GRADE_OUT_OF_RANGE"
+    assert await db.scalar(select(func.count()).select_from(ReviewDraft)) == 0
+    assert await db.scalar(select(func.count()).select_from(ReviewDecision)) == 0
+    assert await db.scalar(select(func.count()).select_from(SyncOutbox).where(
+        SyncOutbox.event_type == "review.decision",
+    )) == 0
+
+
+@pytest.mark.parametrize("max_score, grade", [("0", "0"), ("10", "7.5")])
+async def test_ai_review_comment_keeps_provenance_when_zero_grade_is_approved(
+    db, max_score, grade,
+):
+    _student, teacher, _other_teacher, attempt, submission, _main_file = await _create_submission(
+        db
+    )
+    assessment = await db.get(Assessment, attempt.assessment_id)
+    assessment.max_score = Decimal(max_score)
+    report = await db.scalar(select(AICodeReview).where(
+        AICodeReview.submission_id == submission.id,
+        AICodeReview.snapshot_id == submission.snapshot_id,
+    ))
+    assert report is not None
+    report.state = "COMPLETED"
+    report.recommended_grade = Decimal(grade)
+    report.recommended_comment = "Добавьте проверку границ массива."
+    await db.flush()
+    await claim_submission(db, submission_id=submission.id, teacher_id=teacher.id)
+    draft = await save_review_draft(
+        db,
+        submission_id=submission.id,
+        teacher_id=teacher.id,
+        grade=Decimal(grade),
+        comment=report.recommended_comment,
+        ai_review_id=report.id,
+    )
+    assert draft.ai_review_id == report.id
+    assert report.approved_decision_id is None
+    decision = await finalize_review(
+        db,
+        submission_id=submission.id,
+        teacher_id=teacher.id,
+        grade=Decimal(grade),
+        comment=f"{report.recommended_comment}\nПроверено преподавателем.",
+        ai_review_id=report.id,
+    )
+    assert report.approved_decision_id == decision.id
+    event = await db.scalar(select(SyncOutbox).where(
+        SyncOutbox.event_type == "review.decision",
+        SyncOutbox.aggregate_id == decision.id,
+    ))
+    assert event.payload["comment"] == decision.comment
+    assert event.payload["grade"] == grade
+
+
+async def test_zero_max_score_does_not_make_missing_ai_recommendation_approvable(db):
+    _student, teacher, _other_teacher, attempt, submission, _main_file = await _create_submission(
+        db
+    )
+    assessment = await db.get(Assessment, attempt.assessment_id)
+    assessment.max_score = Decimal("0")
+    report = await db.scalar(select(AICodeReview).where(
+        AICodeReview.submission_id == submission.id,
+        AICodeReview.snapshot_id == submission.snapshot_id,
+    ))
+    assert report is not None
+    report.state = "COMPLETED"
+    report.recommended_grade = None
+    report.recommended_comment = "Нет итоговой рекомендации по оценке."
+    await db.flush()
+    await claim_submission(db, submission_id=submission.id, teacher_id=teacher.id)
+    for save in (save_review_draft, finalize_review):
+        with pytest.raises(DomainError) as error:
+            await save(
+                db,
+                submission_id=submission.id,
+                teacher_id=teacher.id,
+                grade=Decimal("0"),
+                comment=report.recommended_comment,
+                ai_review_id=report.id,
+            )
+        assert error.value.code == "AI_RECOMMENDATION_DISCARDED"
+    assert report.approved_decision_id is None
+    assert await db.scalar(select(func.count()).select_from(ReviewDraft)) == 0
+    assert await db.scalar(select(func.count()).select_from(ReviewDecision)) == 0
+    assert await db.scalar(select(func.count()).select_from(SyncOutbox).where(
+        SyncOutbox.event_type == "review.decision",
+    )) == 0
 
 
 async def test_new_claim_owner_can_replace_stale_draft(db):

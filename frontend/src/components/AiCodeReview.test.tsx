@@ -69,6 +69,25 @@ describe('AI recommendation until explicit review exit', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Поставить оценку и комментарий от ИИ' }));
     expect(approve).toHaveBeenCalledOnce();
   });
+  it('offers an AI comment without assigning points when the maximum is zero', () => {
+    const approve = vi.fn();
+    render(<AiReviewRecommendation report={{ ...suggestion, recommendedGrade: 0 }} maxScore={0} canApprove onApprove={approve} />);
+    expect(screen.getByText('Без балла')).toBeVisible();
+    expect(screen.queryByText('0/0')).not.toBeInTheDocument();
+    expect(screen.getByText(/Баллы за эту работу не выставляются/)).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'Поставить комментарий от ИИ' }));
+    expect(approve).toHaveBeenCalledOnce();
+  });
+  it.each([undefined, null, 3])('does not offer applying an invalid zero-point recommendation (grade=%s)', (recommendedGrade) => {
+    render(<AiReviewRecommendation report={{ ...suggestion, recommendedGrade }} maxScore={0} canApprove onApprove={vi.fn()} />);
+    expect(screen.getByText('Без балла')).toBeVisible();
+    expect(screen.queryByRole('button')).not.toBeInTheDocument();
+  });
+  it('does not apply a comment-only AI recommendation when numeric grading is required', () => {
+    render(<AiReviewRecommendation report={{ ...suggestion, recommendedGrade: undefined }} maxScore={10} canApprove onApprove={vi.fn()} />);
+    expect(screen.getByText('Без балла')).toBeVisible();
+    expect(screen.queryByRole('button')).not.toBeInTheDocument();
+  });
   it('does not offer a discarded recommendation even if a stale payload contains its score', () => {
     vi.setSystemTime(new Date('2020-01-01T00:00:00Z'));
     render(<AiReviewRecommendation report={{ ...suggestion, recommendationStatus: 'DISCARDED' }} maxScore={10} canApprove onApprove={vi.fn()} />);

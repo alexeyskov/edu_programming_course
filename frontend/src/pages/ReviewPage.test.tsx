@@ -171,6 +171,113 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); window.sessionStorage.clear(); });
 
 describe('reviewed submission', () => {
+  it.each([false, true])('keeps a zero-point grade disabled while saving and approving comments (mobile=%s)', async (mobile) => {
+    vi.stubGlobal('matchMedia', () => ({ matches: mobile, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    const questions = mockUngradedQuestionGroup();
+    questions[0].maxScore = 0;
+    questions[0].reviewGroup!.items[0].maxScore = 0;
+    mocks.finalizeReview.mockResolvedValue({ id: 'comment-decision', lmsExportState: 'PENDING' });
+    renderPage('/review/question-1');
+    await screen.findByText('Код работы');
+    if (mobile) {
+      fireEvent.click(screen.getByRole('button', { name: 'Задание' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Начать проверку' }));
+    }
+    const comment = screen.getByLabelText('Комментарий студенту');
+    await waitFor(() => expect(comment).toBeEnabled());
+    const grade = screen.getByLabelText('Итоговый балл');
+    expect(grade).toBeDisabled();
+    expect(grade).toHaveValue(null);
+    expect(grade).toHaveAccessibleDescription('Баллы за эту работу не выставляются.');
+    expect(screen.getByRole('tab', { name: /№1 Задача 1/ })).toHaveTextContent('Без оценки');
+    fireEvent.change(comment, { target: { value: 'Лабораторная выполнена. Комментарий без балла.' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Сохранить черновик' }));
+    await waitFor(() => expect(mocks.saveReview).toHaveBeenCalledExactlyOnceWith('question-1', 0, 'Лабораторная выполнена. Комментарий без балла.'));
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+    fireEvent.change(comment, { target: { value: 'Проверено, замечаний нет.' } });
+    fireEvent.click(within(document.querySelector('.grading-panel')!).getByRole('button', { name: 'Утвердить' }));
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveTextContent('Без оценки');
+    expect(dialog).not.toHaveTextContent('0/0');
+    expect(dialog).toHaveTextContent('Проверено, замечаний нет.');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Утвердить и отправить' }));
+    await screen.findByText('Список работ');
+    expect(mocks.finalizeReview).toHaveBeenCalledExactlyOnceWith('question-1', 0, 'Проверено, замечаний нет.');
+    expect(mocks.createExperiment).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('applies only the AI comment for a zero-point activity (mobile=%s)', async (mobile) => {
+    vi.stubGlobal('matchMedia', () => ({ matches: mobile, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    const questions = mockUngradedQuestionGroup();
+    questions[0].maxScore = 0;
+    mocks.getAiCodeReview.mockResolvedValue({ id: 'zero-point-ai', enabled: true, state: 'COMPLETED',
+      recommendationStatus: 'PENDING', findings: [], summary: 'Обзор', recommendedGrade: 0,
+      recommendedComment: 'Исправьте формат вывода.' });
+    mocks.finalizeReview.mockResolvedValue({ id: 'ai-comment-decision', lmsExportState: 'PENDING' });
+    renderPage('/review/question-1');
+    await screen.findByText('Код работы');
+    if (mobile) fireEvent.click(screen.getByRole('button', { name: 'Задание' }));
+    const recommendation = await screen.findByRole('region', { name: 'Ответ ИИ' });
+    expect(within(recommendation).getByText('Без балла')).toBeVisible();
+    fireEvent.click(within(recommendation).getByRole('button', { name: 'Поставить комментарий от ИИ' }));
+    expect(screen.getByLabelText('Итоговый балл')).toBeDisabled();
+    expect(screen.getByLabelText('Итоговый балл')).toHaveValue(null);
+    await waitFor(() => expect(screen.getByLabelText('Комментарий студенту')).toHaveValue('Исправьте формат вывода.'));
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+    fireEvent.click(screen.getAllByRole('button', { name: 'Утвердить' })[0]);
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Утвердить и отправить' }));
+    await screen.findByText('Список работ');
+    expect(mocks.finalizeReview).toHaveBeenCalledExactlyOnceWith('question-1', 0, 'Исправьте формат вывода.', 'zero-point-ai');
+  });
+
+  it.each([undefined, null, 3])('does not apply an AI recommendation with an invalid technical grade for a zero-point activity (grade=%s)', async (recommendedGrade) => {
+    const questions = mockUngradedQuestionGroup();
+    questions[0].maxScore = 0;
+    mocks.getAiCodeReview.mockResolvedValue({ id: 'invalid-zero-point-ai', enabled: true, state: 'COMPLETED',
+      recommendationStatus: 'PENDING', findings: [], summary: 'Обзор', recommendedGrade,
+      recommendedComment: 'Ответ ИИ без допустимого технического балла.' });
+    renderPage('/review/question-1');
+    const recommendation = await screen.findByRole('region', { name: 'Ответ ИИ' });
+    expect(within(recommendation).getByText('Без балла')).toBeVisible();
+    expect(within(recommendation).queryByRole('button')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Комментарий студенту')).toHaveValue('');
+    expect(mocks.saveReview).not.toHaveBeenCalled();
+    expect(mocks.finalizeReview).not.toHaveBeenCalled();
+  });
+
+  it('persists a zero-point comment on question switch without disabling positive-point grading', async () => {
+    const questions = mockUngradedQuestionGroup();
+    questions[0].maxScore = 0;
+    renderPage('/review/question-1');
+    const comment = await screen.findByLabelText('Комментарий студенту');
+    await waitFor(() => expect(comment).toBeEnabled());
+    expect(screen.getByLabelText('Итоговый балл')).toBeDisabled();
+    fireEvent.change(comment, { target: { value: 'Сохранить комментарий без оценки' } });
+    fireEvent.click(screen.getByRole('tab', { name: /№2 Задача 2/ }));
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/review/question-2'));
+    expect(mocks.saveReview).toHaveBeenCalledExactlyOnceWith('question-1', 0, 'Сохранить комментарий без оценки');
+    const positiveGrade = screen.getByLabelText('Итоговый балл');
+    await waitFor(() => expect(positiveGrade).toBeEnabled());
+    expect(screen.queryByText(/Баллы за эту работу не выставляются/)).not.toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: 'Утвердить' }).every((button) => button.hasAttribute('disabled'))).toBe(true);
+    fireEvent.change(positiveGrade, { target: { value: '0' } });
+    expect(screen.getAllByRole('button', { name: 'Утвердить' }).every((button) => !button.hasAttribute('disabled'))).toBe(true);
+    expect(positiveGrade).toHaveValue(0);
+  });
+
+  it('does not present zero-point historical decisions as numeric grades', async () => {
+    mocks.getSubmission.mockResolvedValue({ ...submission, maxScore: 0, score: 0,
+      latestDecision: { ...decision, grade: 0 }, decisionHistory: [{ ...decision, grade: 0 }] });
+    renderPage();
+    const grade = await screen.findByLabelText('Итоговый балл');
+    expect(grade).toBeDisabled();
+    expect(grade).toHaveValue(null);
+    expect(screen.getByLabelText('Финальный комментарий студенту')).toHaveValue('Хорошая работа');
+    fireEvent.click(screen.getByRole('tab', { name: 'История' }));
+    expect(screen.getByText('Без оценки')).toBeVisible();
+    expect(document.querySelector('.review-decision-history')).not.toHaveTextContent('0/0');
+  });
+
   it('explains locally archived answers and blocks code-dependent actions until a Moodle reimport', async () => {
     mocks.getSubmission.mockResolvedValue({ ...submission, files: [], courseId: 'course-1', payloadEvictedAt: '2026-10-19T09:00:00Z' });
     renderPage();
@@ -785,6 +892,19 @@ describe('reviewed submission', () => {
     mocks.getSubmission.mockResolvedValue({ ...submission, taskStatement: '' });
     renderPage();
     expect(await screen.findByRole('region', { name: 'Задание студента' })).toHaveTextContent('Текст задания не был получен из Moodle');
+  });
+
+  it.each([false, true])('renders task images on the teacher task panel with mobile=%s', async (mobile) => {
+    vi.stubGlobal('matchMedia', () => ({ matches: mobile, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    const url = 'https://edu.mmcs.sfedu.ru/filter/tex/pix.php/formula.png';
+    mocks.getSubmission.mockResolvedValue({ ...submission, taskStatement: `Посчитайте ![Формула суммы](<${url}>).` });
+    renderPage();
+    await screen.findByRole('region', { name: 'Задание студента' });
+    if (mobile) fireEvent.click(screen.getByRole('button', { name: 'Задание' }));
+    const image = screen.getByRole('img', { name: 'Формула суммы' });
+    expect(image).toHaveAttribute('src', `/api/v1/statement-images/submission/${submission.id}?url=${encodeURIComponent(url)}`);
+    expect(image).not.toHaveAttribute('tabindex');
+    expect(document.querySelector('.review-task input, .review-task textarea, .review-task [contenteditable]')).toBeNull();
   });
 
   it.each(['PENDING', 'FAILED'])('refreshes %s delivery without reloading or changing the decision', async (state) => {
@@ -1536,6 +1656,29 @@ describe('reviewed submission', () => {
     await act(async () => { resolveInput(run); });
     expect(screen.getAllByText('› 3')).toHaveLength(1);
     expect(input).toHaveValue('9');
+  });
+
+  it('does not roll teacher console output backwards when an older poll arrives after stdin', async () => {
+    const run = {
+      sessionId: 'teacher-console-race', status: 'RUNNING', terminal: false, durationMs: 1,
+      stdout: 'Число: ', stderr: '', outputTruncated: false, diagnostics: [],
+    };
+    let resolvePoll!: (value: typeof run) => void;
+    mocks.startInteractiveExperiment.mockResolvedValue(run);
+    mocks.getInteractiveExperiment.mockReturnValueOnce(new Promise((resolve) => { resolvePoll = resolve; }));
+    mocks.sendInteractiveInput.mockResolvedValue({ ...run, stdout: 'Число: Следующее число: ' });
+    renderPage();
+    await screen.findByText('Работа проверена');
+    fireEvent.click(screen.getByRole('button', { name: 'Компилировать и запустить код' }));
+    await screen.findByText('Число:');
+    await waitFor(() => expect(mocks.getInteractiveExperiment).toHaveBeenCalledOnce());
+    const input = screen.getByLabelText('Ввод программы');
+    fireEvent.change(input, { target: { value: '3' } });
+    fireEvent.submit(input.closest('form')!);
+    await screen.findByText('Следующее число:');
+    await act(async () => resolvePoll(run));
+    expect(screen.getByText('Следующее число:')).toBeVisible();
+    expect(screen.getByText('› 3')).toBeVisible();
   });
 
   it('reconnects to a live teacher session after reload without stopping it on unmount', async () => {

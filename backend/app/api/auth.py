@@ -28,6 +28,7 @@ from app.auth.login_verifier import (
     verify_login_verifier,
 )
 from app.auth.sessions import (
+    SessionCredentials,
     clear_session_cookie,
     create_principal_session,
     revoke_principal_session,
@@ -82,6 +83,7 @@ from app.schemas.auth import (
     LMSLoginStartRead,
     LMSLoginStartRequest,
     MoodleCredentialLoginRequest,
+    MoodleKeepaliveRead,
     PrincipalRead,
     SessionProviderRead,
     SessionRead,
@@ -455,6 +457,25 @@ async def get_session(context: CurrentAuth, db: DBSession) -> SessionRead:
         capabilities=context.capabilities,
         elevation_expires_at=context.elevation_expires_at,
     )
+
+
+@router.post("/moodle/keepalive", response_model=MoodleKeepaliveRead)
+async def keepalive_moodle_session(
+    context: CurrentAuth, request: Request, response: Response, db: DBSession,
+) -> MoodleKeepaliveRead:
+    from app.services.moodle_keepalive import keep_moodle_session_alive
+
+    settings = _settings(request)
+    result = await keep_moodle_session_alive(db, settings, context.principal_id)
+    # The authentication middleware renews the local database TTL. Renew the
+    # matching HttpOnly cookie too, so a long editing session survives its
+    # original browser-cookie deadline without issuing a new identity/session.
+    bearer = request.cookies.get(settings.session_cookie_name)
+    if bearer:
+        set_session_cookie(
+            response, SessionCredentials(context.session_id, bearer, context.session_key), settings,
+        )
+    return MoodleKeepaliveRead(status=result)
 
 
 async def _ensure_dev_identity(

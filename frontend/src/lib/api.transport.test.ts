@@ -19,6 +19,125 @@ afterEach(() => {
 });
 
 describe('API transport security contract', () => {
+  it('keeps Moodle alive with local credentials and CSRF, without sending work or identity', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ csrf_token: 'ping-csrf' }))
+      .mockResolvedValueOnce(jsonResponse({ status: 'ACTIVE', retry_after_seconds: 300 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    const controller = new AbortController();
+    await expect(api.keepMoodleSessionAlive(controller.signal)).resolves.toMatchObject({ status: 'ACTIVE' });
+    const [url, init] = fetchMock.mock.calls[1];
+    expect(url).toBe('/api/v1/auth/moodle/keepalive');
+    expect(init.method).toBe('POST');
+    expect(init.credentials).toBe('include');
+    expect(new Headers(init.headers).get('X-CSRFToken')).toBe('ping-csrf');
+    expect(JSON.parse(init.body)).toEqual({});
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not disguise a real heartbeat outage as demo success', async () => {
+    vi.stubEnv('VITE_DEMO_MODE', 'auto');
+    try {
+      const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ csrf_token: 'ping-csrf' }))
+        .mockResolvedValueOnce(jsonResponse({ code: 'UNAVAILABLE' }, 503));
+      vi.stubGlobal('fetch', fetchMock);
+      const { api } = await freshApi();
+      await expect(api.keepMoodleSessionAlive(new AbortController().signal)).rejects.toMatchObject({ status: 503 });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it.each([
+    [{}, true],
+    [{ ai_review_enabled: null }, true],
+    [{ ai_review_enabled: true }, true],
+    [{ ai_review_enabled: false }, false],
+  ])('uses default-on AI review while preserving an explicit opt-out: %j', async (policy, enabled) => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      id: 'assessment-1', course_id: 'cpp-2026', title: 'Работа', student_ai_enabled: false, ...policy,
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    await expect(api.getAssessment('assessment-1')).resolves.toMatchObject({
+      aiReviewEnabled: enabled, aiEnabled: false,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('saves the automatic review policy with CSRF and without enabling student help', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ csrf_token: 'ai-policy-csrf' }))
+      .mockResolvedValueOnce(jsonResponse({
+        id: 'assessment-1', course_id: 'cpp-2026', ai_review_enabled: false, student_ai_enabled: false,
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    await expect(api.setAssessmentAiReviewPolicy('assessment-1', false)).resolves.toMatchObject({
+      aiReviewEnabled: false, aiEnabled: false,
+    });
+    const [url, init] = fetchMock.mock.calls[1];
+    expect(url).toBe('/api/v1/assessments/assessment-1/ai-review-policy');
+    expect(init.method).toBe('PATCH');
+    expect(init.credentials).toBe('include');
+    expect(new Headers(init.headers).get('X-CSRFToken')).toBe('ai-policy-csrf');
+    expect(JSON.parse(init.body)).toEqual({ enabled: false });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not substitute demo success or repeat a failed real AI policy mutation', async () => {
+    vi.stubEnv('VITE_DEMO_MODE', 'auto');
+    try {
+      const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ csrf_token: 'ai-policy-csrf' }))
+        .mockResolvedValueOnce(jsonResponse({ code: 'UNAVAILABLE', message: 'Unavailable' }, 503));
+      vi.stubGlobal('fetch', fetchMock);
+      const { api } = await freshApi();
+      await expect(api.setAssessmentAiReviewPolicy('assessment-1', false)).rejects.toMatchObject({ status: 503 });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('does not replace a failed real comment save with demo success or retry the mutation', async () => {
+    vi.stubEnv('VITE_DEMO_MODE', 'auto');
+    try {
+      const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ csrf_token: 'comment-csrf' }))
+        .mockResolvedValueOnce(jsonResponse({ code: 'UNAVAILABLE', message: 'Unavailable' }, 503));
+      vi.stubGlobal('fetch', fetchMock);
+      const { api } = await freshApi();
+      await expect(api.updateCourseComment('cpp-2026', 'Do not pretend to save')).rejects.toMatchObject({ status: 503 });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it('updates only the local course comment with credentials and CSRF', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ csrf_token: 'course-comment-csrf' }))
+      .mockResolvedValueOnce(jsonResponse({
+        id: 'c1', connection_id: 'lms1', external_id: '549', title: 'C++', comment: 'Осень 2026',
+        external_url: 'https://edu.mmcs.sfedu.ru/course/view.php?id=549', sync_status: 'CURRENT',
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    await expect(api.updateCourseComment('c1', 'Осень 2026')).resolves.toMatchObject({
+      id: 'c1', title: 'C++', comment: 'Осень 2026', syncStatus: 'SYNCED',
+    });
+    const [url, init] = fetchMock.mock.calls[1];
+    expect(url).toBe('/api/v1/system/course-catalog/c1');
+    expect(init.method).toBe('PATCH');
+    expect(init.credentials).toBe('include');
+    expect(new Headers(init.headers).get('X-CSRFToken')).toBe('course-comment-csrf');
+    expect(JSON.parse(init.body)).toEqual({ comment: 'Осень 2026' });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('shares saved demo course comments with teacher and student course lists', async () => {
+    vi.stubEnv('VITE_DEMO_MODE', 'always');
+    try {
+      const { api } = await freshApi();
+      const course = (await api.getCourseCatalog())[0];
+      await api.updateCourseComment(course.id, 'Осень 2026');
+      expect((await api.getCourses()).find((item) => item.id === course.id)?.comment).toBe('Осень 2026');
+      await api.updateCourseComment(course.id, '');
+      expect((await api.getCourseCatalog())[0].comment).toBe('');
+    } finally { vi.unstubAllEnvs(); }
+  });
   it('previews stored data read-only and sends a category and refreshed cutoff only with confirmed cleanup', async () => {
     const cutoff = '2026-10-19T09:00:00Z';
     const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({
@@ -223,6 +342,23 @@ describe('API transport security contract', () => {
     expect(fetchMock.mock.calls[1][0]).toMatch(/threads\/thread-1\/messages\?stream=true$/);
     expect(fetchMock.mock.calls[1][1]).toMatchObject({ method: 'POST', credentials: 'include', headers: { 'X-CSRFToken': 'c'.repeat(32), Accept: 'text/event-stream' }, body: JSON.stringify({ content: 'Вопрос', teacher_comment: 'Мой комментарий' }) });
     expect(onEvent.mock.calls.map(([event]) => event)).toEqual([{ type: 'thinking' }, { type: 'delta', text: 'Ответ' }]);
+  });
+
+  it('streams student chat with the acknowledged revision and never adds teacher context', async () => {
+    const events = 'event: done\ndata: {"id":"reply-1","content":"Подсказка","citations":[]}\n\n';
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ csrf_token: 'c'.repeat(32) }))
+      .mockResolvedValueOnce(new Response(events, { headers: { 'Content-Type': 'text/event-stream' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { api } = await freshApi();
+    const result = await api.sendAiMessageStream('student-thread', 'Почему?', { revision: 12 }, { onEvent: vi.fn() });
+    expect(result.content).toBe('Подсказка');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][0]).toMatch(/threads\/student-thread\/messages\?stream=true$/);
+    expect(fetchMock.mock.calls[1][1]).toMatchObject({
+      method: 'POST', credentials: 'include',
+      headers: { 'X-CSRFToken': 'c'.repeat(32), Accept: 'text/event-stream' },
+      body: JSON.stringify({ content: 'Почему?', revision: 12 }),
+    });
   });
 
   it('keeps comment-only review drafts ungraded instead of converting null into zero', async () => {

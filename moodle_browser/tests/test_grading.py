@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -39,7 +40,8 @@ class FakeLocator:
         return self.controls[0].visible
 
     async def get_attribute(self, name: str) -> str | None:
-        return self.controls[0].attributes.get(name)
+        control = self.controls[0]
+        return control.attributes.get(name, control.value if name == "value" else None)
 
     async def input_value(self) -> str:
         return self.controls[0].value
@@ -50,6 +52,8 @@ class FakeLocator:
             return control.tag.upper()
         if "innerText" in script and value is None:
             return control.attributes.get("context_text", "")
+        if "defaultValue" in script and value is None:
+            return control.attributes.get("server_value", control.value)
         if value is not None:
             control.value = value
         return None
@@ -258,7 +262,8 @@ async def test_quiz_grade_uses_canonical_manual_grading_form(
         return
     assert mark.value == "2"
     assert textarea.value == "<p>Проверено</p><p>Коваленко А.</p>"
-    assert editor.value == "Проверено\nКоваленко А."
+    # Never fill a global contenteditable: it may belong to another field.
+    assert editor.value == ""
     assert submit.clicked is True
 
 
@@ -519,3 +524,36 @@ async def test_assignment_grade_uses_canonical_user_grader(settings: Settings) -
     assert grade.value == "8.5"
     assert textarea.value == "<p>Исправлено</p>"
     assert submit.clicked is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_mark", "server_comment", "live_mark", "live_comment", "expected"),
+    [
+        ("0", "<p>Проверено</p>", "2", "<p>Проверено</p>", False),
+        ("2", "<p>Другой комментарий</p>", "2", "<p>Проверено</p>", False),
+        ("2", "", "2", "<p>Проверено</p>", False),
+        ("2", "<p>Проверено</p>", "0", "<p>Старый локальный черновик</p>", True),
+    ],
+)
+async def test_quiz_readback_uses_server_defaults_not_restored_editor_drafts(
+    settings: Settings,
+    server_mark: str,
+    server_comment: str,
+    live_mark: str,
+    live_comment: str,
+    expected: bool,
+) -> None:
+    page = FakePage(
+        {
+            "input[name$='-mark']": [
+                Control(value=live_mark, attributes={"value": server_mark})
+            ],
+            "textarea[name$='-comment']": [
+                Control(value=live_comment, attributes={"server_value": server_comment})
+            ],
+        }
+    )
+    assert await MoodleBrowserService(settings)._quiz_grade_matches(
+        page, Decimal("2"), "Проверено"  # type: ignore[arg-type]
+    ) is expected

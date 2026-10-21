@@ -36,6 +36,8 @@ class Course(UUIDTimestampModel):
     )
     external_id: Mapped[str] = mapped_column(String(255))
     title: Mapped[str] = mapped_column(String(255))
+    # Local display label only; Moodle discovery must never overwrite it.
+    comment: Mapped[str] = mapped_column(String(255), default="", server_default="")
     short_name: Mapped[str] = mapped_column(String(120), default="")
     description: Mapped[str] = mapped_column(Text, default="")
     timezone: Mapped[str] = mapped_column(String(64), default="Europe/Moscow")

@@ -1,22 +1,27 @@
 import {
   AlertTriangle, Bot, CheckCircle2, ChevronDown, CircleStop, Clock3, Cloud,
-  FileClock, FilePlus2, History, Info, MessageCircleQuestion, PanelBottomClose, PanelBottomOpen,
-  PanelLeftClose, PanelLeftOpen, Play, Send, Smartphone, Square, TerminalSquare, Trash2, X,
+  FilePlus2, Info, PanelBottomClose, PanelBottomOpen,
+  PanelLeftClose, PanelLeftOpen, Play, Send, Smartphone, Square, TerminalSquare, Trash2,
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { CodeWorkspace, type CodeWorkspaceHandle } from '../components/CodeWorkspace';
+import { TaskStatement } from '../components/TaskStatement';
+import { ConsoleTranscript, type ConsoleInput } from '../components/ConsoleTranscript';
+import { StudentAiChat } from '../components/StudentAiChat';
+import type { AiAttachmentDraft } from '../components/TeacherAiChat';
+import type { AiCodeSelection } from '../lib/editorAiSelection';
 import { Badge, Button, Field, InlineError, Modal, PageLoader, useToast } from '../components/ui';
 import { PaneResizer } from '../components/PaneResizer';
 import { useMediaQuery, usePanelSize } from '../lib/workspaceLayout';
 import { api, ApiError } from '../lib/api';
 import { createServerClock } from '../lib/serverClock';
 import { createEditorClipboardSession, type EditorClipboardSession } from '../lib/editorClipboard';
-import { cn, findWorkspacePasteSource, formatClientContext, formatDate, formatRemaining, formatSessionElapsed, isTextDataPath, isTranslationUnitPath, severityOrder, validateWorkspacePath } from '../lib/utils';
-import { createUuid } from '../lib/uuid';
-import type { Attempt, Diagnostic, HistoryEvent, InternalPasteRange, InteractiveRun, WorkspaceFile } from '../types';
+import { mergeInteractiveRunSnapshot } from '../lib/interactiveRun';
+import { cn, findWorkspacePasteSource, formatDate, formatRemaining, formatSessionElapsed, isTextDataPath, isTranslationUnitPath, severityOrder, validateWorkspacePath } from '../lib/utils';
+import type { Attempt, Diagnostic, InternalPasteRange, InteractiveRun, WorkspaceFile } from '../types';
 
-type BottomTab = 'output' | 'problems' | 'history';
+type BottomTab = 'output' | 'problems';
 type SubmissionPhase = 'confirm' | 'preparing' | 'waiting' | 'error';
 type LmsClosureReason = 'LMS_ATTEMPT_FINALIZED' | 'LMS_ATTEMPT_DELETED';
 const SUBMISSION_SLOW_AFTER_MS = 12_000;
@@ -64,7 +69,6 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
   const [attempt, setAttempt] = useState<Attempt | null>(null);
   const [files, setFiles] = useState<WorkspaceFile[]>([]);
   const [activeFileId, setActiveFileId] = useState('');
-  const [history, setHistory] = useState<HistoryEvent[]>([]);
   const [interactiveRun, setInteractiveRun] = useState<InteractiveRun | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -74,6 +78,9 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
   const [bottomTab, setBottomTab] = useState<BottomTab>('problems');
   const [running, setRunning] = useState(false);
   const [interactiveInput, setInteractiveInput] = useState('');
+  const [consoleInputs, setConsoleInputs] = useState<ConsoleInput[]>([]);
+  const [inputSending, setInputSending] = useState(false);
+  const inputSendingRef = useRef(false);
   const [remaining, setRemaining] = useState('');
   const serverClock = useRef(createServerClock());
   const [now, setNow] = useState<number | null>(null);
@@ -81,6 +88,7 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
   const [filesPanelOpen, setFilesPanelOpen] = useState(true);
   const [bottomPanelOpen, setBottomPanelOpen] = useState(true);
   const [aiOpen, setAiOpen] = useState(false);
+  const [aiDraft, setAiDraft] = useState<AiAttachmentDraft>();
   const [submitOpen, setSubmitOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [newPath, setNewPath] = useState('');
@@ -152,21 +160,16 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
 
   const loadMetadata = useCallback(async (loaded: Attempt, generation: number) => {
     setMetadataLoading(true);
-    const [loadedHistory, resolvedCourse] = await Promise.allSettled([
-      api.getHistory(loaded.id), api.resolveCourseId(loaded.assessmentId),
-    ]);
-    if (!mountedRef.current || generation !== loadGenerationRef.current) return;
-    if (loadedHistory.status === 'fulfilled') {
-      // Editing may have begun while history was loading. Keep those local
-      // events instead of replacing them with the older server response.
-      setHistory((current) => {
-        const ids = new Set(current.map((item) => item.id));
-        return [...current, ...loadedHistory.value.filter((item) => !ids.has(item.id))];
-      });
+    try {
+      const resolvedCourse = await api.resolveCourseId(loaded.assessmentId);
+      if (!mountedRef.current || generation !== loadGenerationRef.current) return;
+      setCourseId(resolvedCourse); setMetadataError(false);
+    } catch {
+      if (!mountedRef.current || generation !== loadGenerationRef.current) return;
+      setMetadataError(true);
+    } finally {
+      if (mountedRef.current && generation === loadGenerationRef.current) setMetadataLoading(false);
     }
-    if (resolvedCourse.status === 'fulfilled') setCourseId(resolvedCourse.value);
-    setMetadataError(loadedHistory.status === 'rejected' || resolvedCourse.status === 'rejected');
-    setMetadataLoading(false);
   }, []);
 
   const load = useCallback(async () => {
@@ -204,12 +207,12 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
       dirtyFilesRef.current = []; setConflictOpen(false);
       serverClock.current.sync(loaded.serverNow, loaded.serverTimeReceivedAt);
       setNow(serverClock.current.now());
-      attemptRef.current = loaded; setAttempt(loaded); setCourseId(''); setFiles(loaded.files); setActiveFileId(restoredActiveFile(loaded)); setHistory([]); setSaveState('saved');
+      attemptRef.current = loaded; setAttempt(loaded); setCourseId(''); setFiles(loaded.files); setActiveFileId(restoredActiveFile(loaded)); setSaveState('saved');
       setMetadataError(false);
-      // A slow or failed history/course lookup must not block the student's
+      // A slow or failed course lookup must not block the student's
       // code, autosave or final submission. These are ancillary to the workspace.
       void loadMetadata(loaded, generation);
-      setInteractiveRun(null); setInteractiveInput('');
+      setInteractiveRun(null); setInteractiveInput(''); setConsoleInputs([]);
       if (isLmsClosureReason(loaded.closureReason)) closeForLmsFinalization(loaded, loaded.closureReason);
       else if (loaded.status === 'SUBMITTED' && loaded.checkpointStatus !== 'SYNCED') {
         setSubmissionPhase(loaded.checkpointStatus === 'ERROR' ? 'error' : 'waiting');
@@ -408,7 +411,14 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
     const poll = async () => {
       try {
         const current = await api.getInteractiveAttempt(attempt.id, interactiveRun.sessionId);
-        if (!cancelled && !interactiveRunRef.current?.terminal) setInteractiveRun(current);
+        const latest = interactiveRunRef.current;
+        if (!cancelled && latest?.sessionId === current.sessionId && !latest.terminal) {
+          // A poll started before stdin may finish after the input response.
+          // Cumulative output must not jump backwards or lose a displayed prompt.
+          const next = mergeInteractiveRunSnapshot(latest, current);
+          interactiveRunRef.current = next;
+          setInteractiveRun(next);
+        }
         if (!cancelled && !current.terminal) timer = window.setTimeout(() => { void poll(); }, 350);
       } catch (caught) {
         if (!cancelled) setInteractiveRun((current) => current ? {
@@ -444,7 +454,6 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
     const entry = { file: changedFile, source, receiptId, pasteRange };
     if (source === 'typing' && last?.source === 'typing' && last.file.id === fileId) dirtyFilesRef.current[dirtyFilesRef.current.length - 1] = entry;
     else dirtyFilesRef.current.push(entry);
-    setHistory((items) => [{ id: createUuid(), type: source === 'internal_paste' ? 'internal_paste' : 'edit', label: source === 'internal_paste' ? 'Внутренняя вставка' : `Изменён ${files.find((file) => file.id === fileId)?.path}`, at: new Date().toISOString(), revision: attempt.revision + 1 }, ...items]);
     if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
     const serverNow = serverClock.current.now();
     const nearDeadline = Boolean(serverNow !== null && attempt.deadlineAt && new Date(attempt.deadlineAt).getTime() - serverNow <= 3_000);
@@ -507,6 +516,12 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
     return revision;
   }
 
+  function askAboutSelection(selection: AiCodeSelection) {
+    if (!attemptRef.current?.aiEnabled || editorReadOnly) return;
+    setAiDraft((previous) => ({ id: (previous?.id ?? 0) + 1, attachment: selection }));
+    setAiOpen(true);
+  }
+
   async function switchQuestion(targetAttemptId: string) {
     const current = attemptRef.current;
     if (!current || targetAttemptId === current.id || switchingQuestionRef.current || running || submitting || lmsFinalizedRef.current) return;
@@ -553,9 +568,8 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
         return;
       }
       window.sessionStorage.setItem(interactiveStorageKey(currentAttempt.id), result.sessionId);
-      setInteractiveInput(''); setInteractiveRun(result);
+      setInteractiveInput(''); setConsoleInputs([]); interactiveRunRef.current = result; setInteractiveRun(result);
       setBottomTab(result.diagnostics.length ? 'problems' : 'output');
-      setHistory((items) => [{ id: createUuid(), type: 'run', label: 'Запуск программы', detail: result.status === 'COMPILE_ERROR' ? 'Ошибка компиляции' : result.terminal ? 'Выполнено' : 'Программа запущена', at: new Date().toISOString(), revision }, ...items]);
     } catch (caught) {
       if (mountedRef.current && !handleLmsFinalizedError(caught)) toast.push('error', 'Запуск не выполнен', caught instanceof Error ? caught.message : undefined);
     }
@@ -565,15 +579,25 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
   async function sendInteractiveInput() {
     const currentAttempt = attemptRef.current;
     const active = interactiveRunRef.current;
-    if (!currentAttempt || !active || active.terminal || active.inputClosed || locked || lmsFinalizedRef.current) return;
+    if (!currentAttempt || !active || active.terminal || active.inputClosed || locked || lmsFinalizedRef.current || inputSendingRef.current) return;
     const text = interactiveInput;
+    inputSendingRef.current = true;
+    setInputSending(true);
     try {
       const updated = await api.sendInteractiveAttemptInput(currentAttempt.id, active.sessionId, text);
-      if (!mountedRef.current || lmsFinalizedRef.current) return;
-      setInteractiveInput(''); setInteractiveRun(updated);
+      if (!mountedRef.current || lmsFinalizedRef.current || interactiveRunRef.current?.sessionId !== active.sessionId) return;
+      setConsoleInputs((inputs) => [...inputs, { sessionId: active.sessionId, stdoutOffset: active.stdout.length, text }]);
+      // Do not erase a next line typed while this request was pending.
+      setInteractiveInput((value) => value === text ? '' : value);
+      if (!interactiveRunRef.current.terminal || updated.terminal) {
+        const next = mergeInteractiveRunSnapshot(interactiveRunRef.current, updated);
+        interactiveRunRef.current = next;
+        setInteractiveRun(next);
+      }
     } catch (caught) {
       if (!handleLmsFinalizedError(caught)) toast.push('error', 'Ввод не передан программе', caught instanceof Error ? caught.message : undefined);
     }
+    finally { inputSendingRef.current = false; if (mountedRef.current) setInputSending(false); }
   }
 
   async function stopInteractive() {
@@ -724,8 +748,8 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
         </button>)}
       </div>
     </nav>}
-    {mobile && <div className="workspace-mobile-tabs" role="group" aria-label="Разделы работы"><button type="button" aria-pressed={mobilePanel === 'code'} onClick={() => setMobilePanel('code')}>Код</button><button type="button" aria-pressed={mobilePanel === 'condition'} onClick={() => { setMobilePanel('condition'); setStatementOpen(true); }}>Условие</button><button type="button" aria-pressed={mobilePanel === 'results'} onClick={() => { setMobilePanel('results'); setBottomPanelOpen(true); }}>Запуски и история</button></div>}
-    <div id={multiQuestion ? 'quiz-task-panel' : undefined} role={multiQuestion ? 'tabpanel' : undefined} aria-labelledby={multiQuestion ? `quiz-question-${attempt.id}` : undefined} className={cn('ide-layout', !statementOpen && !mobile && 'ide-layout--condition-hidden')}>
+    {mobile && <div className="workspace-mobile-tabs" role="group" aria-label="Разделы работы"><button type="button" aria-pressed={mobilePanel === 'code'} onClick={() => setMobilePanel('code')}>Код</button><button type="button" aria-pressed={mobilePanel === 'condition'} onClick={() => { setMobilePanel('condition'); setStatementOpen(true); }}>Условие</button><button type="button" aria-pressed={mobilePanel === 'results'} onClick={() => { setMobilePanel('results'); setBottomPanelOpen(true); setBottomTab('output'); }}>Консоль</button></div>}
+    <div id={multiQuestion ? 'quiz-task-panel' : undefined} role={multiQuestion ? 'tabpanel' : undefined} aria-labelledby={multiQuestion ? `quiz-question-${attempt.id}` : undefined} className={cn('ide-layout', !statementOpen && !mobile && 'ide-layout--condition-hidden', aiOpen && 'ide-layout--ai-open')}>
       <aside className={cn('condition-panel', !statementOpen && 'condition-panel--collapsed')}>
         {statementOpen && !mobile && <PaneResizer label="Ширина условия" edge="right" value={conditionWidth} minimum={240} maximum={480} initial={300} onChange={setConditionWidth} />}
         <header>
@@ -733,14 +757,14 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
           {statementOpen && <div><span className="eyebrow">Условие</span><h2>{attempt.title}</h2></div>}
         </header>
         {!statementOpen && <span className="condition-panel__rail-label" aria-hidden="true">Задание</span>}
-        <div id="attempt-condition" className="condition-body" hidden={!statementOpen}><p className="condition-statement">{attempt.statement || 'Текст условия пока не получен. Обновите страницу или сообщите преподавателю.'}</p><h3>Параметры рабочей области</h3><dl className="condition-facts"><div><dt>Файлы</dt><dd>{attempt.fileMode === 'MULTI' ? 'Многофайловый режим' : 'Один исходный файл'}</dd></div><div><dt>Срок</dt><dd>{untimed ? 'Без таймера' : attempt.deadlineAt || attempt.expectedEndAt ? `Около ${remaining}` : 'Контролируется Moodle'}</dd></div><div><dt>Помощник</dt><dd>{attempt.aiEnabled ? 'Доступен' : 'Отключён'}</dd></div></dl>{untimed && <p>Код сохраняется автоматически. Нажмите «Завершить работу», чтобы сдать работу.</p>}<div className="rules-card"><Info size={16} /><div><strong>Политика вставки</strong><p>{attempt.pastePolicy === 'STRICT' ? 'Копируйте код прямо из редактора. Его можно вставлять в другие файлы и задачи этой работы в рамках текущей попытки. Внешняя вставка запрещена.' : 'Вставка разрешена политикой этой работы.'}</p></div></div></div>
+        <div id="attempt-condition" className="condition-body" hidden={!statementOpen}><TaskStatement className="condition-statement" content={attempt.statement || 'Текст условия пока не получен. Обновите страницу или сообщите преподавателю.'} scope={{ kind: 'attempt', id: attempt.id }} /><h3>Параметры рабочей области</h3><dl className="condition-facts"><div><dt>Файлы</dt><dd>{attempt.fileMode === 'MULTI' ? 'Многофайловый режим' : 'Один исходный файл'}</dd></div><div><dt>Срок</dt><dd>{untimed ? 'Без таймера' : attempt.deadlineAt || attempt.expectedEndAt ? `Около ${remaining}` : 'Контролируется Moodle'}</dd></div><div><dt>Помощник</dt><dd>{attempt.aiEnabled ? 'Доступен' : 'Отключён'}</dd></div></dl>{untimed && <p>Код сохраняется автоматически. Нажмите «Завершить работу», чтобы сдать работу.</p>}<div className="rules-card"><Info size={16} /><div><strong>Политика вставки</strong><p>{attempt.pastePolicy === 'STRICT' ? 'Копируйте код прямо из редактора. Его можно вставлять в другие файлы и задачи этой работы в рамках текущей попытки. Внешняя вставка запрещена.' : 'Вставка разрешена политикой этой работы.'}</p></div></div></div>
       </aside>
       <section className={cn('ide-center', !bottomPanelOpen && 'ide-center--bottom-collapsed')}><div className="ide-editor">
         <aside className="workspace-files-rail" aria-label="Управление панелью файлов"><button type="button" title={filesPanelOpen ? 'Скрыть файлы' : 'Показать файлы'} aria-label={filesPanelOpen ? 'Скрыть файлы' : 'Показать файлы'} aria-controls="student-file-explorer" aria-expanded={filesPanelOpen} onClick={() => setFilesPanelOpen((value) => !value)}>{filesPanelOpen ? <PanelLeftClose size={18} /> : <PanelLeftOpen size={18} />}</button><span aria-hidden="true">Файлы</span></aside>
-        <CodeWorkspace ref={editorRef} explorerId="student-file-explorer" explorerVisible={filesPanelOpen} files={files} activeFileId={activeFileId} onActiveFile={setActiveFileId} onChange={changeFile} onCreateFile={() => setCreateOpen(true)} onDeleteFile={setDeleteTarget} canDeleteFile={(file) => canDeleteWorkspaceFile(file, files, attempt.fileMode)} readOnly={editorReadOnly} strictPaste={attempt.pastePolicy === 'STRICT'} scopeId={attempt.id} intelligenceScope={{ kind: 'attempt', id: attempt.id }} clipboardScopeId={attempt.quizSession?.rootAttemptId ?? attempt.id} clipboardSession={clipboardSession} diagnostics={diagnostics} onPasteBlocked={() => { setHistory((items) => [{ id: createUuid(), type: 'paste_blocked', label: 'Неподтверждённая вставка заблокирована', at: new Date().toISOString(), revision: attempt.revision }, ...items]); toast.push('info', 'Вставка запрещена', 'Скопируйте фрагмент заново из редактора любой задачи этой работы (Ctrl/Cmd+C), затем вставьте (Ctrl/Cmd+V). Текст из других страниц и приложений не принимается.'); }} onInternalCopy={createInternalReceipt} /></div>
-        <BottomPanel resizer={bottomPanelOpen && !mobile ? <PaneResizer label="Высота консоли" edge="top" value={consoleHeight} minimum={120} maximum={480} initial={210} onChange={setConsoleHeight} /> : undefined} runControl={interactiveActive ? <Button className="program-run-button" variant="secondary" loading={running} disabled={Boolean(switchingQuestionId)} onClick={() => void stopInteractive()}><Square size={15} fill="currentColor" /> Остановить</Button> : <Button className="program-run-button" variant="secondary" loading={running} disabled={editorReadOnly} onClick={() => void execute()}><Play size={16} fill="currentColor" /> Запустить</Button>} open={bottomPanelOpen} onOpenChange={setBottomPanelOpen} active={bottomTab} setActive={setBottomTab} run={interactiveRun} diagnostics={diagnostics} history={history} input={interactiveInput} setInput={setInteractiveInput} starting={running && !interactiveActive} canInput={interactiveActive && !editorReadOnly && !interactiveRun?.inputClosed} onSend={() => void sendInteractiveInput()} onDiagnostic={(diagnostic) => editorRef.current?.openDiagnostic(diagnostic)} /></section>
+        <CodeWorkspace ref={editorRef} explorerId="student-file-explorer" explorerVisible={filesPanelOpen} files={files} activeFileId={activeFileId} onActiveFile={setActiveFileId} onChange={changeFile} onCreateFile={() => setCreateOpen(true)} onDeleteFile={setDeleteTarget} canDeleteFile={(file) => canDeleteWorkspaceFile(file, files, attempt.fileMode)} readOnly={editorReadOnly} strictPaste={attempt.pastePolicy === 'STRICT'} scopeId={attempt.id} intelligenceScope={{ kind: 'attempt', id: attempt.id }} clipboardScopeId={attempt.quizSession?.rootAttemptId ?? attempt.id} clipboardSession={clipboardSession} diagnostics={diagnostics} allowEditableAiSelection onAskAiSelection={attempt.aiEnabled && !editorReadOnly ? askAboutSelection : undefined} onPasteBlocked={() => { toast.push('info', 'Вставка запрещена', 'Скопируйте фрагмент заново из редактора любой задачи этой работы (Ctrl/Cmd+C), затем вставьте (Ctrl/Cmd+V). Текст из других страниц и приложений не принимается.'); }} onInternalCopy={createInternalReceipt} /></div>
+        <BottomPanel resizer={bottomPanelOpen && !mobile ? <PaneResizer label="Высота консоли" edge="top" value={consoleHeight} minimum={120} maximum={480} initial={210} onChange={setConsoleHeight} /> : undefined} runControl={interactiveActive ? <Button className="program-run-button" variant="secondary" loading={running} disabled={Boolean(switchingQuestionId)} onClick={() => void stopInteractive()}><Square size={15} fill="currentColor" /> Остановить</Button> : <Button className="program-run-button" variant="secondary" loading={running} disabled={editorReadOnly} onClick={() => void execute()}><Play size={16} fill="currentColor" /> Запустить</Button>} open={bottomPanelOpen} onOpenChange={setBottomPanelOpen} active={bottomTab} setActive={setBottomTab} run={interactiveRun} inputs={consoleInputs} diagnostics={diagnostics} input={interactiveInput} setInput={setInteractiveInput} inputSending={inputSending} starting={running && !interactiveActive} canInput={interactiveActive && !editorReadOnly && !interactiveRun?.inputClosed} onSend={() => void sendInteractiveInput()} onDiagnostic={(diagnostic) => editorRef.current?.openDiagnostic(diagnostic)} /></section>
+      <StudentAiChat key={attempt.id} open={aiOpen} onClose={() => setAiOpen(false)} attemptId={attempt.id} courseId={courseId} canSend={attempt.aiEnabled && !locked} draft={aiDraft} prepareContext={() => prepareAiContext(attempt.id)} />
     </div>
-    <AiTutor key={attempt.id} open={aiOpen} onClose={() => setAiOpen(false)} attemptId={attempt.id} courseId={courseId} prepareContext={() => prepareAiContext(attempt.id)} />
     <Modal open={createOpen} title="Новый файл" onClose={() => setCreateOpen(false)} footer={<><Button variant="ghost" onClick={() => setCreateOpen(false)}>Отмена</Button><Button onClick={() => void createFile()} disabled={!newPath}><FilePlus2 size={16} /> Создать</Button></>}><Field label="Напишите имя файла" hint={attempt.fileMode === 'SINGLE' ? 'Можно добавить текстовый файл .txt с данными для программы' : 'Разрешены исходники, заголовки C/C++ и .txt'}><input autoFocus value={newPath} onChange={(event) => setNewPath(event.target.value)} placeholder={attempt.fileMode === 'SINGLE' ? 'input.txt' : 'solution.cpp'} /></Field></Modal>
     <Modal open={Boolean(deleteTarget)} title="Удалить файл?" onClose={() => !deleting && setDeleteTarget(null)} footer={<><Button variant="ghost" disabled={deleting} onClick={() => setDeleteTarget(null)}>Отмена</Button><Button variant="danger" loading={deleting} onClick={() => void deleteFile()}><Trash2 size={16} /> Удалить</Button></>}><p className="modal-copy">Файл <strong>{deleteTarget?.path}</strong> будет удалён из рабочей области отдельной серверной ревизией. Единственный исходный файл удалить нельзя.</p></Modal>
     <Modal open={submitOpen} title={submissionPhase === 'confirm' ? 'Завершить работу?' : submissionPhase === 'error' ? 'Moodle не подтвердил сдачу' : submissionSlow ? 'Сдача продолжается в фоне' : 'Передаём работу в Moodle…'} onClose={() => { if (submitting) return; if (submissionPhase === 'confirm') setSubmitOpen(false); else navigate('/'); }} footer={submissionPhase === 'confirm' ? <><Button variant="ghost" disabled={submitting} onClick={() => setSubmitOpen(false)}>Вернуться к коду</Button><Button loading={submitting} onClick={() => void submit()}>{multiQuestion ? 'Сдать все задачи' : `Сдать ревизию ${attempt.acknowledgedRevision}`}</Button></> : submissionPhase === 'error' ? <><Button variant="ghost" disabled={submitting} onClick={() => navigate('/')}>Вернуться к работам</Button><Button loading={submitting} onClick={() => void retrySubmission()}>Повторить отправку</Button></> : <Button variant={submissionSlow ? 'secondary' : 'ghost'} disabled={submitting} onClick={() => navigate('/')}>{submissionSlow ? 'Вернуться к работам' : 'Продолжить в фоне'}</Button>}>
@@ -753,47 +777,15 @@ function AttemptWorkspace({ attemptId, clipboardSession }: { attemptId: string; 
   </div>;
 }
 
-function BottomPanel({ resizer, runControl, open, onOpenChange, active, setActive, run, diagnostics, history, input, setInput, starting, canInput, onSend, onDiagnostic }: { resizer?: ReactNode; runControl: ReactNode; open: boolean; onOpenChange(value: boolean): void; active: BottomTab; setActive(value: BottomTab): void; run: InteractiveRun | null; diagnostics: Diagnostic[]; history: HistoryEvent[]; input: string; setInput(value: string): void; starting: boolean; canInput: boolean; onSend(): void; onDiagnostic(value: Diagnostic): void }) {
+function BottomPanel({ resizer, runControl, open, onOpenChange, active, setActive, run, inputs, diagnostics, input, setInput, inputSending, starting, canInput, onSend, onDiagnostic }: { resizer?: ReactNode; runControl: ReactNode; open: boolean; onOpenChange(value: boolean): void; active: BottomTab; setActive(value: BottomTab): void; run: InteractiveRun | null; inputs: ConsoleInput[]; diagnostics: Diagnostic[]; input: string; setInput(value: string): void; inputSending: boolean; starting: boolean; canInput: boolean; onSend(): void; onDiagnostic(value: Diagnostic): void }) {
   const tabs: Array<{ id: BottomTab; label: string; icon: typeof TerminalSquare; count?: number }> = [
     { id: 'output', label: 'Консоль', icon: TerminalSquare }, { id: 'problems', label: 'Проблемы', icon: AlertTriangle, count: diagnostics.length },
-    { id: 'history', label: 'История', icon: History, count: history.length },
   ];
-  return <section className={cn('bottom-panel', !open && 'bottom-panel--collapsed')}>{resizer}<header>{open ? <div className="bottom-panel__tabs" role="tablist" aria-label="Вывод программы и история">{tabs.map(({ id, label, icon: Icon, count }) => <button key={id} type="button" className={cn(active === id && 'is-active')} role="tab" aria-selected={active === id} onClick={() => setActive(id)}><Icon size={14} />{label}{count !== undefined && <em>{count}</em>}</button>)}</div> : <strong className="bottom-panel__collapsed-label"><TerminalSquare size={14} /> Консоль скрыта</strong>}<div className="bottom-panel__actions">{runControl}<button type="button" className="bottom-panel__toggle" aria-controls="student-bottom-panel" aria-expanded={open} onClick={() => onOpenChange(!open)}>{open ? <PanelBottomClose size={13} /> : <PanelBottomOpen size={13} />}{open ? 'Закрыть' : 'Открыть консоль'}</button></div></header>{open && <div id="student-bottom-panel" className="bottom-panel__body">
-    {active === 'output' && <div className="student-console"><div className="student-console__output">{starting && <p>$ Компиляция и запуск…</p>}{run?.stdout && <pre>{run.stdout}</pre>}{run?.stderr && <pre className="terminal-error">{run.stderr}</pre>}{run?.outputTruncated && <p className="terminal-error">Вывод остановлен: достигнут установленный лимит.</p>}{!starting && !run && <p>$ Нажмите «Запустить». Если программа запросит данные, введите строку ниже и нажмите Enter.</p>}{run?.terminal && <p className={run.status === 'SUCCESS' ? 'terminal-success' : run.status === 'STOPPED' ? '' : 'terminal-error'}>{interactiveStatusLabel(run)} · {run.durationMs} мс</p>}</div><form className="student-console__form" onSubmit={(event) => { event.preventDefault(); onSend(); }}><input aria-label="Ввод программы" value={input} onChange={(event) => setInput(event.target.value)} disabled={!canInput} maxLength={65_536} autoComplete="off" spellCheck={false} placeholder={run?.terminal ? 'Программа завершена' : canInput ? 'Введите строку и нажмите Enter' : 'Сначала запустите программу'} /><button type="submit" aria-label="Передать строку программе" disabled={!canInput}><Send size={14} /> Отправить</button></form></div>}
+  return <section className={cn('bottom-panel', !open && 'bottom-panel--collapsed')}>{resizer}<header>{open ? <div className="bottom-panel__tabs" role="tablist" aria-label="Вывод программы и диагностика">{tabs.map(({ id, label, icon: Icon, count }) => <button key={id} type="button" className={cn(active === id && 'is-active')} role="tab" aria-selected={active === id} onClick={() => setActive(id)}><Icon size={14} />{label}{count !== undefined && <em>{count}</em>}</button>)}</div> : <strong className="bottom-panel__collapsed-label"><TerminalSquare size={14} /> Консоль скрыта</strong>}<div className="bottom-panel__actions">{runControl}<button type="button" className="bottom-panel__toggle" aria-controls="student-bottom-panel" aria-expanded={open} onClick={() => onOpenChange(!open)}>{open ? <PanelBottomClose size={13} /> : <PanelBottomOpen size={13} />}{open ? 'Закрыть' : 'Открыть консоль'}</button></div></header>{open && <div id="student-bottom-panel" className="bottom-panel__body">
+    {active === 'output' && <div className="student-console"><div className="student-console__output">{starting && <p>$ Компиляция и запуск…</p>}{run && <ConsoleTranscript sessionId={run.sessionId} stdout={run.stdout} inputs={inputs} />}{run?.stderr && <pre className="terminal-error">{run.stderr}</pre>}{run?.outputTruncated && <p className="terminal-error">Вывод остановлен: достигнут установленный лимит.</p>}{!starting && !run && <p>$ Нажмите «Запустить». Если программа запросит данные, введите строку ниже и нажмите Enter.</p>}{run?.terminal && <p className={run.status === 'SUCCESS' ? 'terminal-success' : run.status === 'STOPPED' ? '' : 'terminal-error'}>{interactiveStatusLabel(run)} · {run.durationMs} мс</p>}</div><form className="student-console__form" onSubmit={(event) => { event.preventDefault(); onSend(); }}><input aria-label="Ввод программы" value={input} onChange={(event) => setInput(event.target.value)} disabled={!canInput} maxLength={65_536} autoComplete="off" spellCheck={false} placeholder={run?.terminal ? 'Программа завершена' : canInput ? 'Введите строку и нажмите Enter' : 'Сначала запустите программу'} /><button type="submit" aria-label="Передать строку программе" disabled={!canInput || inputSending}><Send size={14} /> Отправить</button></form></div>}
     {active === 'problems' && <div className="problems-list">{diagnostics.length ? [...diagnostics].sort((a, b) => severityOrder(a.severity) - severityOrder(b.severity)).map((item) => <button key={item.id} onClick={() => onDiagnostic(item)}><span className={cn('problem-icon', `problem-icon--${item.severity}`)}>{item.severity === 'error' ? '×' : '!'}</span><span><strong>{item.message}</strong><small>{item.path ?? 'Сборка'}{item.line ? `:${item.line}:${item.column ?? 1}` : ''}{item.code ? ` · ${item.code}` : ''}</small>{item.notes?.map((note) => <em key={note}>{note}</em>)}</span><ChevronDown size={15} /></button>) : <div className="panel-empty"><CheckCircle2 size={20} /><span><strong>Проблем не найдено</strong><small>Запустите сборку для обновления диагностики.</small></span></div>}</div>}
-    {active === 'history' && <div className="history-list">{history.slice(0, 15).map((item) => <div key={item.id}><span><FileClock size={14} /></span><p><strong>{item.label}</strong><small>{[item.detail ?? `Ревизия ${item.revision}`, formatClientContext(item.client), formatDate(item.at)].filter(Boolean).join(' · ')}</small></p></div>)}</div>}
   </div>}</section>;
 }
-
-function AiTutor({ open, onClose, attemptId, courseId, prepareContext }: { open: boolean; onClose(): void; attemptId: string; courseId: string; prepareContext(): Promise<number> }) {
-  const [message, setMessage] = useState('');
-  const [sending, setSending] = useState(false);
-  const threadIdRef = useRef<string>();
-  const mountedRef = useRef(false);
-  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
-  const [messages, setMessages] = useState<Array<{ from: 'ai' | 'user'; text: string; citations?: Array<{ title: string; url: string }> }>>([]);
-  async function sendMessage() {
-    const content = message.trim();
-    if (!content || sending) return;
-    setMessage(''); setMessages((items) => [...items, { from: 'user', text: content }]); setSending(true);
-    try {
-      const revision = await prepareContext();
-      if (!mountedRef.current) return;
-      if (!threadIdRef.current) threadIdRef.current = (await api.createStudentAiThread(attemptId, courseId, revision)).id;
-      if (!mountedRef.current) return;
-      const response = await api.sendAiMessage(threadIdRef.current, content, { revision });
-      if (!mountedRef.current) return;
-      setMessages((items) => [...items, { from: 'ai', text: response.content, citations: response.citations }]);
-    } catch (caught) {
-      if (!mountedRef.current) return;
-      setMessages((items) => [...items, { from: 'ai', text: caught instanceof Error ? `Помощник сейчас недоступен: ${caught.message}` : 'Помощник сейчас недоступен.' }]);
-    } finally { if (mountedRef.current) setSending(false); }
-  }
-  if (!open) return null;
-  return <aside className="ai-drawer"><header><span><Bot /><span><strong>Учебный помощник</strong><small>Условие и все файлы открытой задачи</small></span></span><button onClick={onClose}><X /></button></header><div className="ai-policy"><ShieldAlertIcon /><p>Только объяснения и ссылки на документацию по языку, без написания кода.</p></div><div className="ai-messages">{messages.map((item, index) => <div className={cn('ai-message', item.from === 'user' && 'ai-message--user')} key={index}>{item.text}{item.citations?.map((citation) => <a key={citation.url} href={citation.url} target="_blank" rel="noreferrer">{citation.title}</a>)}</div>)}{sending && <div className="ai-message ai-message--thinking">Сохраняем код и готовим ответ…</div>}</div><form onSubmit={(event) => { event.preventDefault(); void sendMessage(); }}><textarea value={message} disabled={sending} onChange={(event) => setMessage(event.target.value)} placeholder="Ваш вопрос…" /><Button size="icon" loading={sending} disabled={!message.trim()} aria-label="Отправить"><Send size={17} /></Button></form><small className="ai-disclaimer">Ответы ИИ могут содержать ошибки — проверяйте документацию.</small></aside>;
-}
-
-function ShieldAlertIcon() { return <MessageCircleQuestion size={17} />; }
 
 function downloadLocalCopy(files: WorkspaceFile[], attemptId: string) {
   const payload = JSON.stringify({ attempt_id: attemptId, exported_at: new Date().toISOString(), files: files.map(({ path, content }) => ({ path, content })) }, null, 2);

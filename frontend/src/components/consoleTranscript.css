@@ -1,0 +1,9 @@
+/* Shared by student runs and teacher experiments; stdin is not program stdout. */
+.student-console__output .console-transcript pre.is-input,
+.experiment-console__output .console-transcript pre.is-input {
+  padding-left: 12px;
+  color: #82b892;
+  font-size: 12px;
+  font-style: italic;
+  line-height: 1.55;
+}

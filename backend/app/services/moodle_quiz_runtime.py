@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -22,6 +23,12 @@ from app.services.assessment_mappings import assessment_activity_mappings
 from app.services.build_profile import effective_workspace_build_profile
 from app.services.common import DomainError, canonical_hash, sha256_text
 from app.services.moodle_source import moodle_statement_is_deferred
+from app.services.moodle_statement_upgrade import (
+    LEGACY_STATEMENT_FORMATS,
+    STATEMENT_FORMAT,
+    is_statement_image_upgrade,
+    is_statement_math_upgrade,
+)
 
 _RUNTIME_TRANSPORTS = frozenset({"ESSAY_ATTACHMENT", "ESSAY_ONLINE_TEXT"})
 _MAX_QUESTION_TEXT = 50_000
@@ -65,6 +72,7 @@ class PreparedMoodleQuizAttempt:
     remaining_seconds: int | None = None
     question_max_mark: Decimal | None = None
     questions: tuple[PreparedMoodleQuizAttempt, ...] = ()
+    question_text_legacy_hashes: tuple[str, ...] = ()
 
 
 def apply_prepared_quiz_timer(
@@ -168,6 +176,7 @@ def prepared_moodle_quiz_attempt(
     remaining_seconds: object = None,
     question_max_mark: object = None,
     questions: object = None,
+    question_text_legacy_hashes: object = None,
 ) -> PreparedMoodleQuizAttempt:
     course_id = _positive_decimal_id(course_external_id, "Moodle course id")
     normalized_cmid = int(_positive_decimal_id(cmid, "Moodle activity id"))
@@ -190,6 +199,15 @@ def prepared_moodle_quiz_attempt(
             "INVALID_MOODLE_PREPARATION",
             "Moodle question text is empty or too large",
         )
+    raw_hashes = question_text_legacy_hashes if question_text_legacy_hashes is not None else ()
+    if not isinstance(raw_hashes, list | tuple) or len(raw_hashes) > 2 or any(
+        not isinstance(value, str) or re.fullmatch(r"[a-f0-9]{64}", value) is None
+        for value in raw_hashes
+    ):
+        raise DomainError(
+            502, "INVALID_MOODLE_PREPARATION", "Moodle statement repair proof is invalid"
+        )
+    legacy_hashes = tuple(dict.fromkeys(raw_hashes))
     transport = normalize_moodle_essay_answer_transport(answer_transport)
     if transport not in _RUNTIME_TRANSPORTS:
         raise DomainError(
@@ -263,6 +281,7 @@ def prepared_moodle_quiz_attempt(
                 external_attempt_id=attempt_id,
                 question_slot=raw_question.get("question_slot"),
                 question_text=raw_question.get("question_text"),
+                question_text_legacy_hashes=raw_question.get("question_text_legacy_hashes"),
                 answer_transport=raw_question.get("answer_transport"),
                 available_answer_transports=raw_question.get("available_answer_transports"),
                 remaining_seconds=remaining_seconds,
@@ -278,6 +297,7 @@ def prepared_moodle_quiz_attempt(
             len({question.question_slot for question in parsed_questions}) != len(parsed_questions)
             or first.question_slot != slot
             or first.question_text != statement
+            or first.question_text_legacy_hashes != legacy_hashes
             or first.answer_transport != transport
             or first.available_answer_transports != available
         ):
@@ -297,6 +317,7 @@ def prepared_moodle_quiz_attempt(
         remaining_seconds=remaining_seconds,
         question_max_mark=mark,
         questions=prepared_questions,
+        question_text_legacy_hashes=legacy_hashes,
     )
 
 
@@ -559,8 +580,7 @@ async def materialize_prepared_task_version(
             and str(policy.get("moodle_question_slot", "")) == prepared.question_slot
         ):
             if (
-                candidate.statement != prepared.question_text
-                or policy.get("answer_transport") != prepared.answer_transport
+                policy.get("answer_transport") != prepared.answer_transport
                 or (
                     policy.get("moodle_question_max_mark") is not None
                     and str(policy["moodle_question_max_mark"])
@@ -572,12 +592,33 @@ async def materialize_prepared_task_version(
                     "MOODLE_ATTEMPT_BINDING_CONFLICT",
                     "Moodle returned different data for an already prepared attempt",
                 )
+            if candidate.statement != prepared.question_text:
+                image_repair = policy.get("statement_format") is None and (
+                    is_statement_image_upgrade(candidate.statement, prepared.question_text)
+                )
+                math_repair = policy.get("statement_format") in LEGACY_STATEMENT_FORMATS and (
+                    is_statement_math_upgrade(
+                        candidate.statement, prepared.question_text,
+                        prepared.question_text_legacy_hashes,
+                    )
+                )
+                if image_repair or math_repair:
+                    # Keep the old published statement immutable. Continue to
+                    # materialize a new presentation-only version, preserving
+                    # the pinned question and the student's existing workspace.
+                    continue
+                raise DomainError(
+                    409,
+                    "MOODLE_ATTEMPT_BINDING_CONFLICT",
+                    "Moodle returned different data for an already prepared attempt",
+                )
             return candidate
 
     multi_file = prepared.answer_transport == "ESSAY_ATTACHMENT"
     ai_policy = {
         **dict(base_version.ai_policy or {}),
         "source": "MOODLE_RUNTIME_ESSAY",
+        "statement_format": STATEMENT_FORMAT,
         "statement_deferred": False,
         "moodle_course_id": prepared.course_external_id,
         "moodle_cmid": prepared.cmid,

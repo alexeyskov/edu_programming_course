@@ -205,10 +205,11 @@ async def main(output):
         await student.locator(".condition-statement").wait_for(state="visible")
         await capture(student, "student-mobile-task")
         await student.get_by_role(
-            "button", name="Запуски и история", exact=True
+            "button", name="Консоль", exact=True
         ).click()
-        await student.get_by_role("tab", name="История", exact=False).click()
-        await capture(student, "student-mobile-history")
+        assert await student.get_by_role("tab", name="История", exact=False).count() == 0
+        await student.get_by_role("tab", name="Консоль", exact=True).wait_for()
+        await capture(student, "student-mobile-console")
         await student.get_by_role("button", name="Код", exact=True).click()
         await student.get_by_label("Файл для просмотра", exact=True).select_option(
             "file-header"

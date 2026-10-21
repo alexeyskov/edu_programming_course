@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { api, ApiError, AUTH_UNAUTHORIZED_EVENT } from '../lib/api';
 import { saveRememberedToken, saveRememberedTokens } from '../lib/rememberedTokens';
+import { useMoodleKeepalive } from '../lib/useMoodleKeepalive';
 import type { Role, Session } from '../types';
 
 interface AuthContextValue {
@@ -23,6 +24,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [moodleLoginRevision, setMoodleLoginRevision] = useState(0);
+  useMoodleKeepalive(session?.id, moodleLoginRevision);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -57,6 +60,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const authenticated = await api.moodleCredentialLogin(connectionId, username, password, adminToken, teacherToken);
       saveRememberedTokens({ adminToken, teacherToken });
       setSession(authenticated);
+      setMoodleLoginRevision((revision) => revision + 1);
       setError(null);
     },
     async devLogin(role, adminToken) {

@@ -18,6 +18,7 @@ from pydantic import (
 
 ShortText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
 PositiveId = Annotated[str, StringConstraints(pattern=r"^[1-9][0-9]{0,19}$")]
+StatementHash = Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]
 AnswerTransport = Literal[
     "ESSAY_ONLINE_TEXT",
     "ESSAY_ATTACHMENT",
@@ -110,6 +111,18 @@ class LoginRequest(StrictModel):
 
 class LoginResponse(StrictModel):
     identity: MoodleIdentity
+    storage_state: BrowserStorageState
+
+
+class SessionKeepaliveRequest(StrictModel):
+    schema_version: Literal["1.0"]
+    base_url: Annotated[str, StringConstraints(min_length=8, max_length=2_048)]
+    actor_external_subject: PositiveId
+    storage_state: BrowserStorageState
+
+
+class SessionKeepaliveResponse(StrictModel):
+    external_subject: PositiveId
     storage_state: BrowserStorageState
 
 
@@ -375,6 +388,7 @@ class QuizEssayPrepareRequest(StrictModel):
 
 class QuizEssayQuestionPreparation(StrictModel):
     question_slot: PositiveId
+    question_text_legacy_hashes: list[StatementHash] = Field(default_factory=list, max_length=2)
     question_text: Annotated[
         str, StringConstraints(strip_whitespace=True, min_length=1, max_length=50_000)
     ]
@@ -391,6 +405,7 @@ class QuizEssayPreparation(StrictModel):
     cmid: int = Field(gt=0)
     attempt_id: PositiveId
     question_slot: PositiveId
+    question_text_legacy_hashes: list[StatementHash] = Field(default_factory=list, max_length=2)
     question_text: Annotated[
         str,
         StringConstraints(strip_whitespace=True, min_length=1, max_length=50_000),
